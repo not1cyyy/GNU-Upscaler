@@ -59,11 +59,15 @@ float FrameLimit::targetFps()
     auto& state = State::Instance();
     auto fpsLimit = Config::Instance()->FramerateLimit.value_or_default();
 
-    if (auto fg = state.currentFG; fg != nullptr && fg->IsActive() && !fg->IsPaused() &&
-                                   state.activeFgOutput == FGOutput::XeFG && state.xefgDynamicCapFps > 0.0f &&
-                                   (fpsLimit <= 0.0f || state.xefgDynamicCapFps < fpsLimit))
+    if (Config::Instance()->FGXeFGDynamicMFG.value_or_default() &&
+        Config::Instance()->FGXeFGTargetAsCapDMFG.value_or_default())
     {
-        return state.xefgDynamicCapFps;
+        if (auto fg = state.currentFG; fg != nullptr && fg->IsActive() && !fg->IsPaused() &&
+                                       state.activeFgOutput == FGOutput::XeFG && state.xefgDynamicCapFps > 0.0f &&
+                                       (fpsLimit <= 0.0f || state.xefgDynamicCapFps < fpsLimit))
+        {
+            return state.xefgDynamicCapFps;
+        }
     }
 
     return fpsLimit;
