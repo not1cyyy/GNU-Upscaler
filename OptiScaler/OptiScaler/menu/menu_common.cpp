@@ -3833,15 +3833,31 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
     auto& primaryGpu = *ctx.primaryGpu;
 
     // UPSCALERS -----------------------------
-    SectionTitle("Upscalers");
+    GnuUi::SectionHeader("Upscaling Pipeline");
 
     GetCurrentBackendInfo(state.api, currentBackend, &currentBackendName);
 
-    ImGui::PushItemWidth(150.0f * menuResScale);
+    std::string interceptedInput = ApiUpscalerInputName(state.currentInputApiName);
+    if (interceptedInput.empty() || interceptedInput == "None")
+        interceptedInput = "NVIDIA DLSS (Intercepted)";
+
+    ImGui::Text("Game Call (Intercepted):");
+    ImGui::SameLine(GnuUi::Px(220.0f));
+    ImGui::TextColored(ThemeColor(MenuColor::White), "%s", interceptedInput.c_str());
+    GnuUi::Help("The upscaler API the game is calling internally (e.g. DLSS, FSR, XeSS)");
+
+    ImGui::Text("Active Target Backend:");
+    ImGui::SameLine(GnuUi::Px(220.0f));
+    ImGui::TextColored(ThemeColor(MenuColor::CheckOn), "%s", currentBackendName.c_str());
+    GnuUi::Help("The actual upscaler algorithm rendering frames on your GPU");
 
     const bool usesDlssd = currentFeature != nullptr && currentFeature->GetUpscalerType() == Upscaler::DLSSD;
 
-    // DLSSD can't be switched to another upscaler
+    ImGui::Text("Switch Target Upscaler:");
+    ImGui::SameLine(GnuUi::Px(220.0f));
+
+    ImGui::PushItemWidth(150.0f * menuResScale);
+
     if (usesDlssd)
     {
         ImGui::AlignTextToFramePadding();
@@ -3866,39 +3882,44 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
 
     ImGui::PopItemWidth();
 
-    if (currentFeature != nullptr)
+    if (!usesDlssd)
     {
         ImGui::SameLine();
+        const bool hasPendingChange = state.newBackend != Upscaler::Reset && state.newBackend != currentBackend;
+        if (GnuUi::Button("Apply Upscaler", ImVec2(0.0f, 0.0f), hasPendingChange))
+        {
+            if (hasPendingChange)
+            {
+                if (state.newBackend == Upscaler::XeSS)
+                {
+                    config->DisableReactiveMask.reset();
+                    config->DlssReactiveMaskBias.reset();
+                }
+
+                MARK_ALL_BACKENDS_CHANGED();
+            }
+        }
+        GnuUi::Help("Applies the newly selected upscaler backend");
+
+        if (hasPendingChange)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Pending: Changing %s -> %s (Click 'Apply Upscaler' to activate)",
+                               currentBackendName.c_str(), UpscalerDisplayName(state.newBackend).c_str());
+        }
+    }
+
+    if (currentFeature != nullptr)
+    {
         float rw = (float) currentFeature->RenderWidth();
         float ratio = rw > 0.0f ? (float) currentFeature->TargetWidth() / rw : 0.0f;
-        ImGui::TextDisabled("%ux%u -> %ux%u (%.2fx)", currentFeature->RenderWidth(), currentFeature->RenderHeight(),
-                            currentFeature->TargetWidth(), currentFeature->TargetHeight(), ratio);
-
-        if (currentFeature->DynamicResolution())
-        {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(DRS)");
-        }
+        ImGui::TextDisabled("Pipeline Resolution: %ux%u (Render) -> %ux%u (Display) [%.2fx Scale]%s",
+                            currentFeature->RenderWidth(), currentFeature->RenderHeight(),
+                            currentFeature->TargetWidth(), currentFeature->TargetHeight(), ratio,
+                            currentFeature->DynamicResolution() ? " (DRS Active)" : "");
     }
     else
     {
-        ImGui::SameLine();
-        ImGui::TextDisabled(" (Initializing)");
-    }
-
-    if (!usesDlssd)
-    {
-        if (state.newBackend != Upscaler::Reset && state.newBackend != currentBackend)
-        {
-            if (state.newBackend == Upscaler::XeSS)
-            {
-                // Reseting them for xess
-                config->DisableReactiveMask.reset();
-                config->DlssReactiveMaskBias.reset();
-            }
-
-            MARK_ALL_BACKENDS_CHANGED();
-        }
+        ImGui::TextDisabled("Pipeline Resolution: (Waiting for 3D frame rendering)");
     }
 
     if (primaryGpu.dlssCapable && !state.NVNGX_DLSS_Path.has_value())
@@ -4055,7 +4076,7 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
             ShowTooltip("List of upscalers reported by FFX SDK");
         }
 
-        auto majorFsrVersion = currentFeature->Version().major;
+        auto majorFsrVersion = currentFeature != nullptr ? currentFeature->Version().major : 0;
 
         if (majorFsrVersion >= 4)
         {
@@ -4246,7 +4267,7 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
             }
         }
 
-        if (currentFeature->Version() >= feature_version { 3, 1, 1 } &&
+        if (currentFeature != nullptr && currentFeature->Version() >= feature_version { 3, 1, 1 } &&
             currentFeature->Version() < feature_version { 4, 0, 0 })
         {
             ImGui::Spacing();
@@ -4391,7 +4412,7 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
     // DLSS -----------------
     if ((config->DLSSEnabled.value_or_default() &&
          (currentBackend == Upscaler::DLSS || currentBackend == Upscaler::DLSS_on12) &&
-         currentFeature->Version().major > 2) ||
+         currentFeature != nullptr && currentFeature->Version().major > 2) ||
         usesDlssd)
     {
         ImGui::Spacing();
@@ -7330,7 +7351,7 @@ void MenuCommon::RenderActiveImageSettings(RenderMenuContext& ctx)
         config->OverrideSharpness = overrideSharpness;
 
         if ((currentBackend == Upscaler::DLSS || currentBackend == Upscaler::DLSS_on12) &&
-            currentFeature->Version().major < 3)
+            currentFeature != nullptr && currentFeature->Version().major < 3)
         {
             state.newBackend = currentBackend;
             MARK_ALL_BACKENDS_CHANGED();
@@ -7341,7 +7362,7 @@ void MenuCommon::RenderActiveImageSettings(RenderMenuContext& ctx)
 
     ImGui::SameLine(0.0f, 16.0f * menuResScale);
 
-    float featuresCurrentSharpness = currentFeature->Sharpness();
+    float featuresCurrentSharpness = currentFeature != nullptr ? currentFeature->Sharpness() : 0.0f;
     if (featuresCurrentSharpness > 0.0f)
         ImGui::TextDisabled("(Current: %.3f)", featuresCurrentSharpness);
     else
@@ -7361,7 +7382,7 @@ void MenuCommon::RenderActiveImageSettings(RenderMenuContext& ctx)
         // xess or dlss version >= 2.5.1
         constexpr feature_version requiredDlssVersion = { 2, 5, 1 };
         const bool isDlss = currentBackend == Upscaler::DLSS || currentBackend == Upscaler::DLSS_on12;
-        rcasEnabled = currentBackend == Upscaler::XeSS || (isDlss && currentFeature->Version() >= requiredDlssVersion);
+        rcasEnabled = currentBackend == Upscaler::XeSS || (isDlss && currentFeature != nullptr && currentFeature->Version() >= requiredDlssVersion);
 
         // Determine current mode for the dropdown
         bool currentRcasEnabled = config->RcasEnabled.value_or(rcasEnabled);
@@ -7663,8 +7684,9 @@ void MenuCommon::RenderOutputScalingSettings(RenderMenuContext& ctx)
     // if (state.api == DX12 || state.api == DX11)
     {
         // if motion vectors are not display size
-        ImGui::BeginDisabled(!currentFeature->LowResMV() &&
-                             currentFeature->RenderWidth() != currentFeature->DisplayWidth());
+        const bool mvDisabled = currentFeature != nullptr && !currentFeature->LowResMV() &&
+                                currentFeature->RenderWidth() != currentFeature->DisplayWidth();
+        ImGui::BeginDisabled(mvDisabled);
 
         SectionTitle("Output Scaling");
 
@@ -7677,9 +7699,9 @@ void MenuCommon::RenderOutputScalingSettings(RenderMenuContext& ctx)
             _ssDownsampler = config->OutputScalingDownscaler.value_or_default();
         }
 
+        const bool isOverDisplay = currentFeature != nullptr && currentFeature->RenderWidth() > currentFeature->DisplayWidth();
         ImGui::BeginDisabled((currentBackend == Upscaler::XeSS || currentBackend == Upscaler::DLSS ||
-                              currentBackend == Upscaler::DLSS_on12) &&
-                             currentFeature->RenderWidth() > currentFeature->DisplayWidth());
+                              currentBackend == Upscaler::DLSS_on12) && isOverDisplay);
         ImGui::Checkbox("Enable", &_ssEnabled);
         ImGui::EndDisabled();
 
