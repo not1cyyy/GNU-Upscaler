@@ -422,7 +422,8 @@ HRESULT FGHooks::CreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
     }
 
     cq->Release();
-    return E_INVALIDARG;
+    LOG_ERROR("FG CreateSwapchain failed, falling back to native DXGI swapchain creation");
+    return pFactory->CreateSwapChain(pDevice, pDesc, ppSwapChain);
 }
 
 HRESULT FGHooks::CreateSwapChainForHwnd(IDXGIFactory* pFactory, IUnknown* pDevice, HWND hWnd,
@@ -549,7 +550,8 @@ HRESULT FGHooks::CreateSwapChainForHwnd(IDXGIFactory* pFactory, IUnknown* pDevic
     }
 
     cq->Release();
-    return E_INVALIDARG;
+    LOG_ERROR("FG CreateSwapChainForHwnd failed, falling back to native DXGI swapchain creation");
+    return pFactory->CreateSwapChainForHwnd(pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
 }
 
 void FGHooks::SetFGSwapchain(IDXGISwapChain* pSwapChain, HWND hWnd)
