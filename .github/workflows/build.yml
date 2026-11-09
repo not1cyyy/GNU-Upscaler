@@ -21,42 +21,6 @@ jobs:
         run: |
           "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      - name: Fetch External SDKs
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path "OptiScaler\external"
-          Set-Location "OptiScaler\external"
-
-          Write-Host "Fetching external SDK dependencies..."
-          if (-not (Test-Path "simpleini\SimpleIni.h")) {
-              git clone --depth 1 https://github.com/brofield/simpleini simpleini
-          }
-          if (-not (Test-Path "unordered_dense\include")) {
-              git clone --depth 1 https://github.com/martinus/unordered_dense.git unordered_dense
-          }
-          if (-not (Test-Path "vulkan\include")) {
-              git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git vulkan
-          }
-          if (-not (Test-Path "spdlog\include")) {
-              git clone --depth 1 https://github.com/gabime/spdlog.git spdlog
-          }
-          if (-not (Test-Path "magic_enum\include")) {
-              git clone --depth 1 https://github.com/Neargye/magic_enum magic_enum
-          }
-          if (-not (Test-Path "nvapi\nvapi.h")) {
-              git clone --depth 1 https://github.com/NVIDIA/nvapi.git nvapi
-          }
-          if (-not (Test-Path "xess\inc")) {
-              git clone --depth 1 https://github.com/intel/xess.git xess
-          }
-          if (-not (Test-Path "FidelityFX-SDK\ffx-api")) {
-              git clone --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK FidelityFX-SDK
-          }
-          if (-not (Test-Path "FidelityFX-SDK-v2\Kits")) {
-              git clone --depth 1 -b v2.4.0 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git FidelityFX-SDK-v2
-          }
-          Write-Host "External SDKs ready."
-
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
