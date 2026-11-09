@@ -271,7 +271,7 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
         const int ceiling = Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5);
         if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
-            _maxInterpolationCount = std::max(props.maxSupportedInterpolations, ceiling);
+            _maxInterpolationCount = std::max((int) props.maxSupportedInterpolations, ceiling);
             LOG_INFO("Max supported interpolations: {} (unlocked ceiling: {})", props.maxSupportedInterpolations, _maxInterpolationCount);
         }
         else
@@ -440,7 +440,7 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
         const int ceiling = Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5);
         if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
-            _maxInterpolationCount = std::max(props.maxSupportedInterpolations, ceiling);
+            _maxInterpolationCount = std::max((int) props.maxSupportedInterpolations, ceiling);
             LOG_INFO("Max supported interpolations: {} (unlocked ceiling: {})", props.maxSupportedInterpolations, _maxInterpolationCount);
         }
         else
