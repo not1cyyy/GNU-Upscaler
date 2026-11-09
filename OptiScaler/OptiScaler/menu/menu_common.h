@@ -280,11 +280,6 @@ class MenuCommon
     static void RenderLoggingSettings(RenderMenuContext& ctx);
     static void RenderQuickStartTab(RenderMenuContext& ctx);
     static void RenderMainMenuTable(RenderMenuContext& ctx);
-    static void RequestTab(MenuTab tab);
-
-    static ImVec4 ThemeColor(MenuColor c);
-    static ImU32 ThemeColorU32(MenuColor c);
-    static float MockPx();
     static void RenderFpsOverlaySettings(RenderMenuContext& ctx);
     static void RenderUpscalerInputsSettings(RenderMenuContext& ctx);
     static void RenderApiAndTextureSettings(RenderMenuContext& ctx);
@@ -300,6 +295,11 @@ class MenuCommon
     static void UpdateManualInput(HWND targetHwnd);
 
   public:
+    static void RequestTab(MenuTab tab);
+    static ImVec4 ThemeColor(MenuColor c);
+    static ImU32 ThemeColorU32(MenuColor c);
+    static float MockPx();
+
     static void Dx11Inited() { _dx11Ready = true; }
     static void Dx12Inited() { _dx12Ready = true; }
     static void VulkanInited() { _vulkanReady = true; }
