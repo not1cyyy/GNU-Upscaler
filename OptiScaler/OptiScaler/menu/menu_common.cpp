@@ -5686,7 +5686,14 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             ImGui::SameLine(0.0f, 16.0f);
 
             if (bool dynamic = dynamicMFG; ImGui::Checkbox("Dynamic MFG##xefg", &dynamic))
+            {
                 config->FGXeFGDynamicMFG = dynamic;
+                if (!dynamic)
+                {
+                    state.xefgDynamicCapFps = 0.0f;
+                    state.fgChanged = true;
+                }
+            }
 
             ShowTooltip("Changes the multiplier on the fly to hit the target FPS,\n"
                         "up to the Frame Gen setting (at 2X: FG on or off).");

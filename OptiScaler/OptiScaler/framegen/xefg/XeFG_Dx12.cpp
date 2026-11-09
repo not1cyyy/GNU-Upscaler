@@ -746,16 +746,25 @@ bool XeFG_Dx12::Dispatch()
 
         // Dynamic MFG, the game's wait in the present path is its last present
         const HWND window = _hwnd != nullptr ? _hwnd : state.currentSwapchainDesc.OutputWindow;
-        const auto dynamic =
-            _dynamic.Update(targetCount, _framesToInterpolate, _generationOff, state.lastFGPresentMs, window);
-        const bool dynamicChange = dynamic.ownChange;
+        bool dynamicChange = false;
 
-        // 1X: frame generation off. XeFG keeps its count, so nothing is rebuilt, and turns back on in microseconds;
-        // its first frame after that has no history and shows the real frame alone.
-        if (dynamic.generationOff != _generationOff)
-            SetGenerationOff(dynamic.generationOff);
+        if (Config::Instance()->FGXeFGDynamicMFG.value_or_default())
+        {
+            const auto dynamic =
+                _dynamic.Update(targetCount, _framesToInterpolate, _generationOff, state.lastFGPresentMs, window);
+            dynamicChange = dynamic.ownChange;
 
-        targetCount = dynamic.count;
+            if (dynamic.generationOff != _generationOff)
+                SetGenerationOff(dynamic.generationOff);
+
+            targetCount = dynamic.count;
+        }
+        else
+        {
+            state.xefgDynamicCapFps = 0.0f;
+            if (_generationOff)
+                SetGenerationOff(false);
+        }
 
         if (_framesToInterpolate != targetCount)
         {
