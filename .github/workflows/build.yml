@@ -1,0 +1,66 @@
+name: Build GNU-Upscaler
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build GNU-Upscaler (OptiScaler)
+        shell: cmd
+        run: |
+          msbuild /m /p:Configuration=Release /p:Platform=x64 OptiScaler\OptiScaler.sln /verbosity:minimal
+
+      - name: Prepare Artifacts
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path ".\dist"
+          
+          # Find the compiled OptiScaler.dll
+          $dll = Get-ChildItem -Path ".\OptiScaler" -Recurse -Filter "OptiScaler.dll" | Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
+          if (-not $dll) {
+              Write-Error "Could not find compiled OptiScaler.dll in Release output!"
+              exit 1
+          }
+          Write-Host "Found compiled DLL: $($dll.FullName)"
+          Copy-Item -Path $dll.FullName -Destination ".\dist\OptiScaler.dll" -Force
+          Copy-Item -Path ".\OptiScaler\OptiScaler.ini" -Destination ".\dist\OptiScaler.ini" -Force
+          
+          # Create zip bundle
+          Compress-Archive -Path ".\dist\*" -DestinationPath ".\dist\GNU-Upscaler-latest.zip" -Force
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GNU-Upscaler-Release
+          path: .\dist\*
+          if-no-files-found: error
+
+      - name: Release Latest Build
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        with:
+          tag_name: latest
+          name: "GNU-Upscaler (Latest Automated Build)"
+          body: "Automated build of GNU-Upscaler compiled with MSVC on GitHub Actions."
+          files: |
+            .\dist\OptiScaler.dll
+            .\dist\OptiScaler.ini
+            .\dist\GNU-Upscaler-latest.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
