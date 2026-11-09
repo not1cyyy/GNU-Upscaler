@@ -1,0 +1,27 @@
+[submodule "OptiScaler/external/simpleini"]
+	path = OptiScaler/external/simpleini
+	url = https://github.com/brofield/simpleini
+[submodule "OptiScaler/external/unordered_dense"]
+	path = OptiScaler/external/unordered_dense
+	url = https://github.com/martinus/unordered_dense.git
+[submodule "OptiScaler/external/xess"]
+	path = OptiScaler/external/xess
+	url = https://github.com/intel/xess.git
+[submodule "OptiScaler/external/vulkan"]
+	path = OptiScaler/external/vulkan
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "OptiScaler/external/spdlog"]
+	path = OptiScaler/external/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "OptiScaler/external/FidelityFX-SDK"]
+	path = OptiScaler/external/FidelityFX-SDK
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+[submodule "OptiScaler/external/magic_enum"]
+	path = OptiScaler/external/magic_enum
+	url = https://github.com/Neargye/magic_enum
+[submodule "OptiScaler/external/FidelityFX-SDK-v2"]
+	path = OptiScaler/external/FidelityFX-SDK-v2
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+[submodule "OptiScaler/external/nvapi"]
+	path = OptiScaler/external/nvapi
+	url = https://github.com/NVIDIA/nvapi.git
