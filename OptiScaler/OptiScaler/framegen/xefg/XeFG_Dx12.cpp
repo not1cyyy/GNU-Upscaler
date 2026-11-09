@@ -268,13 +268,15 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
 
         xefg_swapchain_properties_t props {};
         auto result = XeFGProxy::GetProperties()(_swapChainContext, &props);
+        const int ceiling = Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5);
         if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
-            _maxInterpolationCount = props.maxSupportedInterpolations;
-            LOG_INFO("Max supported interpolations: {}", props.maxSupportedInterpolations);
+            _maxInterpolationCount = std::max(props.maxSupportedInterpolations, ceiling);
+            LOG_INFO("Max supported interpolations: {} (unlocked ceiling: {})", props.maxSupportedInterpolations, _maxInterpolationCount);
         }
         else
         {
+            _maxInterpolationCount = ceiling;
             LOG_ERROR("Can't get swapchain properties: {} ({})", magic_enum::enum_name(result), (UINT) result);
         }
     }
@@ -351,8 +353,8 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
 
     if (Config::Instance()->ForceXeLL.value_or_default())
         params.maxInterpolatedFrames = 1;
-
-    params.maxInterpolatedFrames = intTarget;
+    else
+        params.maxInterpolatedFrames = std::max(intTarget, Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5));
 
     params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;
 
@@ -435,13 +437,15 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
 
         xefg_swapchain_properties_t props {};
         auto result = XeFGProxy::GetProperties()(_swapChainContext, &props);
+        const int ceiling = Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5);
         if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
-            _maxInterpolationCount = props.maxSupportedInterpolations;
-            LOG_INFO("Max supported interpolations: {}", props.maxSupportedInterpolations);
+            _maxInterpolationCount = std::max(props.maxSupportedInterpolations, ceiling);
+            LOG_INFO("Max supported interpolations: {} (unlocked ceiling: {})", props.maxSupportedInterpolations, _maxInterpolationCount);
         }
         else
         {
+            _maxInterpolationCount = ceiling;
             LOG_ERROR("Can't get swapchain properties: {} ({})", magic_enum::enum_name(result), (UINT) result);
         }
     }
@@ -482,8 +486,8 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
 
     if (Config::Instance()->ForceXeLL.value_or_default())
         params.maxInterpolatedFrames = 1;
-
-    params.maxInterpolatedFrames = intTarget;
+    else
+        params.maxInterpolatedFrames = std::max(intTarget, Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5));
 
     params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;
 
@@ -728,16 +732,19 @@ bool XeFG_Dx12::Dispatch()
 
     if (XeFGProxy::SetNumInterpolatedFrames() != nullptr)
     {
-        if (Config::Instance()->FGXeFGInterpolationCount.value_or_default() > _maxInterpolationCount)
+        const int ceiling = Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5);
+        const int maxAllowed = std::max(_maxInterpolationCount, ceiling);
+
+        if (Config::Instance()->FGXeFGInterpolationCount.value_or_default() > maxAllowed)
         {
-            Config::Instance()->FGXeFGInterpolationCount = _maxInterpolationCount;
+            Config::Instance()->FGXeFGInterpolationCount = maxAllowed;
             LOG_WARN("Requested interpolation count is higher than max supported, setting to max: {}",
-                     _maxInterpolationCount);
+                     maxAllowed);
         }
 
         int targetCount = std::clamp(
             Config::Instance()->FGInterpolationCount(Config::Instance()->FGXeFGInterpolationCount.value_or_default()),
-            1, std::max(_maxInterpolationCount, 1));
+            1, maxAllowed);
 
         // Dynamic MFG, the game's wait in the present path is its last present
         const HWND window = _hwnd != nullptr ? _hwnd : state.currentSwapchainDesc.OutputWindow;
