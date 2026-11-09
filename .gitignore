@@ -18,13 +18,13 @@ bld/
 *.suo
 *.log
 
-# Submodules (managed via .gitmodules)
-OptiScaler/external/simpleini/*
-OptiScaler/external/unordered_dense/*
-OptiScaler/external/xess/*
-OptiScaler/external/vulkan/*
-OptiScaler/external/spdlog/*
-OptiScaler/external/FidelityFX-SDK/*
-OptiScaler/external/magic_enum/*
-OptiScaler/external/FidelityFX-SDK-v2/*
-OptiScaler/external/nvapi/*
+# Exclude heavy sample assets/docs that are not needed for building
+OptiScaler/external/FidelityFX-SDK/samples/
+OptiScaler/external/FidelityFX-SDK/docs/
+OptiScaler/external/FidelityFX-SDK/framework/
+OptiScaler/external/FidelityFX-SDK/sdk/tools/
+OptiScaler/external/FidelityFX-SDK-v2/Kits/Cauldron2/
+OptiScaler/external/FidelityFX-SDK-v2/Kits/FidelityFX/docs/
+OptiScaler/external/FidelityFX-SDK-v2/Kits/FidelityFX/samples/
+OptiScaler/external/xess/doc/
+OptiScaler/external/xess/bin/basic_sample_*
