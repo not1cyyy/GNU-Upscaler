@@ -2548,7 +2548,7 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
             inputMenu = false;
             static MenuInput::ToggleGate menuToggleGate;
             if (!menuToggleGate.Accept(Util::MillisecondsNow(), 300))
-                return true;
+                return;
 
             _isVisible = !_isVisible;
 
@@ -10050,37 +10050,36 @@ void MenuCommon::RenderQuickStartTab(RenderMenuContext& ctx)
                 config->UpscaleRatioOverrideValue = 1.50f;
                 config->OverrideSharpness = true;
                 config->Sharpness = 0.30f;
-                config->CasEnabled = true;
+                config->SharpnessShader = SharpenShader::RCAS;
                 break;
             case 1: // Balanced
                 config->UpscaleRatioOverrideEnabled = true;
                 config->UpscaleRatioOverrideValue = 1.70f;
                 config->OverrideSharpness = true;
                 config->Sharpness = 0.35f;
-                config->CasEnabled = true;
+                config->SharpnessShader = SharpenShader::RCAS;
                 break;
             case 2: // Performance
                 config->UpscaleRatioOverrideEnabled = true;
                 config->UpscaleRatioOverrideValue = 2.00f;
                 config->OverrideSharpness = true;
                 config->Sharpness = 0.45f;
-                config->CasEnabled = true;
+                config->SharpnessShader = SharpenShader::RCAS;
                 break;
             case 3: // Battery Saver (Handheld)
                 config->UpscaleRatioOverrideEnabled = true;
                 config->UpscaleRatioOverrideValue = 1.70f;
                 config->OverrideSharpness = true;
                 config->Sharpness = 0.35f;
-                config->CasEnabled = true;
+                config->SharpnessShader = SharpenShader::RCAS;
                 config->FramerateLimit = 45.0f;
-                config->FramerateLimitMode = 1;
                 break;
             case 4: // Native AA
                 config->UpscaleRatioOverrideEnabled = true;
                 config->UpscaleRatioOverrideValue = 1.00f;
                 config->OverrideSharpness = true;
                 config->Sharpness = 0.20f;
-                config->CasEnabled = true;
+                config->SharpnessShader = SharpenShader::RCAS;
                 break;
             }
             config->SaveIni();
@@ -11070,6 +11069,7 @@ void MenuCommon::RenderMainMenuWindow(RenderMenuContext& ctx)
         auto winPos = ImGui::GetWindowPos();
 
         // Menu was resized by the user
+        const float menuHeight = config->MenuHeight.value_or(815.0f) * menuResScale;
         if (std::abs(winSize.y - menuHeight) > 0.5f)
             config->MenuHeight = std::round(winSize.y / menuResScale);
 
