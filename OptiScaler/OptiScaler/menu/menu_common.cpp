@@ -3839,7 +3839,7 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
 
     ImGui::PushItemWidth(150.0f * menuResScale);
 
-    const bool usesDlssd = currentFeature->GetUpscalerType() == Upscaler::DLSSD;
+    const bool usesDlssd = currentFeature != nullptr && currentFeature->GetUpscalerType() == Upscaler::DLSSD;
 
     // DLSSD can't be switched to another upscaler
     if (usesDlssd)
@@ -3866,15 +3866,24 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
 
     ImGui::PopItemWidth();
 
-    ImGui::SameLine();
-    ImGui::TextDisabled("%dx%d -> %dx%d (%.2fx)", currentFeature->RenderWidth(), currentFeature->RenderHeight(),
-                        currentFeature->TargetWidth(), currentFeature->TargetHeight(),
-                        (float) currentFeature->TargetWidth() / (float) currentFeature->RenderWidth());
-
-    if (currentFeature->DynamicResolution())
+    if (currentFeature != nullptr)
     {
         ImGui::SameLine();
-        ImGui::TextDisabled("(DRS)");
+        float rw = (float) currentFeature->RenderWidth();
+        float ratio = rw > 0.0f ? (float) currentFeature->TargetWidth() / rw : 0.0f;
+        ImGui::TextDisabled("%ux%u -> %ux%u (%.2fx)", currentFeature->RenderWidth(), currentFeature->RenderHeight(),
+                            currentFeature->TargetWidth(), currentFeature->TargetHeight(), ratio);
+
+        if (currentFeature->DynamicResolution())
+        {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(DRS)");
+        }
+    }
+    else
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled(" (Initializing)");
     }
 
     if (!usesDlssd)
@@ -5217,7 +5226,7 @@ void MenuCommon::RenderFGModeSlider(RenderMenuContext& ctx, const char* label, i
         return std::format("{}X", mode + 1);
     };
 
-    const int maxMode = std::max(maxInterpolationCount, 1);
+    const int maxMode = std::max({ maxInterpolationCount, 5, 1 });
 
     int current = 0;
     if (config->FGFollowsGame())
@@ -5615,7 +5624,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                         "It might cause crashes and bad IQ!");
         }
 
-        const int maxCount = fgOutput->GetMaxInterpolationCount();
+        const int maxCount = std::max({ fgOutput->GetMaxInterpolationCount(), 5, config->FGXeFGInterpolationCount.value_or(1) });
         const bool dynamicMFG = maxCount >= 1 && config->FGXeFGDynamicMFG.value_or_default();
 
         // Frame Gen at 2X: Dynamic MFG only switches between off and 2X
@@ -5661,6 +5670,28 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             ShowTooltip("Changes the multiplier on the fly to hit the target FPS,\n"
                         "up to the Frame Gen setting (at 2X: FG on or off).");
         }
+
+        bool extraPacing = config->FGXeFGExtraPacing.value_or_default();
+        if (GnuUi::Checkbox("Extra Pacing (3X and above)", &extraPacing))
+            config->FGXeFGExtraPacing = extraPacing;
+        GnuUi::Help("Spaces generated frames evenly to eliminate burst stuttering at 3X, 4X, and 6X");
+
+        ImGui::SameLine(0.0f, 16.0f);
+        bool paceOnSwapchain = config->FGXeFGPaceOnSwapchain.value_or_default();
+        if (GnuUi::Checkbox("Pace on Swapchain", &paceOnSwapchain))
+            config->FGXeFGPaceOnSwapchain = paceOnSwapchain;
+        GnuUi::Help("Synchronizes each frame with the DXGI frame latency waitable object");
+
+        bool paceRealFrame = config->FGXeFGPaceRealFrame.value_or(true);
+        if (GnuUi::Checkbox("Pace Real Frame", &paceRealFrame))
+            config->FGXeFGPaceRealFrame = paceRealFrame;
+        GnuUi::Help("Evenly spaces the real frame alongside generated frames to prevent burst clumps");
+
+        ImGui::SameLine(0.0f, 16.0f);
+        bool allowDilated = config->FGXeFGAllowDilatedMV.value_or_default();
+        if (GnuUi::Checkbox("Allow Dilated Motion Vectors", &allowDilated))
+            config->FGXeFGAllowDilatedMV = allowDilated;
+        GnuUi::Help("Allows high-resolution Unreal Engine dilated motion vectors for smoother camera motion");
 
         if (dynamicMFG)
         {
@@ -10167,6 +10198,7 @@ void MenuCommon::RenderMainMenuTable(RenderMenuContext& ctx)
     {
         ImGui::PushItemWidth(itemWidth);
         RenderActiveUpscalerSettings(ctx);
+        RenderActiveImageSettings(ctx);
         RenderFsrCommonSettings(ctx);
         RenderUpscaleRatioSettings(ctx);
         RenderOutputScalingSettings(ctx);
@@ -11027,8 +11059,11 @@ void MenuCommon::RenderMainMenuWindow(RenderMenuContext& ctx)
         std::max(std::min(WholePx(kMenuWidthPx * mockPx), ImFloor(io.DisplaySize.x - menuMargin * 2.0f)), 200.0f);
     const float menuMaxHeight =
         std::max(std::min(WholePx(kMenuMaxHeightPx * mockPx), ImFloor(io.DisplaySize.y - menuMargin * 2.0f)), 200.0f);
+    const float defaultHeight =
+        std::clamp(config->MenuHeight.value_or(750.0f) * menuResScale, 450.0f, menuMaxHeight);
 
-    ImGui::SetNextWindowSizeConstraints(ImVec2(menuWidth, 0.0f), ImVec2(menuWidth, menuMaxHeight));
+    ImGui::SetNextWindowSize(ImVec2(menuWidth, defaultHeight), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(menuWidth, 400.0f), ImVec2(menuWidth, menuMaxHeight));
 
     // Main menu window, fixed ID as the game name can show up later
     windowTitle = StrFmt("GNU-Upscaler - %s%s###GnuUpscalerMenu", state.gameExe.c_str(),

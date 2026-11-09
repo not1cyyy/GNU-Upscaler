@@ -235,6 +235,11 @@ bool Config::Reload(std::filesystem::path iniPath)
             FGXeFGHighResMV.set_from_config(readBool("XeFG", "HighResMV"));
             FGXeFGDebugView.set_from_config(readBool("XeFG", "DebugView"));
             FGXeFGForceBorderless.set_from_config(readBool("XeFG", "ForceBorderless"));
+            FGXeFGExtraPacing.set_from_config(readBool("XeFG", "ExtraPacing"));
+            FGXeFGPaceOnSwapchain.set_from_config(readBool("XeFG", "PaceOnSwapchain"));
+            FGXeFGPaceRealFrame.set_from_config(readBool("XeFG", "PaceRealFrame"));
+            FGXeFGAllowDilatedMV.set_from_config(readBool("XeFG", "AllowDilatedMV"));
+            FGXeFGMaxInterpolatedFrames.set_from_config(readInt("XeFG", "MaxInterpolatedFrames"));
         }
 
         {
@@ -1467,6 +1472,11 @@ bool Config::SaveIni()
         ini.SetValue("XeFG", "DebugView", GetBoolValue(Instance()->FGXeFGDebugView.value_for_config()).c_str());
         ini.SetValue("XeFG", "ForceBorderless",
                      GetBoolValue(Instance()->FGXeFGForceBorderless.value_for_config()).c_str());
+        ini.SetValue("XeFG", "ExtraPacing", GetBoolValue(Instance()->FGXeFGExtraPacing.value_for_config()).c_str());
+        ini.SetValue("XeFG", "PaceOnSwapchain", GetBoolValue(Instance()->FGXeFGPaceOnSwapchain.value_for_config()).c_str());
+        ini.SetValue("XeFG", "PaceRealFrame", GetBoolValue(Instance()->FGXeFGPaceRealFrame.value_for_config()).c_str());
+        ini.SetValue("XeFG", "AllowDilatedMV", GetBoolValue(Instance()->FGXeFGAllowDilatedMV.value_for_config()).c_str());
+        ini.SetValue("XeFG", "MaxInterpolatedFrames", GetIntValue(Instance()->FGXeFGMaxInterpolatedFrames.value_for_config()).c_str());
     }
 
     {
