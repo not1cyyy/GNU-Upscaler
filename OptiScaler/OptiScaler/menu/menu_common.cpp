@@ -2547,7 +2547,7 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
         {
             inputMenu = false;
             static MenuInput::ToggleGate menuToggleGate;
-            if (!menuToggleGate.Accept(Util::MillisecondsNow(), 300))
+            if (!menuToggleGate.Accept(static_cast<uint64_t>(Util::MillisecondsNow()), 300))
                 return;
 
             _isVisible = !_isVisible;
@@ -10017,7 +10017,7 @@ void MenuCommon::RenderQuickStartTab(RenderMenuContext& ctx)
         if (fg != nullptr && fg->IsActive() && !fg->IsPaused())
         {
             UINT mult = fg->GetInterpolatedFrameCount() + 1;
-            ImGui::TextColored(ThemeColor(MenuColor::CheckOn), "%s active (%ux)", fg->Name().c_str(), mult);
+            ImGui::TextColored(ThemeColor(MenuColor::CheckOn), "%s active (%ux)", fg->Name(), mult);
         }
         else
         {
