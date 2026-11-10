@@ -235,6 +235,12 @@ bool Config::Reload(std::filesystem::path iniPath)
             FGXeFGHighResMV.set_from_config(readBool("XeFG", "HighResMV"));
             FGXeFGDebugView.set_from_config(readBool("XeFG", "DebugView"));
             FGXeFGForceBorderless.set_from_config(readBool("XeFG", "ForceBorderless"));
+            FGXeFGMaxInterpolatedFrames.set_from_config(readInt("XeFG", "MaxInterpolatedFrames"));
+            if (FGXeFGMaxInterpolatedFrames.has_value() &&
+                (FGXeFGMaxInterpolatedFrames.value() < 1 || FGXeFGMaxInterpolatedFrames.value() > 9))
+            {
+                FGXeFGMaxInterpolatedFrames.reset();
+            }
         }
 
         {
@@ -1467,6 +1473,8 @@ bool Config::SaveIni()
         ini.SetValue("XeFG", "DebugView", GetBoolValue(Instance()->FGXeFGDebugView.value_for_config()).c_str());
         ini.SetValue("XeFG", "ForceBorderless",
                      GetBoolValue(Instance()->FGXeFGForceBorderless.value_for_config()).c_str());
+        ini.SetValue("XeFG", "MaxInterpolatedFrames",
+                     GetIntValue(Instance()->FGXeFGMaxInterpolatedFrames.value_for_config()).c_str());
     }
 
     {

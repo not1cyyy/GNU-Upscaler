@@ -5658,7 +5658,9 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                         "It might cause crashes and bad IQ!");
         }
 
-        const int maxCount = fgOutput->GetMaxInterpolationCount();
+        const int ceiling = std::clamp(config->FGXeFGMaxInterpolatedFrames.value_or(5), 1, 9);
+        const int maxCount =
+            std::max({ fgOutput->GetMaxInterpolationCount(), ceiling, config->FGXeFGInterpolationCount.value_or(1) });
         const bool dynamicMFG = maxCount >= 1 && config->FGXeFGDynamicMFG.value_or_default();
 
         // Frame Gen at 2X: Dynamic MFG only switches between off and 2X
@@ -5909,7 +5911,9 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             ImGui::TextColored(StatusError(), "OFF");
         }
 
-        RenderFGModeSlider(ctx, "Frame Gen##dlssg", dlssg->GetMaxInterpolationCount(),
+        const int maxDlssg =
+            std::max({ dlssg->GetMaxInterpolationCount(), config->FGDLSSGInterpolationCount.value_or(1), 3 });
+        RenderFGModeSlider(ctx, "Frame Gen##dlssg", maxDlssg,
                            &config->FGDLSSGInterpolationCount);
 
         if (dlssg->GetMaxInterpolationCount() > 1)
