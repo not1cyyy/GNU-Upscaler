@@ -2531,6 +2531,8 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
 
                 if (config->IsFGEnabled())
                     state.fgChanged = true;
+                else
+                    state.xefgDynamicCapFps = 0.0f;
             }
         }
 
@@ -2565,6 +2567,10 @@ void MenuCommon::HandleMenuShortcuts(RenderMenuContext& ctx)
                 ApplyThemeStyle();
 
                 refreshRate = Util::GetActiveRefreshRate(_handle);
+                // Keep the slider maxes current on the display the game moved to; also catch a first
+                // query that failed before the swapchain existed
+                if (refreshRate <= 0)
+                    refreshRate = Util::GetActiveRefreshRate(state.currentSwapchainDesc.OutputWindow);
 
                 auto optiPath = std::filesystem::path(Config::Instance()->MainDllPath.value());
                 state.artursFgFileAvailable = enablerExists.Get(optiPath / L"dlss-enabler-headless.dll");
@@ -5011,6 +5017,11 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
 
             ImGui::BeginDisabled(state.dlssgLastSetMode != sl::DLSSGMode::eDynamic);
             static float fpsTarget = config->FGDLSSGFramerateTargetDMFG.value_or_default();
+
+            // Re-sync with the config when the slider isn't in use
+            if (!ImGui::IsItemActive() && config->FGDLSSGFramerateTargetDMFG.value_or_default() != fpsTarget)
+                fpsTarget = config->FGDLSSGFramerateTargetDMFG.value_or_default();
+
             const float fpsSliderMax = (float) std::max(200, refreshRate);
             ImGui::SliderFloat("DMFG FPS Target", &fpsTarget, 0, fpsSliderMax, "%.0f");
 
@@ -5247,7 +5258,7 @@ void MenuCommon::RenderFGModeSlider(RenderMenuContext& ctx, const char* label, i
         return std::format("{}X", mode + 1);
     };
 
-    const int maxMode = std::max({ maxInterpolationCount, 5, 1 });
+    const int maxMode = std::max(maxInterpolationCount, 1);
 
     int current = 0;
     if (config->FGFollowsGame())
@@ -5301,6 +5312,8 @@ void MenuCommon::RenderFGModeSlider(RenderMenuContext& ctx, const char* label, i
 
         if (config->IsFGEnabled())
             state.fgChanged = true;
+        else
+            state.xefgDynamicCapFps = 0.0f;
     }
 
     ImGui::PopItemWidth();
@@ -5645,7 +5658,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                         "It might cause crashes and bad IQ!");
         }
 
-        const int maxCount = std::max({ fgOutput->GetMaxInterpolationCount(), 5, config->FGXeFGInterpolationCount.value_or(1) });
+        const int maxCount = fgOutput->GetMaxInterpolationCount();
         const bool dynamicMFG = maxCount >= 1 && config->FGXeFGDynamicMFG.value_or_default();
 
         // Frame Gen at 2X: Dynamic MFG only switches between off and 2X
@@ -5699,34 +5712,18 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                         "up to the Frame Gen setting (at 2X: FG on or off).");
         }
 
-        bool extraPacing = config->FGXeFGExtraPacing.value_or_default();
-        if (GnuUi::Checkbox("Extra Pacing (3X and above)", &extraPacing))
-            config->FGXeFGExtraPacing = extraPacing;
-        GnuUi::Help("Spaces generated frames evenly to eliminate burst stuttering at 3X, 4X, and 6X");
-
-        ImGui::SameLine(0.0f, 16.0f);
-        bool paceOnSwapchain = config->FGXeFGPaceOnSwapchain.value_or_default();
-        if (GnuUi::Checkbox("Pace on Swapchain", &paceOnSwapchain))
-            config->FGXeFGPaceOnSwapchain = paceOnSwapchain;
-        GnuUi::Help("Synchronizes each frame with the DXGI frame latency waitable object");
-
-        bool paceRealFrame = config->FGXeFGPaceRealFrame.value_or(true);
-        if (GnuUi::Checkbox("Pace Real Frame", &paceRealFrame))
-            config->FGXeFGPaceRealFrame = paceRealFrame;
-        GnuUi::Help("Evenly spaces the real frame alongside generated frames to prevent burst clumps");
-
-        ImGui::SameLine(0.0f, 16.0f);
-        bool allowDilated = config->FGXeFGAllowDilatedMV.value_or_default();
-        if (GnuUi::Checkbox("Allow Dilated Motion Vectors", &allowDilated))
-            config->FGXeFGAllowDilatedMV = allowDilated;
-        GnuUi::Help("Allows high-resolution Unreal Engine dilated motion vectors for smoother camera motion");
-
         if (dynamicMFG)
         {
             // Applied on release, dragging doesn't restart Dynamic MFG every frame.
             // The slider's lowest step (9) is Auto, the lowest target is 10.
             constexpr float autoStep = 9.0f;
             static float xefgFpsTarget = std::max(config->FGXeFGFramerateTargetDMFG.value_or_default(), autoStep);
+
+            // Re-sync with the config when the slider isn't in use, ini reloads and resets show up
+            if (!ImGui::IsItemActive() && config->FGXeFGFramerateTargetDMFG.has_value() &&
+                config->FGXeFGFramerateTargetDMFG.value() != xefgFpsTarget)
+                xefgFpsTarget = config->FGXeFGFramerateTargetDMFG.value();
+
             const float fpsSliderMax = (float) std::max(200, refreshRate);
 
             ImGui::SetNextItemWidth(150.0f * menuResScale);
@@ -5752,7 +5749,11 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                 ImGui::SameLine(0.0f, 16.0f);
 
                 if (bool cap = targetAsCap; ImGui::Checkbox("Use as FPS limit##xefg", &cap))
+                {
                     config->FGXeFGTargetAsCapDMFG = cap;
+                    if (!cap)
+                        state.xefgDynamicCapFps = 0.0f;
+                }
 
                 ShowTooltip("Also limits FPS to the target and uses the lowest\n"
                             "multiplier that reaches it.");
@@ -5926,6 +5927,11 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
 
                 ImGui::BeginDisabled(!config->FGDLSSGForceDMFG.value_or_default());
                 static float fpsTarget = config->FGDLSSGFramerateTargetDMFG.value_or_default();
+
+                // Re-sync with the config when the slider isn't in use
+                if (!ImGui::IsItemActive() && config->FGDLSSGFramerateTargetDMFG.value_or_default() != fpsTarget)
+                    fpsTarget = config->FGDLSSGFramerateTargetDMFG.value_or_default();
+
                 float fpsSliderMax = (float) std::max(200, refreshRate);
                 ImGui::SliderFloat("DMFG FPS Target", &fpsTarget, 0, fpsSliderMax, "%.0f");
 
@@ -10142,6 +10148,12 @@ void MenuCommon::RenderQuickStartTab(RenderMenuContext& ctx)
                 config->SharpnessShader = SharpenShader::RCAS;
                 break;
             }
+
+            // Every preset but Battery Saver is framerate-agnostic: lift the 45 fps cap a Battery Saver
+            // run left behind, it would silently cap every later session
+            if (i != 3 && config->FramerateLimit.value_or_default() == 45.0f)
+                config->FramerateLimit = 0.0f;
+
             config->SaveIni();
         }
     }

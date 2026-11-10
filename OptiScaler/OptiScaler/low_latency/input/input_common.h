@@ -129,6 +129,8 @@ class InputCommon
 
     // The time the output slept since the last call, 0 if it didn't
     static double take_sleep_ms() { return last_sleep_ms.exchange(0.0); }
+    // Time slept outside the output's own sleep (FrameLimit::sleep), added onto it for Dynamic MFG
+    static void add_sleep_ms(double ms) { last_sleep_ms.fetch_add(ms > 0.0 ? ms : 0.0); }
 
     static InputResult sleep(const InputContext& inputContext, IUnknown* pDevice,
                              std::optional<uint32_t> frame_id = std::nullopt);

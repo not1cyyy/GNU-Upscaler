@@ -268,17 +268,18 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
 
         xefg_swapchain_properties_t props {};
         auto result = XeFGProxy::GetProperties()(_swapChainContext, &props);
-        const int ceiling = Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5);
         if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
+            // The lib's reported max is authoritative: counts above it fail (or get clamped silently) while the
+            // limiter and UI would still run with the requested count
             _propsMaxInterpolationCount = props.maxSupportedInterpolations;
-            _maxInterpolationCount = std::max((int) props.maxSupportedInterpolations, ceiling);
-            LOG_INFO("Max supported interpolations: {} (unlocked ceiling: {})", props.maxSupportedInterpolations, _maxInterpolationCount);
+            _maxInterpolationCount = (int) props.maxSupportedInterpolations;
+            LOG_INFO("Max supported interpolations: {}", props.maxSupportedInterpolations);
         }
         else
         {
             _propsMaxInterpolationCount = 1;
-            _maxInterpolationCount = ceiling;
+            _maxInterpolationCount = 1;
             LOG_ERROR("Can't get swapchain properties: {} ({})", magic_enum::enum_name(result), (UINT) result);
         }
     }
@@ -436,17 +437,18 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
 
         xefg_swapchain_properties_t props {};
         auto result = XeFGProxy::GetProperties()(_swapChainContext, &props);
-        const int ceiling = Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5);
         if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
+            // The lib's reported max is authoritative: counts above it fail (or get clamped silently) while the
+            // limiter and UI would still run with the requested count
             _propsMaxInterpolationCount = props.maxSupportedInterpolations;
-            _maxInterpolationCount = std::max((int) props.maxSupportedInterpolations, ceiling);
-            LOG_INFO("Max supported interpolations: {} (unlocked ceiling: {})", props.maxSupportedInterpolations, _maxInterpolationCount);
+            _maxInterpolationCount = (int) props.maxSupportedInterpolations;
+            LOG_INFO("Max supported interpolations: {}", props.maxSupportedInterpolations);
         }
         else
         {
             _propsMaxInterpolationCount = 1;
-            _maxInterpolationCount = ceiling;
+            _maxInterpolationCount = 1;
             LOG_ERROR("Can't get swapchain properties: {} ({})", magic_enum::enum_name(result), (UINT) result);
         }
     }
@@ -730,8 +732,7 @@ bool XeFG_Dx12::Dispatch()
 
     if (XeFGProxy::SetNumInterpolatedFrames() != nullptr)
     {
-        const int ceiling = Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5);
-        const int maxAllowed = std::max(_maxInterpolationCount, ceiling);
+        const int maxAllowed = std::max(_maxInterpolationCount, 1);
 
         if (Config::Instance()->FGXeFGInterpolationCount.value_or_default() > maxAllowed)
         {
@@ -780,12 +781,24 @@ bool XeFG_Dx12::Dispatch()
 
             auto intResult = XeFGProxy::SetNumInterpolatedFrames()(_swapChainContext, targetCount);
 
-            _framesToInterpolate = targetCount;
-
-            if (intResult != XEFG_SWAPCHAIN_RESULT_SUCCESS)
+            if (intResult == XEFG_SWAPCHAIN_RESULT_SUCCESS)
             {
+                _framesToInterpolate = targetCount;
+            }
+            else
+            {
+                // The count is still the old one: the limiter and UI must not run with a batch the lib
+                // never applied, fall back to the hardware max and let the config follow
                 LOG_ERROR("SetNumInterpolatedFrames error: {} ({})", magic_enum::enum_name(intResult),
                           (UINT) intResult);
+
+                const int fallback = std::min(targetCount, maxAllowed);
+                if (fallback != targetCount &&
+                    XeFGProxy::SetNumInterpolatedFrames()(_swapChainContext, fallback) == XEFG_SWAPCHAIN_RESULT_SUCCESS)
+                {
+                    _framesToInterpolate = fallback;
+                    Config::Instance()->FGXeFGInterpolationCount.set_volatile_value(fallback);
+                }
             }
         }
     }
@@ -1091,6 +1104,10 @@ void XeFG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
         Disable();
         ReleaseResourceCopies();
         _depthInvert.reset();
+
+        // Nothing runs the Dynamic MFG cap while FG is off, a stale one would hold the limiters at the
+        // last target (just under the refresh rate) for the whole disabled period
+        state.xefgDynamicCapFps = 0.0f;
 
         state.clearCapturedHudlesses = true;
         Hudfix_Dx12::ResetCounters();

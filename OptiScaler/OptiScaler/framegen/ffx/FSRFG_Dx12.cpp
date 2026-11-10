@@ -1484,12 +1484,16 @@ void FSRFG_Dx12::Deactivate()
             result = FfxApiProxy::D3D12_Configure(&_fgContext, &fgConfig.header);
 
             if (result == FFX_API_RETURN_OK)
+            {
                 _isActive = false;
+                _waitingNewFrameData = false;
+            }
         }
         else
         {
             LOG_DEBUG("No context to deactivate, just set  active to false");
             _isActive = false;
+            _waitingNewFrameData = false;
         }
 
         // _lastDispatchedFrame = 0;
