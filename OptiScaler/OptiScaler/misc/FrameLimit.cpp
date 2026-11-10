@@ -4,6 +4,7 @@
 #include "Config.h"
 #include "State.h"
 #include <framegen/IFGFeature.h>
+#include <low_latency/input/input_common.h>
 // #include "hooks/D3D11Hooks.h"
 
 // https://learn.microsoft.com/en-us/windows/win32/sync/using-waitable-timer-objects
@@ -93,11 +94,16 @@ void FrameLimit::sleep(bool fgActive)
         {
             static bool errorLogged = false;
 
+            const auto sleepStart = Util::GetTimestamp();
             if (auto res = combined_sleep(min_interval_us * 1000 - frame_time); res && !errorLogged)
             {
                 LOG_ERROR("Sleep command failed: {}", res);
                 errorLogged = true;
             }
+
+            // Dynamic MFG only sees the low latency output's sleep, its "reachable fps" needs the
+            // limiter's wait too, else it underestimates what the game can reach and mis-ratchets
+            InputCommon::add_sleep_ms((Util::GetTimestamp() - sleepStart) / 1e6);
         }
         previous_frame_time = Util::GetTimestamp();
     }

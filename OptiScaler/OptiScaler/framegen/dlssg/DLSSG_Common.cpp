@@ -60,6 +60,7 @@ void DLSSG_Common::Deactivate()
             StreamlineProxy::ReflexSetOptions()(reflexConst);
 
         _isActive = false;
+        _waitingNewFrameData = false;
     }
 }
 

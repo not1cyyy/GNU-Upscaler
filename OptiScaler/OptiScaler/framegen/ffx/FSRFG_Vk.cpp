@@ -706,7 +706,10 @@ void FSRFG_Vk::Deactivate()
         return;
 
     if (_fgContext == nullptr || ConfigureEnabled(false) == FFX_API_RETURN_OK)
+    {
         _isActive = false;
+        _waitingNewFrameData = false;
+    }
 }
 
 void FSRFG_Vk::EvaluateState(FG_Constants& fgConstants)
