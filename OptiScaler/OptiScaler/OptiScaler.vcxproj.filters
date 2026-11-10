@@ -569,6 +569,9 @@
     <ClInclude Include="proxies\XeFG_Proxy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="proxies\XeFG_Unlock.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="proxies\XeLL_Proxy.h">
       <Filter>Header Files</Filter>
     </ClInclude>

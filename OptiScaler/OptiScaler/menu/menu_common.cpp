@@ -5660,8 +5660,9 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                         "It might cause crashes and bad IQ!");
         }
 
+        const int ceiling = std::clamp(config->FGXeFGMaxInterpolatedFrames.value_or(5), 1, 9);
         const int unlockedMax = fgOutput->GetMaxInterpolationCount();
-        const int maxCount = unlockedMax > 0 ? unlockedMax : 1;
+        const int maxCount = std::max({ unlockedMax, ceiling, 1 });
         if (config->FGXeFGInterpolationCount.value_or_default() > maxCount)
             config->FGXeFGInterpolationCount.set_volatile_value(maxCount);
 

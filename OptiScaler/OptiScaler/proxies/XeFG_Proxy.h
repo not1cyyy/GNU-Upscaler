@@ -11,6 +11,7 @@
 #include <xefg_swapchain.h>
 #include <xefg_swapchain_d3d12.h>
 #include <xefg_swapchain_debug.h>
+#include <proxies/XeFG_Unlock.h>
 
 #pragma comment(lib, "Version.lib")
 
@@ -172,6 +173,9 @@ class XeFGProxy
             return false;
 
         _dll = libxefgModule;
+
+        // Apply built-in multi-frame generation unlock patches so libxess_fg reports and supports up to 6X/10X
+        XeFGUnlock::Apply(libxefgModule);
 
         {
             ScopedSkipDxgiLoadChecks skipDxgiLoadChecks {};
