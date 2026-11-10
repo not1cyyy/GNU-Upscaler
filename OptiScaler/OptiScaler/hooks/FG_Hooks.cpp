@@ -1751,11 +1751,14 @@ void FGHooks::ReleaseFGSwapchain(IUnknown* swapchain, bool releaseReferences)
     if (releaseReferences && State::Instance().currentWrappedSwapchain != nullptr &&
         State::Instance().currentSwapchainDesc.OutputWindow == _hwnd)
     {
-        auto refCount = State::Instance().currentWrappedSwapchain->Release();
-
-        while (refCount > 0 && refCount < 0xffffff00)
+        if (!State::Instance().isShuttingDown)
         {
-            refCount = State::Instance().currentWrappedSwapchain->Release();
+            auto refCount = State::Instance().currentWrappedSwapchain->Release();
+
+            while (refCount > 0 && refCount < 0xffffff00)
+            {
+                refCount = State::Instance().currentWrappedSwapchain->Release();
+            }
         }
 
         State::Instance().currentWrappedSwapchain = nullptr;

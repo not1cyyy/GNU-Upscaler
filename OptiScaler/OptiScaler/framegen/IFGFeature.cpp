@@ -299,7 +299,8 @@ void IFGFeature::ResetCounters() { _targetFrame = _frameCount; }
 
 void IFGFeature::UpdateTarget()
 {
-    _targetFrame = _frameCount + 10;
+    // Reduced from 10 frames to 2 frames for near-instant mode changes without noticeable pause/stutter
+    _targetFrame = _frameCount + 2;
     //_lastDispatchedFrame = 0;
     LOG_DEBUG("Current frame: {} target frame: {}", _frameCount, _targetFrame);
 }

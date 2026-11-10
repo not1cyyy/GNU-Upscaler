@@ -40,7 +40,8 @@ inline int FrameLimit::busywait_sleep(int64_t ns)
 
 inline int FrameLimit::combined_sleep(int64_t ns)
 {
-    constexpr int64_t busywait_threshold = 2'000'000; // 2ms
+    // Reduced from 2ms to 250us (0.25ms) to prevent pinning a CPU core at 100% in a busy spin-loop
+    constexpr int64_t busywait_threshold = 250'000; // 0.25ms
     int status {};
     auto current_time = Util::GetTimestamp();
     if (ns <= busywait_threshold)
@@ -48,7 +49,7 @@ inline int FrameLimit::combined_sleep(int64_t ns)
     else
         status = timer_sleep((ns - busywait_threshold) / 100);
 
-    // Busy wait also covers a failed timer
+    // Fine-grained busy wait completes the remaining sub-millisecond precision
     if (int64_t sleep_deviation = ns - (Util::GetTimestamp() - current_time); sleep_deviation > 0)
         busywait_sleep(sleep_deviation);
 

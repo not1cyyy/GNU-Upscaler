@@ -577,7 +577,7 @@ void UpdateFocusState(HWND targetHwnd)
         return;
     }
 
-    HWND targetRoot = targetHwnd != nullptr ? GetAncestor(targetHwnd, GA_ROOT) : _state.TargetRootHwnd;
+    HWND targetRoot = _state.TargetRootHwnd != nullptr ? _state.TargetRootHwnd : (targetHwnd != nullptr ? GetAncestor(targetHwnd, GA_ROOT) : nullptr);
 
     if (foregroundRoot != nullptr && targetRoot != nullptr && foregroundRoot == targetRoot)
     {

@@ -731,13 +731,34 @@ void PollInputFallbackLocked()
     if (_state.PolledMouseUsedThisFrame)
         _state.PolledMouseFrameCount++;
 
-    for (int vk = 0; vk < 256; ++vk)
+    if (_state.MenuVisible)
     {
-        const bool wasDown = _state.Keys[vk].Down;
-        PollVirtualKeyLocked(vk, time);
+        for (int vk = 0; vk < 256; ++vk)
+        {
+            const bool wasDown = _state.Keys[vk].Down;
+            PollVirtualKeyLocked(vk, time);
 
-        if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
-            _state.PolledKeyboardUsedThisFrame = true;
+            if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
+                _state.PolledKeyboardUsedThisFrame = true;
+        }
+    }
+    else
+    {
+        // When overlay menu is closed, poll only potential shortcut/toggle keys to save ~240 Win32 syscalls per frame
+        static const int shortcutKeys[] = {
+            VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT,
+            VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
+            VK_PAUSE, VK_SCROLL, VK_SNAPSHOT, VK_OEM_3
+        };
+
+        for (int vk : shortcutKeys)
+        {
+            const bool wasDown = _state.Keys[vk].Down;
+            PollVirtualKeyLocked(vk, time);
+
+            if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
+                _state.PolledKeyboardUsedThisFrame = true;
+        }
     }
 
     if (_state.PolledKeyboardUsedThisFrame)

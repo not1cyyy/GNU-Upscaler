@@ -241,6 +241,8 @@ bool Config::Reload(std::filesystem::path iniPath)
             {
                 FGXeFGMaxInterpolatedFrames.reset();
             }
+            FGXeFGPaceOnSwapchain.set_from_config(readBool("XeFG", "PaceOnSwapchain"));
+            FGXeFGAllowDilatedMV.set_from_config(readBool("XeFG", "AllowDilatedMV"));
         }
 
         {
@@ -1475,6 +1477,10 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->FGXeFGForceBorderless.value_for_config()).c_str());
         ini.SetValue("XeFG", "MaxInterpolatedFrames",
                      GetIntValue(Instance()->FGXeFGMaxInterpolatedFrames.value_for_config()).c_str());
+        ini.SetValue("XeFG", "PaceOnSwapchain",
+                     GetBoolValue(Instance()->FGXeFGPaceOnSwapchain.value_for_config()).c_str());
+        ini.SetValue("XeFG", "AllowDilatedMV",
+                     GetBoolValue(Instance()->FGXeFGAllowDilatedMV.value_for_config()).c_str());
     }
 
     {
