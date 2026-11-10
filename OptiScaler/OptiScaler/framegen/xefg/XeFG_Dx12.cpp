@@ -788,10 +788,6 @@ bool XeFG_Dx12::Dispatch()
         {
             LOG_INFO("Interpolation count changed {} -> {}", _framesToInterpolate, targetCount);
 
-            // XeFG 3.x changes the count at the next frame, Dynamic MFG's own changes skip the FG toggle
-            if (!dynamicChange)
-                state.WAR_xefgRequestFGToggle = true;
-
 #ifndef DONT_USE_XMX
             ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
 #endif // !DONT_USE_XMX
@@ -801,21 +797,19 @@ bool XeFG_Dx12::Dispatch()
             if (intResult == XEFG_SWAPCHAIN_RESULT_SUCCESS)
             {
                 _framesToInterpolate = targetCount;
+
+                // XeFG changes count at next frame; toggle FG once to rebase limiters
+                if (!dynamicChange)
+                    state.WAR_xefgRequestFGToggle = true;
             }
             else
             {
-                // The count is still the old one: the limiter and UI must not run with a batch the lib
-                // never applied, fall back to the hardware max and let the config follow
                 LOG_ERROR("SetNumInterpolatedFrames error: {} ({})", magic_enum::enum_name(intResult),
                           (UINT) intResult);
 
-                const int fallback = std::min(targetCount, maxAllowed);
-                if (fallback != targetCount &&
-                    XeFGProxy::SetNumInterpolatedFrames()(_swapChainContext, fallback) == XEFG_SWAPCHAIN_RESULT_SUCCESS)
-                {
-                    _framesToInterpolate = fallback;
-                    Config::Instance()->FGXeFGInterpolationCount.set_volatile_value(fallback);
-                }
+                // Prevent rapid toggle oscillation: sync config back to active working count
+                Config::Instance()->FGXeFGInterpolationCount.set_volatile_value(
+                    _framesToInterpolate > 0 ? _framesToInterpolate : 1);
             }
         }
     }

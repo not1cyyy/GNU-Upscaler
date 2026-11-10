@@ -263,15 +263,29 @@ static void RegisterLoadedAsi(const std::filesystem::path& path)
 
 void LoadAsiPlugins()
 {
-    std::filesystem::path pluginPath(Config::Instance()->PluginPath.value_or(L"plugins"));
-    auto folderPath = pluginPath.wstring();
+    std::vector<std::filesystem::path> searchPaths;
 
-    LOG_DEBUG(L"Checking {} for *.asi", folderPath);
+    if (Config::Instance()->PluginPath.has_value())
+        searchPaths.push_back(Config::Instance()->PluginPath.value());
 
-    if (!std::filesystem::exists(pluginPath))
-        return;
+    auto dllDir = Util::DllPath().parent_path();
+    searchPaths.push_back(dllDir / L"plugins");
 
-    for (const auto& entry : std::filesystem::directory_iterator(folderPath))
+    auto exeDir = Util::ExePath().parent_path();
+    if (exeDir != dllDir)
+        searchPaths.push_back(exeDir / L"plugins");
+
+    std::vector<std::wstring> loadedFileNames;
+
+    for (const auto& pluginPath : searchPaths)
+    {
+        auto folderPath = pluginPath.wstring();
+        LOG_DEBUG(L"Checking {} for *.asi", folderPath);
+
+        if (!std::filesystem::exists(pluginPath) || !std::filesystem::is_directory(pluginPath))
+            continue;
+
+        for (const auto& entry : std::filesystem::directory_iterator(folderPath))
     {
         if (!entry.is_regular_file())
             continue;
@@ -284,6 +298,11 @@ void LoadAsiPlugins()
             std::wstring fileName = entry.path().filename().wstring();
             std::transform(fileName.begin(), fileName.end(), fileName.begin(),
                            [](wchar_t c) { return std::towlower(c); });
+
+            if (std::find(loadedFileNames.begin(), loadedFileNames.end(), fileName) != loadedFileNames.end())
+                continue;
+
+            loadedFileNames.push_back(fileName);
 
             if (fileName.rfind(L"-loadlate") != std::wstring::npos)
             {
@@ -342,6 +361,7 @@ void LoadAsiPlugins()
             }
         }
     }
+}
 
     if (_lateLoadingEntries.size() > 0)
     {
