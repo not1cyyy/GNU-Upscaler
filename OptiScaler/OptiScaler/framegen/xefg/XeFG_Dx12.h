@@ -26,6 +26,7 @@ class XeFG_Dx12 : public virtual IFGFeature_Dx12
     std::optional<bool> _haveHudless = std::nullopt;
     bool _uiComposition = false;
     uint32_t _propsMaxInterpolationCount = 1;
+    HANDLE _swapchainWaitable = nullptr;
 
     // Dynamic MFG
     XeFG_DynamicMFG _dynamic;

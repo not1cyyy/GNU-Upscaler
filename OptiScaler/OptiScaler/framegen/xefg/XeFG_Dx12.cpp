@@ -183,6 +183,7 @@ bool XeFG_Dx12::DestroySwapchainContext()
         {
             State::Instance().currentFGSwapchain = nullptr;
             _allowLowerFrameId = true;
+            _swapchainWaitable = nullptr;
 
             // New context starts with its defaults, Dispatch sets them again
             _framesToInterpolate = -1;
@@ -423,6 +424,21 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     _swapChain = *swapChain;
     _hwnd = hwnd;
 
+    if (*swapChain != nullptr)
+    {
+        IDXGISwapChain2* sc2 = nullptr;
+        if (SUCCEEDED((*swapChain)->QueryInterface(IID_PPV_ARGS(&sc2))) && sc2 != nullptr)
+        {
+            DXGI_SWAP_CHAIN_DESC1 d1 {};
+            if (SUCCEEDED(sc2->GetDesc1(&d1)) && (d1.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
+            {
+                _swapchainWaitable = sc2->GetFrameLatencyWaitableObject();
+                LOG_INFO("XeFG: acquired swapchain waitable object {:X}", (size_t) _swapchainWaitable);
+            }
+            sc2->Release();
+        }
+    }
+
     return true;
 }
 
@@ -566,6 +582,21 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
     _swapChain = *swapChain;
     _hwnd = hwnd;
 
+    if (*swapChain != nullptr)
+    {
+        IDXGISwapChain2* sc2 = nullptr;
+        if (SUCCEEDED((*swapChain)->QueryInterface(IID_PPV_ARGS(&sc2))) && sc2 != nullptr)
+        {
+            DXGI_SWAP_CHAIN_DESC1 d1 {};
+            if (SUCCEEDED(sc2->GetDesc1(&d1)) && (d1.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
+            {
+                _swapchainWaitable = sc2->GetFrameLatencyWaitableObject();
+                LOG_INFO("XeFG: acquired swapchain waitable object {:X}", (size_t) _swapchainWaitable);
+            }
+            sc2->Release();
+        }
+    }
+
     return true;
 }
 
@@ -609,10 +640,14 @@ void XeFG_Dx12::Activate()
     if (State::Instance().activeFgInput == FGInput::Upscaler && currentFeature != nullptr)
         nativeAA = currentFeature->RenderWidth() == currentFeature->DisplayWidth();
 
+    const bool allowDilatedMV = Config::Instance()->FGXeFGAllowDilatedMV.value_or_default();
     if (_swapChainContext != nullptr && _fgContext != nullptr && !_isActive &&
         (IsLowResMV() || nativeAA || (State::Instance().gameQuirks & GameQuirk::ForceFGRenderSizeMVs) ||
-         Config::Instance()->FGXeFGIgnoreInitChecks.value_or_default()))
+         Config::Instance()->FGXeFGIgnoreInitChecks.value_or_default() || allowDilatedMV))
     {
+        if (!IsLowResMV() && !nativeAA && allowDilatedMV)
+            LOG_INFO("Dilated (high-res) motion vectors allowed by XeFG AllowDilatedMV");
+
         auto result = XeFGProxy::SetEnabled()(_swapChainContext, true);
 
         if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
@@ -1404,6 +1439,11 @@ bool XeFG_Dx12::Present()
     }
 
     _fgFramePresentId++;
+
+    if (Config::Instance()->FGXeFGPaceOnSwapchain.value_or(true) && _swapchainWaitable != nullptr && IsActive() && !IsPaused())
+    {
+        WaitForSingleObjectEx(_swapchainWaitable, 100, TRUE);
+    }
 
     return Dispatch();
 }

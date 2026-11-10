@@ -5608,8 +5608,10 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
         if (state.activeFgInput == FGInput::Upscaler && currentFeature != nullptr)
             nativeAA = currentFeature->RenderWidth() == currentFeature->DisplayWidth();
 
+        bool allowDilatedMV = config->FGXeFGAllowDilatedMV.value_or_default();
         const bool correctMVs = fgOutput->IsLowResMV() || nativeAA ||
-                                (State::Instance().gameQuirks & GameQuirk::ForceFGRenderSizeMVs) || ignoreChecks;
+                                (State::Instance().gameQuirks & GameQuirk::ForceFGRenderSizeMVs) ||
+                                ignoreChecks || allowDilatedMV;
 
         if (!correctMVs || state.realExclusiveFullscreen)
         {
@@ -5629,7 +5631,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
         else
         {
             if (!correctMVs)
-                ImGui::TextColored(StatusError(), "Requires disabling dilated motion vectors");
+                ImGui::TextColored(StatusError(), "Requires disabling dilated motion vectors (or check 'Allow Dilated Motion Vectors')");
 
             if (!ignoreChecks && state.realExclusiveFullscreen)
             {
@@ -5658,9 +5660,11 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                         "It might cause crashes and bad IQ!");
         }
 
-        const int ceiling = std::clamp(config->FGXeFGMaxInterpolatedFrames.value_or(5), 1, 9);
-        const int maxCount =
-            std::max({ fgOutput->GetMaxInterpolationCount(), ceiling, config->FGXeFGInterpolationCount.value_or(1) });
+        const int unlockedMax = fgOutput->GetMaxInterpolationCount();
+        const int maxCount = unlockedMax > 0 ? unlockedMax : 1;
+        if (config->FGXeFGInterpolationCount.value_or_default() > maxCount)
+            config->FGXeFGInterpolationCount.set_volatile_value(maxCount);
+
         const bool dynamicMFG = maxCount >= 1 && config->FGXeFGDynamicMFG.value_or_default();
 
         // Frame Gen at 2X: Dynamic MFG only switches between off and 2X
@@ -5713,6 +5717,16 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             ShowTooltip("Changes the multiplier on the fly to hit the target FPS,\n"
                         "up to the Frame Gen setting (at 2X: FG on or off).");
         }
+
+        bool paceOnSwapchain = config->FGXeFGPaceOnSwapchain.value_or(true);
+        if (GnuUi::Checkbox("Pace on Swapchain", &paceOnSwapchain))
+            config->FGXeFGPaceOnSwapchain = paceOnSwapchain;
+        GnuUi::Help("Synchronizes generated frames with the DXGI frame latency waitable object to prevent burst stutter");
+
+        ImGui::SameLine(0.0f, 16.0f);
+        if (GnuUi::Checkbox("Allow Dilated Motion Vectors", &allowDilatedMV))
+            config->FGXeFGAllowDilatedMV = allowDilatedMV;
+        GnuUi::Help("Allows Unreal Engine full-resolution dilated motion vectors without requiring game-side disabling");
 
         if (dynamicMFG)
         {

@@ -732,6 +732,8 @@ class Config
     CustomOptional<bool> FGXeFGDebugView { false };
     CustomOptional<bool, SoftDefault> FGXeFGForceBorderless { false };
     CustomOptional<int> FGXeFGMaxInterpolatedFrames { 5 };
+    CustomOptional<bool> FGXeFGPaceOnSwapchain { true };
+    CustomOptional<bool> FGXeFGAllowDilatedMV { false };
 
     // DLSSG
     CustomOptional<int> FGDLSSGInterpolationCount { 1 }; // For Opti's own SL instance

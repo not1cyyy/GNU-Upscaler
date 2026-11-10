@@ -2170,21 +2170,26 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         // unhookAdvapi32();
         // DetachHooks();
 
-        if (skModule != nullptr)
-            NtdllProxy::FreeLibrary_Ldr(skModule);
-
-        if (reshadeModule != nullptr)
-            NtdllProxy::FreeLibrary_Ldr(reshadeModule);
-
-        if (_asiHandles.size() > 0)
+        // Only free modules on explicit FreeLibrary, NEVER during process termination (lpReserved != nullptr)
+        // Calling FreeLibrary while other threads are being terminated triggers access violations in the render thread.
+        if (lpReserved == nullptr)
         {
-            for (size_t i = 0; i < _asiHandles.size(); i++)
-                NtdllProxy::FreeLibrary_Ldr(_asiHandles[i]);
-        }
+            if (skModule != nullptr)
+                NtdllProxy::FreeLibrary_Ldr(skModule);
 
-        for (const PVOID& v : State::Instance().modulesToFree)
-        {
-            NtdllProxy::FreeLibrary_Ldr(v);
+            if (reshadeModule != nullptr)
+                NtdllProxy::FreeLibrary_Ldr(reshadeModule);
+
+            if (_asiHandles.size() > 0)
+            {
+                for (size_t i = 0; i < _asiHandles.size(); i++)
+                    NtdllProxy::FreeLibrary_Ldr(_asiHandles[i]);
+            }
+
+            for (const PVOID& v : State::Instance().modulesToFree)
+            {
+                NtdllProxy::FreeLibrary_Ldr(v);
+            }
         }
 
         spdlog::info("");
