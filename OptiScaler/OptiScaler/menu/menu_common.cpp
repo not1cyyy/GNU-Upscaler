@@ -5894,6 +5894,73 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             }
 
             ImGui::Spacing();
+            GnuUi::SectionHeader("Engine Initialization (Restart Required)");
+            ImGui::TextDisabled("Startup-allocated parameters. Changes are saved to OptiScaler.ini and apply on next launch.");
+            ImGui::Spacing();
+
+            // 1. Max Interpolated Frames (Ceiling Cap)
+            const char* capLabels[] = {
+                "2X (Max 1 Frame)",
+                "3X (Max 2 Frames)",
+                "4X (Max 3 Frames)",
+                "6X (Max 5 Frames - Default)",
+                "8X (Max 7 Frames)",
+                "10X (Max 9 Frames - High-Refresh)"
+            };
+            const int capValues[] = { 1, 2, 3, 5, 7, 9 };
+
+            int currentCeiling = std::clamp(config->FGXeFGMaxInterpolatedFrames.value_or(5), 1, 9);
+            int currentCapIdx = 3;
+            for (int i = 0; i < IM_ARRAYSIZE(capValues); ++i)
+            {
+                if (capValues[i] == currentCeiling)
+                {
+                    currentCapIdx = i;
+                    break;
+                }
+            }
+
+            ImGui::SetNextItemWidth(220.0f * menuResScale);
+            if (ImGui::Combo("Max Frame Cap##xefgCeiling", &currentCapIdx, capLabels, IM_ARRAYSIZE(capLabels)))
+            {
+                config->FGXeFGMaxInterpolatedFrames = capValues[currentCapIdx];
+                config->SaveIni();
+            }
+            GnuUi::Help("Configures [XeFG] MaxInterpolatedFrames in OptiScaler.ini. Sized at startup to allocate swapchain buffers. Requires game restart.");
+
+            ImGui::SameLine();
+            ImGui::TextColored(StatusWarn(), "[Restart Required]");
+
+            // 2. XeFG Depth Inverted
+            bool depthInverted = config->FGXeFGDepthInverted.value_or_default();
+            if (GnuUi::Checkbox("Inverted Depth##xefgInit", &depthInverted))
+            {
+                config->FGXeFGDepthInverted = depthInverted;
+                config->SaveIni();
+            }
+            GnuUi::Help("Inverts depth buffer values for XeFG. Must match game depth direction. Requires game restart.");
+
+            ImGui::SameLine(0.0f, 16.0f);
+            // 3. Jittered Motion Vectors
+            bool jitteredMVs = config->FGXeFGJitteredMV.value_or_default();
+            if (GnuUi::Checkbox("Jittered Motion Vectors##xefgInit", &jitteredMVs))
+            {
+                config->FGXeFGJitteredMV = jitteredMVs;
+                config->SaveIni();
+            }
+            GnuUi::Help("Tells XeFG that motion vectors contain camera jitter. Requires game restart.");
+
+            ImGui::SameLine(0.0f, 16.0f);
+            // 4. High-Res Motion Vectors
+            bool highResMVs = config->FGXeFGHighResMV.value_or_default();
+            if (GnuUi::Checkbox("High-Res Motion Vectors##xefgInit", &highResMVs))
+            {
+                config->FGXeFGHighResMV = highResMVs;
+                config->SaveIni();
+            }
+            GnuUi::Help("Informs XeFG that motion vectors are at display resolution. Requires game restart.");
+
+            ImGui::Spacing();
             ImGui::Spacing();
         }
     }
