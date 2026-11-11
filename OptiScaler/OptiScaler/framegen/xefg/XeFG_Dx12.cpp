@@ -366,7 +366,11 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
 
     params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;
 
-    if (Config::Instance()->FGXeFGDepthInverted.value_or_default())
+    const bool depthInverted = Config::Instance()->FGXeFGDepthInverted.has_value()
+                                   ? Config::Instance()->FGXeFGDepthInverted.value()
+                                   : (State::Instance().gameEngine == GameEngineType::Unreal);
+
+    if (depthInverted)
         params.initFlags |= XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH;
 
     if (Config::Instance()->FGXeFGJitteredMV.value_or_default())
@@ -378,11 +382,12 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     if (!Config::Instance()->FGUIPremultipliedAlpha.value_or_default())
         params.initFlags |= XEFG_SWAPCHAIN_INIT_FLAG_UITEXTURE_NOT_PREMUL_ALPHA;
 
-    LOG_DEBUG("Inverted Depth: {}", Config::Instance()->FGXeFGDepthInverted.value_or_default());
+    LOG_DEBUG("Inverted Depth: {} (auto-engine: {})", depthInverted,
+              State::Instance().gameEngine == GameEngineType::Unreal);
     LOG_DEBUG("Jittered Velocity: {}", Config::Instance()->FGXeFGJitteredMV.value_or_default());
     LOG_DEBUG("High Res MV: {}", Config::Instance()->FGXeFGHighResMV.value_or_default());
 
-    if (Config::Instance()->FGXeFGDepthInverted.value_or_default())
+    if (depthInverted)
         _constants.flags |= FG_Flags::InvertedDepth;
 
     if (Config::Instance()->FGXeFGJitteredMV.value_or_default())
@@ -523,7 +528,11 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
 
     params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;
 
-    if (Config::Instance()->FGXeFGDepthInverted.value_or_default())
+    const bool depthInverted = Config::Instance()->FGXeFGDepthInverted.has_value()
+                                   ? Config::Instance()->FGXeFGDepthInverted.value()
+                                   : (State::Instance().gameEngine == GameEngineType::Unreal);
+
+    if (depthInverted)
         params.initFlags |= XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH;
 
     if (Config::Instance()->FGXeFGJitteredMV.value_or_default())
@@ -535,11 +544,12 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
     if (!Config::Instance()->FGUIPremultipliedAlpha.value_or_default())
         params.initFlags |= XEFG_SWAPCHAIN_INIT_FLAG_UITEXTURE_NOT_PREMUL_ALPHA;
 
-    LOG_DEBUG("Inverted Depth: {}", Config::Instance()->FGXeFGDepthInverted.value_or_default());
+    LOG_DEBUG("Inverted Depth: {} (auto-engine: {})", depthInverted,
+              State::Instance().gameEngine == GameEngineType::Unreal);
     LOG_DEBUG("Jittered Velocity: {}", Config::Instance()->FGXeFGJitteredMV.value_or_default());
     LOG_DEBUG("High Res MV: {}", Config::Instance()->FGXeFGHighResMV.value_or_default());
 
-    if (Config::Instance()->FGXeFGDepthInverted.value_or_default())
+    if (depthInverted)
         _constants.flags |= FG_Flags::InvertedDepth;
 
     if (Config::Instance()->FGXeFGJitteredMV.value_or_default())
@@ -1422,22 +1432,50 @@ bool XeFG_Dx12::Present()
 
     // if (IsActive() && !IsPaused())
     {
+        bool uiReady = false;
         if (_uiCommandListResetted[fIndex])
         {
-            LOG_DEBUG("Executing _uiCommandList[{}]: {:X}", fIndex, (size_t) _uiCommandList[fIndex]);
+            LOG_DEBUG("Closing _uiCommandList[{}]: {:X}", fIndex, (size_t) _uiCommandList[fIndex]);
             auto closeResult = _uiCommandList[fIndex]->Close();
 
             if (closeResult == S_OK)
-                _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
+                uiReady = true;
             else
                 LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
-
-            _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
 
             _uiCommandListResetted[fIndex] = false;
         }
 
-        SubmitSCCommandList(fIndex);
+        bool scReady = false;
+        if (fIndex < BUFFER_COUNT && _scCommandListResetted[fIndex])
+        {
+            LOG_DEBUG("Closing _scCommandList[{}]: {:X}", fIndex, (size_t) _scCommandList[fIndex]);
+            auto closeResult = _scCommandList[fIndex]->Close();
+
+            if (closeResult == S_OK)
+                scReady = true;
+            else
+                LOG_ERROR("_scCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
+
+            _scCommandListResetted[fIndex] = false;
+        }
+
+        // Batch command lists into a single ExecuteCommandLists call to eliminate redundant queue submissions
+        ID3D12CommandList* batchLists[2];
+        UINT batchCount = 0;
+        if (uiReady) batchLists[batchCount++] = _uiCommandList[fIndex];
+        if (scReady) batchLists[batchCount++] = _scCommandList[fIndex];
+
+        if (batchCount > 0)
+        {
+            _gameCommandQueue->ExecuteCommandLists(batchCount, batchLists);
+        }
+
+        if (uiReady)
+            _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
+
+        if (scReady)
+            _scAllocatorFenceValues[fIndex] = SignalSCFence();
     }
 
     if ((_fgFramePresentId - _lastFGFramePresentId) > 3 && IsActive() && !_waitingNewFrameData)
