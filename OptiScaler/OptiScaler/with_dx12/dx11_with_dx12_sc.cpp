@@ -800,9 +800,11 @@ HRESULT STDMETHODCALLTYPE Dx11wDx12SC::CheckColorSpaceSupport(DXGI_COLOR_SPACE_T
 HRESULT STDMETHODCALLTYPE Dx11wDx12SC::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace)
 {
     if (_fgSwapChain != nullptr)
-        return _fgSwapChain->SetColorSpace1(ColorSpace);
+        _fgSwapChain->SetColorSpace1(ColorSpace);
+    else if (_real3 != nullptr)
+        _real3->SetColorSpace1(ColorSpace);
 
-    return _real3 != nullptr ? _real3->SetColorSpace1(ColorSpace) : DXGI_ERROR_DEVICE_REMOVED;
+    return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE Dx11wDx12SC::ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format,

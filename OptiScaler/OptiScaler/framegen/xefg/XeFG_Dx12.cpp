@@ -315,6 +315,8 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     scDesc.BufferUsage = desc->BufferUsage;
     scDesc.Flags = desc->Flags;
     scDesc.Format = desc->BufferDesc.Format;
+    if (Config::Instance()->HDR.value_or_default() || Config::Instance()->UseHDR10.value_or_default())
+        scDesc.Format = Config::Instance()->UseHDR10.value_or_default() ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
     scDesc.Height = desc->BufferDesc.Height;
     scDesc.SampleDesc = desc->SampleDesc;
 
@@ -525,6 +527,9 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
         Config::Instance()->FGXeFGInterpolationCount.set_volatile_value(intTarget);
 
     params.maxInterpolatedFrames = _maxInterpolationCount > 0 ? _maxInterpolationCount : 1;
+
+    if (Config::Instance()->HDR.value_or_default() || Config::Instance()->UseHDR10.value_or_default())
+        desc->Format = Config::Instance()->UseHDR10.value_or_default() ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
 
     params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;
 

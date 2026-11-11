@@ -539,7 +539,10 @@ HRESULT STDMETHODCALLTYPE ReprojectionDXGISwapChain::CheckColorSpaceSupport(DXGI
 
 HRESULT STDMETHODCALLTYPE ReprojectionDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace)
 {
-    return _real3->SetColorSpace1(ColorSpace);
+    if (_real3 != nullptr)
+        _real3->SetColorSpace1(ColorSpace);
+
+    return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE ReprojectionDXGISwapChain::ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height,
