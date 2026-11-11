@@ -115,21 +115,22 @@ bool OS_Vk::Dispatch(VkCommandBuffer InCmdList, const VkImageInfo& InResourceVie
 
     ScopedGpuTime_Vk scopedGpuTime(GpuTime.get(), InCmdList);
 
+    const UINT srcW = InResourceView.Width;
+    const UINT srcH = InResourceView.Height;
+    const UINT dstW = OutResourceView.Width;
+    const UINT dstH = OutResourceView.Height;
+
     // Update Constants
     FsrEasuCon(fsr1Constants.const0, fsr1Constants.const1, fsr1Constants.const2, fsr1Constants.const3,
-               State::Instance().currentFeature->TargetWidth(), State::Instance().currentFeature->TargetHeight(),
-               State::Instance().currentFeature->TargetWidth(), State::Instance().currentFeature->TargetHeight(),
-               State::Instance().currentFeature->DisplayWidth(), State::Instance().currentFeature->DisplayHeight());
+               srcW, srcH, srcW, srcH, dstW, dstH);
 
     // EASU only upscales, downscaling stays on the shader's bilinear path
-    fsr1Constants.squaredRadius =
-        State::Instance().currentFeature->TargetWidth() < State::Instance().currentFeature->DisplayWidth() ? UINT32_MAX
-                                                                                                           : 0;
+    fsr1Constants.squaredRadius = (srcW < dstW) ? UINT32_MAX : 0;
 
-    constants.srcWidth = State::Instance().currentFeature->TargetWidth();
-    constants.srcHeight = State::Instance().currentFeature->TargetHeight();
-    constants.destWidth = State::Instance().currentFeature->DisplayWidth();
-    constants.destHeight = State::Instance().currentFeature->DisplayHeight();
+    constants.srcWidth = srcW;
+    constants.srcHeight = srcH;
+    constants.destWidth = dstW;
+    constants.destHeight = dstH;
 
     // Advance Frame Index
     _currentSetIndex = (_currentSetIndex + 1) % _maxFramesInFlight;

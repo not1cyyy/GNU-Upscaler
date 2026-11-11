@@ -67,20 +67,23 @@ bool OS_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     CreateShaderResourceView(_device, InResource, currentHeap.GetSrvCPU(0));
     CreateUnorderedAccessView(_device, OutResource, currentHeap.GetUavCPU(0), 0);
 
+    auto inDesc = InResource->GetDesc();
+    auto outDesc = OutResource->GetDesc();
+    const UINT srcW = static_cast<UINT>(inDesc.Width);
+    const UINT srcH = inDesc.Height;
+    const UINT dstW = static_cast<UINT>(outDesc.Width);
+    const UINT dstH = outDesc.Height;
+
     FsrEasuCon(fsr1Constants.const0, fsr1Constants.const1, fsr1Constants.const2, fsr1Constants.const3,
-               State::Instance().currentFeature->TargetWidth(), State::Instance().currentFeature->TargetHeight(),
-               State::Instance().currentFeature->TargetWidth(), State::Instance().currentFeature->TargetHeight(),
-               State::Instance().currentFeature->DisplayWidth(), State::Instance().currentFeature->DisplayHeight());
+               srcW, srcH, srcW, srcH, dstW, dstH);
 
     // EASU only upscales, downscaling stays on the shader's bilinear path
-    fsr1Constants.squaredRadius =
-        State::Instance().currentFeature->TargetWidth() < State::Instance().currentFeature->DisplayWidth() ? UINT32_MAX
-                                                                                                           : 0;
+    fsr1Constants.squaredRadius = (srcW < dstW) ? UINT32_MAX : 0;
 
-    constants.srcWidth = State::Instance().currentFeature->TargetWidth();
-    constants.srcHeight = State::Instance().currentFeature->TargetHeight();
-    constants.destWidth = State::Instance().currentFeature->DisplayWidth();
-    constants.destHeight = State::Instance().currentFeature->DisplayHeight();
+    constants.srcWidth = srcW;
+    constants.srcHeight = srcH;
+    constants.destWidth = dstW;
+    constants.destHeight = dstH;
 
     // fsr upscaling
     bool createdConstantsBuffer = false;
@@ -107,12 +110,8 @@ bool OS_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
 
     InCmdList->SetComputeRootDescriptorTable(0, currentHeap.GetTableGPUStart());
 
-    UINT dispatchWidth = 0;
-    UINT dispatchHeight = 0;
-
-    dispatchWidth =
-        static_cast<UINT>((State::Instance().currentFeature->DisplayWidth() + InNumThreadsX - 1) / InNumThreadsX);
-    dispatchHeight = (State::Instance().currentFeature->DisplayHeight() + InNumThreadsY - 1) / InNumThreadsY;
+    UINT dispatchWidth = static_cast<UINT>((dstW + InNumThreadsX - 1) / InNumThreadsX);
+    UINT dispatchHeight = (dstH + InNumThreadsY - 1) / InNumThreadsY;
 
     InCmdList->Dispatch(dispatchWidth, dispatchHeight, 1);
 
