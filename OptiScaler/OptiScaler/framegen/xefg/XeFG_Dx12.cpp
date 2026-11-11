@@ -1221,6 +1221,7 @@ void XeFG_Dx12::ReleaseObjects()
     ReleaseFences();
 
     _renderUI.reset();
+    _hudCopy.reset();
     _hudlessCompare.reset();
     _mvFlip.reset();
     _depthFlip.reset();
@@ -1393,7 +1394,40 @@ bool XeFG_Dx12::Present()
         }
         else if (!ui)
         {
-            LOG_WARN("UI resource is nullptr");
+            auto hudless = GetResource(FG_ResourceType::HudlessColor, fIndex);
+            if (hudless && (hudless->validity == FG_ResourceValidity::UntilPresent ||
+                            hudless->validity == FG_ResourceValidity::UntilPresentFromDispatch))
+            {
+                if (_hudCopy.get() == nullptr && _device != nullptr)
+                {
+                    _hudCopy = std::make_unique<HudCopy_Dx12>("HudCopy", _device);
+                }
+
+                if (auto hudCopy = _hudCopy.get(); hudCopy && hudCopy->IsInit())
+                {
+                    float hudDetectionThreshold = 0.03f;
+                    if (Config::Instance()->FGHudCutoff.value_or_default() > 0.0f)
+                        hudDetectionThreshold = Config::Instance()->FGHudCutoff.value_or_default() / 10.0f;
+
+                    ID3D12Resource* backBuffer = nullptr;
+                    IDXGISwapChain3* sc3 = nullptr;
+                    if (SUCCEEDED(_swapChain->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3 != nullptr)
+                    {
+                        if (SUCCEEDED(sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backBuffer))) && backBuffer != nullptr)
+                        {
+                            auto commandList = GetSCCommandList(fIndex);
+                            hudCopy->Dispatch(commandList, hudless->GetResource(), backBuffer, hudless->state,
+                                              D3D12_RESOURCE_STATE_PRESENT, hudDetectionThreshold);
+                            backBuffer->Release();
+                        }
+                        sc3->Release();
+                    }
+                }
+            }
+            else
+            {
+                LOG_WARN("UI resource is nullptr");
+            }
         }
     }
 

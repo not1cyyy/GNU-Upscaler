@@ -96,9 +96,11 @@ Hooked_Dx12_GetFeatureRequirements(IDXGIAdapter* Adapter, const NVSDK_NGX_Featur
 
     auto result = Original_D3D12_GetFeatureRequirements(Adapter, FeatureDiscoveryInfo, OutSupported);
 
-    if (result == NVSDK_NGX_Result_Success && FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling)
+    if (result == NVSDK_NGX_Result_Success &&
+        (FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling ||
+         FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction))
     {
-        LOG_INFO("Spoofing support!");
+        LOG_INFO("Spoofing support for feature {}!", (uint32_t) FeatureDiscoveryInfo->FeatureID);
         OutSupported->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
         OutSupported->MinHWArchitecture = 0;
         strcpy_s(OutSupported->MinOSVersion, "10.0.10240.16384");
@@ -115,9 +117,11 @@ Hooked_Dx11_GetFeatureRequirements(IDXGIAdapter* Adapter, const NVSDK_NGX_Featur
 
     auto result = Original_D3D11_GetFeatureRequirements(Adapter, FeatureDiscoveryInfo, OutSupported);
 
-    if (result == NVSDK_NGX_Result_Success && FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling)
+    if (result == NVSDK_NGX_Result_Success &&
+        (FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling ||
+         FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction))
     {
-        LOG_INFO("Spoofing support!");
+        LOG_INFO("Spoofing support for feature {}!", (uint32_t) FeatureDiscoveryInfo->FeatureID);
         OutSupported->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
         OutSupported->MinHWArchitecture = 0;
         strcpy_s(OutSupported->MinOSVersion, "10.0.10240.16384");
@@ -135,9 +139,11 @@ Hooked_Vulkan_GetFeatureRequirements(const VkInstance Instance, const VkPhysical
 
     auto result = Original_Vulkan_GetFeatureRequirements(Instance, PhysicalDevice, FeatureDiscoveryInfo, OutSupported);
 
-    if (result == NVSDK_NGX_Result_Success && FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling)
+    if (result == NVSDK_NGX_Result_Success &&
+        (FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling ||
+         FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction))
     {
-        LOG_INFO("Spoofing support!");
+        LOG_INFO("Spoofing support for feature {}!", (uint32_t) FeatureDiscoveryInfo->FeatureID);
         OutSupported->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
         OutSupported->MinHWArchitecture = 0;
         strcpy_s(OutSupported->MinOSVersion, "10.0.10240.16384");
