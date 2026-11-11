@@ -403,12 +403,10 @@ bool ShouldPollVirtualKey(int vk)
     }
 }
 
-void PollVirtualKeyLocked(int vk, DWORD time)
+void UpdateVirtualKeyFromStateLocked(int vk, bool down, DWORD time)
 {
     if (!ShouldPollVirtualKey(vk))
         return;
-
-    const bool down = (RealGetAsyncKeyStateSafe(vk) & 0x8000) != 0;
 
     if (down)
     {
@@ -418,6 +416,15 @@ void PollVirtualKeyLocked(int vk, DWORD time)
 
     if (_state.Keys[vk].Down)
         SetKeyUpStateOnly(vk, time);
+}
+
+void PollVirtualKeyLocked(int vk, DWORD time)
+{
+    if (!ShouldPollVirtualKey(vk))
+        return;
+
+    const bool down = (RealGetAsyncKeyStateSafe(vk) & 0x8000) != 0;
+    UpdateVirtualKeyFromStateLocked(vk, down, time);
 }
 
 bool PollMouseButtonLocked(int vk, int button, DWORD time)
@@ -731,33 +738,68 @@ void PollInputFallbackLocked()
     if (_state.PolledMouseUsedThisFrame)
         _state.PolledMouseFrameCount++;
 
+    BYTE keyState[256] = {};
+    const bool hasKeyboardState = (o_GetKeyboardState != nullptr && o_GetKeyboardState(keyState) != FALSE);
+
     if (_state.MenuVisible)
     {
-        for (int vk = 0; vk < 256; ++vk)
+        if (hasKeyboardState)
         {
-            const bool wasDown = _state.Keys[vk].Down;
-            PollVirtualKeyLocked(vk, time);
+            // Single-call fast path: check all 256 keys directly from memory (0 Wine IPC roundtrips)
+            for (int vk = 0; vk < 256; ++vk)
+            {
+                const bool wasDown = _state.Keys[vk].Down;
+                const bool down = (keyState[vk] & 0x80) != 0;
+                UpdateVirtualKeyFromStateLocked(vk, down, time);
 
-            if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
-                _state.PolledKeyboardUsedThisFrame = true;
+                if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
+                    _state.PolledKeyboardUsedThisFrame = true;
+            }
+        }
+        else
+        {
+            // Fallback to individual polling if GetKeyboardState failed
+            for (int vk = 0; vk < 256; ++vk)
+            {
+                const bool wasDown = _state.Keys[vk].Down;
+                PollVirtualKeyLocked(vk, time);
+
+                if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
+                    _state.PolledKeyboardUsedThisFrame = true;
+            }
         }
     }
     else
     {
-        // When overlay menu is closed, poll only potential shortcut/toggle keys to save ~240 Win32 syscalls per frame
+        // When overlay menu is closed, inspect only potential shortcut/toggle keys
         static const int shortcutKeys[] = {
             VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT,
             VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
             VK_PAUSE, VK_SCROLL, VK_SNAPSHOT, VK_OEM_3
         };
 
-        for (int vk : shortcutKeys)
+        if (hasKeyboardState)
         {
-            const bool wasDown = _state.Keys[vk].Down;
-            PollVirtualKeyLocked(vk, time);
+            for (int vk : shortcutKeys)
+            {
+                const bool wasDown = _state.Keys[vk].Down;
+                const bool down = (keyState[vk] & 0x80) != 0;
+                UpdateVirtualKeyFromStateLocked(vk, down, time);
 
-            if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
-                _state.PolledKeyboardUsedThisFrame = true;
+                if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
+                    _state.PolledKeyboardUsedThisFrame = true;
+            }
+        }
+        else
+        {
+            for (int vk : shortcutKeys)
+            {
+                const bool wasDown = _state.Keys[vk].Down;
+                PollVirtualKeyLocked(vk, time);
+
+                if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
+                    _state.PolledKeyboardUsedThisFrame = true;
+            }
         }
     }
 
