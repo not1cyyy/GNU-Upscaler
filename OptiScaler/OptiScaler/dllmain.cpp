@@ -1643,6 +1643,66 @@ void CheckForExcludedProcess()
         }
     }
 
+    // Anti-Cheat Safety Guard: automatic safe mode for protected multiplayer games
+    static const std::vector<std::wstring> acExecutables = {
+        L"start_protected_game.exe",
+        L"easyanticheat.exe",
+        L"easyanticheat_eos.exe",
+        L"easyanticheat_bootstrapper.exe",
+        L"beservice.exe",
+        L"beservice_x64.exe",
+        L"anticheat_expert.exe",
+        L"vgc.exe"
+    };
+
+    for (const auto& acExe : acExecutables)
+    {
+        if (exeLower == acExe)
+        {
+            _passThruMode = true;
+            return;
+        }
+    }
+
+    if (exeLower.find(L"easyanticheat") != std::wstring::npos ||
+        exeLower.find(L"battleye") != std::wstring::npos)
+    {
+        _passThruMode = true;
+        return;
+    }
+
+    // Check if known anti-cheat modules are present in memory
+    static const std::vector<std::wstring> acModules = {
+        L"EasyAntiCheat_x64.dll",
+        L"EasyAntiCheat.dll",
+        L"EasyAntiCheat_EOS_x64.dll",
+        L"beclient_x64.dll",
+        L"beclient.dll",
+        L"ace-base.dll",
+        L"GameMon64.des",
+        L"GameMon.des"
+    };
+
+    for (const auto& mod : acModules)
+    {
+        if (GetModuleHandleW(mod.c_str()) != nullptr)
+        {
+            _passThruMode = true;
+            return;
+        }
+    }
+
+    // Check if anti-cheat binaries exist alongside the executable
+    auto exeDir = Util::ExePath().parent_path();
+    for (const auto& mod : acModules)
+    {
+        if (std::filesystem::exists(exeDir / mod))
+        {
+            _passThruMode = true;
+            return;
+        }
+    }
+
     _passThruMode = false;
 }
 

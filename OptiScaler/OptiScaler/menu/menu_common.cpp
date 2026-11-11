@@ -5932,8 +5932,8 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             ImGui::SameLine();
             ImGui::TextColored(StatusWarn(), "[Restart Required]");
 
-            // 2. XeFG Depth Inverted
-            bool depthInverted = config->FGXeFGDepthInverted.value_or_default();
+            // 2. XeFG Depth Inverted (auto-defaults to enabled for Unreal Engine)
+            bool depthInverted = config->FGXeFGDepthInverted.value_or(State::Instance().gameEngine == GameEngineType::Unreal);
             if (GnuUi::Checkbox("Inverted Depth##xefgInit", &depthInverted))
             {
                 config->FGXeFGDepthInverted = depthInverted;
