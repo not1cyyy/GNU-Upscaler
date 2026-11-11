@@ -297,7 +297,8 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
     if (Config::Instance()->FsrDebugView.value_or_default())
         params.flags = FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
 
-    if (Config::Instance()->FsrNonLinearPQ.value_or_default())
+    const bool isHDR = State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+    if (Config::Instance()->FsrNonLinearPQ.value_or(isHDR))
         params.flags |= FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ;
     else if (Config::Instance()->FsrNonLinearSRGB.value_or_default())
         params.flags |= FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
