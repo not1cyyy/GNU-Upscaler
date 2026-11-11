@@ -440,8 +440,9 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
             DXGI_SWAP_CHAIN_DESC1 d1 {};
             if (SUCCEEDED(sc2->GetDesc1(&d1)) && (d1.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
             {
+                sc2->SetMaximumFrameLatency(1);
                 _swapchainWaitable = sc2->GetFrameLatencyWaitableObject();
-                LOG_INFO("XeFG: acquired swapchain waitable object {:X}", (size_t) _swapchainWaitable);
+                LOG_INFO("XeFG: configured latency 1 and acquired swapchain waitable object {:X}", (size_t) _swapchainWaitable);
             }
             sc2->Release();
         }
@@ -598,8 +599,9 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
             DXGI_SWAP_CHAIN_DESC1 d1 {};
             if (SUCCEEDED(sc2->GetDesc1(&d1)) && (d1.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
             {
+                sc2->SetMaximumFrameLatency(1);
                 _swapchainWaitable = sc2->GetFrameLatencyWaitableObject();
-                LOG_INFO("XeFG: acquired swapchain waitable object {:X}", (size_t) _swapchainWaitable);
+                LOG_INFO("XeFG: configured latency 1 and acquired swapchain waitable object {:X}", (size_t) _swapchainWaitable);
             }
             sc2->Release();
         }

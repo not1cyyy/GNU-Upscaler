@@ -5,20 +5,37 @@
 #include "State.h"
 #include <framegen/IFGFeature.h>
 #include <low_latency/input/input_common.h>
+#include <immintrin.h>
 // #include "hooks/D3D11Hooks.h"
 
-// https://learn.microsoft.com/en-us/windows/win32/sync/using-waitable-timer-objects
+typedef NTSTATUS(NTAPI* PFN_NtDelayExecution)(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval);
+
+// High-resolution sleep utilizing direct NT syscall under Windows and Wine/Proton.
+// Under Wine, NtDelayExecution maps directly to Linux nanosleep/futex without Win32 waitable timer object allocation.
 inline int FrameLimit::timer_sleep(int64_t hundred_ns)
 {
-    static HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    LARGE_INTEGER due_time;
+    static PFN_NtDelayExecution pfnNtDelayExecution = []() -> PFN_NtDelayExecution {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        return hNtdll ? reinterpret_cast<PFN_NtDelayExecution>(GetProcAddress(hNtdll, "NtDelayExecution")) : nullptr;
+    }();
 
+    LARGE_INTEGER due_time;
     due_time.QuadPart = -hundred_ns;
+
+    if (pfnNtDelayExecution != nullptr)
+    {
+        if (pfnNtDelayExecution(FALSE, &due_time) == 0)
+            return 0;
+    }
+
+    static HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer)
+        timer = CreateWaitableTimerW(NULL, NULL, NULL);
 
     if (!timer)
         return 1;
 
-    if (!SetWaitableTimerEx(timer, &due_time, 0, NULL, NULL, NULL, 0))
+    if (!SetWaitableTimer(timer, &due_time, 0, NULL, NULL, 0))
         return 2;
 
     if (WaitForSingleObject(timer, 1000) != WAIT_OBJECT_0)
@@ -33,6 +50,7 @@ inline int FrameLimit::busywait_sleep(int64_t ns)
     auto wait_until = current_time + ns;
     while (current_time < wait_until)
     {
+        _mm_pause(); // Informs CPU pipeline of spin-wait to avoid core pinning and reduce thermal throttling
         current_time = Util::GetTimestamp();
     }
     return 0;
@@ -90,6 +108,14 @@ void FrameLimit::sleep(bool fgActive)
 
         static uint64_t previous_frame_time = 0;
         uint64_t current_time = Util::GetTimestamp();
+
+        // Rebase frame timing on first activation or after pause/loading screen (>1s gap)
+        if (previous_frame_time == 0 || current_time <= previous_frame_time || (current_time - previous_frame_time) > 1'000'000'000ULL)
+        {
+            previous_frame_time = current_time;
+            return;
+        }
+
         uint64_t frame_time = current_time - previous_frame_time;
         if (frame_time < 1000 * min_interval_us)
         {
