@@ -1411,20 +1411,26 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::CheckColorSpaceSupport(DXGI_CO
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace)
 {
-    auto result = _real3->SetColorSpace1(ColorSpace);
+    LOG_INFO("WrappedIDXGISwapChain4::SetColorSpace1: {}", (UINT) ColorSpace);
+    HRESULT result = S_OK;
 
-    if (SUCCEEDED(result) && IsGameOutput(this, _handle))
+    if (_real3 != nullptr)
+        result = _real3->SetColorSpace1(ColorSpace);
+
+    LOG_INFO("Real SetColorSpace1 result: {:X}", (UINT) result);
+
+    if (IsGameOutput(this, _handle))
     {
         UpdateOutputColorSpace(ColorSpace);
-
         CheckForHdrOutput();
-
         LOG_INFO("Output HDR Active: {}", State::Instance().hdrOutputActive);
-
         MenuOverlayDx::ApplyThemeStyle();
     }
 
-    return result;
+    // Always return S_OK to the game engine. Under Wine/Proton/VKD3D, if the underlying swapchain
+    // returns DXGI_ERROR_UNSUPPORTED, returning failure causes Unreal Engine to fatally abort
+    // via check(SUCCEEDED(hr)) with a 'SwapChain->SetColorSpace1 failed' dialog.
+    return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height,
