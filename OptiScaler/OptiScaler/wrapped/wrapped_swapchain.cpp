@@ -1391,7 +1391,22 @@ UINT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetCurrentBackBufferIndex(void)
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace,
                                                                          UINT* pColorSpaceSupport)
 {
-    return _real3->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport);
+    if (_real3 == nullptr)
+        return DXGI_ERROR_INVALID_CALL;
+
+    auto result = _real3->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport);
+
+    // On Linux/Wine/Proton, ensure PRESENT support is reported for HDR10 and scRGB color spaces
+    // so that game engines (such as Unreal Engine in Stellar Blade) unlock the in-game HDR toggle.
+    if (pColorSpaceSupport != nullptr &&
+        (ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+         ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709))
+    {
+        *pColorSpaceSupport |= DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+        return S_OK;
+    }
+
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace)

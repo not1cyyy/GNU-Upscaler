@@ -523,7 +523,18 @@ UINT STDMETHODCALLTYPE ReprojectionDXGISwapChain::GetCurrentBackBufferIndex(void
 HRESULT STDMETHODCALLTYPE ReprojectionDXGISwapChain::CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace,
                                                                             UINT* pColorSpaceSupport)
 {
-    return _real3->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport);
+    HRESULT result = _real3 != nullptr ? _real3->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport)
+                                       : DXGI_ERROR_DEVICE_REMOVED;
+
+    if (pColorSpaceSupport != nullptr &&
+        (ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+         ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709))
+    {
+        *pColorSpaceSupport |= DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+        return S_OK;
+    }
+
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE ReprojectionDXGISwapChain::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace)

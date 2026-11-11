@@ -7856,9 +7856,9 @@ void MenuCommon::RenderOutputScalingSettings(RenderMenuContext& ctx)
         }
         ImGui::EndDisabled();
 
-        bool applyEnabled = _ssEnabled != config->OutputScalingEnabled.value_or_default() ||
+        bool applyEnabled = !mvDisabled && (_ssEnabled != config->OutputScalingEnabled.value_or_default() ||
                             _ssRatio != config->OutputScalingMultiplier.value_or(defaultRatio) ||
-                            _ssDownsampler != config->OutputScalingDownscaler.value_or_default();
+                            _ssDownsampler != config->OutputScalingDownscaler.value_or_default());
 
         ImGui::BeginDisabled(!applyEnabled);
         if (ImGui::Button("Apply Change"))
@@ -7871,7 +7871,7 @@ void MenuCommon::RenderOutputScalingSettings(RenderMenuContext& ctx)
 
             config->OutputScalingDownscaler = _ssDownsampler;
 
-            const bool usesDlssd = currentFeature->GetUpscalerType() == Upscaler::DLSSD;
+            const bool usesDlssd = currentFeature != nullptr && currentFeature->GetUpscalerType() == Upscaler::DLSSD;
             if (usesDlssd)
                 state.newBackend = Upscaler::DLSSD;
             else
@@ -7881,7 +7881,13 @@ void MenuCommon::RenderOutputScalingSettings(RenderMenuContext& ctx)
         }
         ImGui::EndDisabled();
 
-        ImGui::BeginDisabled(!_ssEnabled || currentFeature->RenderWidth() > currentFeature->DisplayWidth());
+        if (mvDisabled)
+        {
+            ImGui::TextColored(StatusWarn(), "Display-res motion vectors detected; Output Scaling is unsupported in this engine mode.");
+        }
+
+        const bool isRenderOverDisplay = currentFeature != nullptr && currentFeature->RenderWidth() > currentFeature->DisplayWidth();
+        ImGui::BeginDisabled(!_ssEnabled || isRenderOverDisplay);
         ImGui::SliderFloat("Ratio", &_ssRatio, 0.5f, 3.0f, "%.2f");
         ImGui::EndDisabled();
 
