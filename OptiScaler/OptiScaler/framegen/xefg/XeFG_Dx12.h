@@ -6,6 +6,7 @@
 #include <proxies/XeFG_Proxy.h>
 
 #include "shaders/depth_invert/DI_Dx12.h"
+#include <shaders/hud_copy/HudCopy_Dx12.h>
 #include "XeFG_DynamicMFG.h"
 
 #include <xell.h>
@@ -33,6 +34,7 @@ class XeFG_Dx12 : public virtual IFGFeature_Dx12
     void SetGenerationOff(bool off); // Dynamic MFG 1X
 
     std::unique_ptr<DI_Dx12> _depthInvert;
+    std::unique_ptr<HudCopy_Dx12> _hudCopy;
 
     static void xefgLogCallback(const char* message, xefg_swapchain_logging_level_t level, void* userData);
 
