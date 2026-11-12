@@ -149,19 +149,17 @@ bool XeFG_Dx12::CreateSwapchainContext(ID3D12Device* device)
 
 const char* XeFG_Dx12::Name()
 {
-    static std::string nameBuffer;
+    static constexpr const char* names[] = {
+        "XeFG",
+        "XeFG 2x", "XeFG 3x", "XeFG 4x", "XeFG 5x", "XeFG 6x",
+        "XeFG 7x", "XeFG 8x", "XeFG 9x", "XeFG 10x"
+    };
 
-    if (_maxInterpolationCount == 1 || _framesToInterpolate < 0)
-    {
-        nameBuffer = "XeFG";
-    }
-    else
-    {
-        auto count = _framesToInterpolate + 1;
-        nameBuffer = "XeFG " + std::to_string(count) + "x";
-    }
+    if (_maxInterpolationCount == 1 || _framesToInterpolate < 1)
+        return "XeFG";
 
-    return nameBuffer.c_str();
+    const int index = std::clamp(_framesToInterpolate, 1, 9);
+    return names[index];
 }
 
 feature_version XeFG_Dx12::Version()
