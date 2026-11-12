@@ -5732,32 +5732,21 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
 
         if (dynamicMFG)
         {
-            // Applied on release, dragging doesn't restart Dynamic MFG every frame.
-            // The slider's lowest step (9) is Auto, the lowest target is 10.
-            constexpr float autoStep = 9.0f;
-            static float xefgFpsTarget = std::max(config->FGXeFGFramerateTargetDMFG.value_or_default(), autoStep);
-
-            // Re-sync with the config when the slider isn't in use, ini reloads and resets show up
-            if (!ImGui::IsItemActive() && config->FGXeFGFramerateTargetDMFG.has_value() &&
-                config->FGXeFGFramerateTargetDMFG.value() != xefgFpsTarget)
-                xefgFpsTarget = config->FGXeFGFramerateTargetDMFG.value();
-
-            const float fpsSliderMax = (float) std::max(200, refreshRate);
+            float xefgFpsTarget = config->FGXeFGFramerateTargetDMFG.value_or(144.0f);
+            const float fpsSliderMax = 360.0f;
 
             ImGui::SetNextItemWidth(150.0f * menuResScale);
-            ImGui::SliderFloat("Target FPS##xefg", &xefgFpsTarget, autoStep, fpsSliderMax,
-                               xefgFpsTarget < autoStep + 0.5f ? "Auto" : "%.0f", ImGuiSliderFlags_AlwaysClamp);
-
+            if (ImGui::SliderFloat("Target FPS##xefg", &xefgFpsTarget, 30.0f, fpsSliderMax, "%.0f FPS", ImGuiSliderFlags_AlwaysClamp))
+            {
+                config->FGXeFGFramerateTargetDMFG = xefgFpsTarget;
+            }
             if (ImGui::IsItemDeactivatedAfterEdit())
             {
-                if (xefgFpsTarget < autoStep + 0.5f)
-                    config->FGXeFGFramerateTargetDMFG.reset();
-                else
-                    config->FGXeFGFramerateTargetDMFG = xefgFpsTarget;
+                config->SaveIni();
             }
 
             ShowTooltip("Presented FPS to aim for, never above the FPS limit.\n"
-                        "Auto: the FPS limit, or just under the refresh rate.");
+                        "Dynamic MFG will modulate multipliers between 2X and your cap to hold this target.");
 
             // The cap picks from 2X up, it needs a higher Frame Gen setting
             const bool targetAsCap = config->FGXeFGTargetAsCapDMFG.value_or_default() && !dynamicOnOff;
@@ -7717,6 +7706,8 @@ void MenuCommon::RenderUpscaleRatioSettings(RenderMenuContext& ctx)
     {
         config->GaqEnabled = gaqEnabled;
         config->SaveIni();
+        if (gaqEnabled)
+            ReInitUpscaler();
     }
     GnuUi::Help("Dynamically adjusts internal render scale using a hardware PID controller to maintain your target framerate.");
 
@@ -7729,10 +7720,19 @@ void MenuCommon::RenderUpscaleRatioSettings(RenderMenuContext& ctx)
             config->GaqTargetFps = gaqTarget;
         }
         if (ImGui::IsItemDeactivatedAfterEdit())
+        {
             config->SaveIni();
+            ReInitUpscaler();
+        }
 
         float currentGaqRatio = GaqController::Instance().CurrentRatio();
         ImGui::TextDisabled("GAQ Live Scale: %.2fx (%.1f%% resolution)", currentGaqRatio, (1.0f / currentGaqRatio) * 100.0f);
+        ImGui::SameLine(0.0f, 12.0f);
+        if (GnuUi::Button("Sync Scale##gaq"))
+        {
+            ReInitUpscaler();
+        }
+        GnuUi::Help("Forces the game engine to re-query the new dynamic render resolution immediately.");
         ImGui::Spacing();
     }
 

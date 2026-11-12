@@ -6,10 +6,17 @@
 #include <proxies/NVNGX_Proxy.h>
 #include <NVNGX_Parameter.h>
 #include <nvsdk_ngx_vk.h>
+#include <misc/GaqController.h>
 
 static std::optional<float> GetQualityOverrideRatio(const xess_quality_settings_t input)
 {
     std::optional<float> output;
+
+    if (Config::Instance()->GaqEnabled.value_or_default())
+    {
+        output = GaqController::Instance().Update(Util::MillisecondsNow());
+        return output;
+    }
 
     auto sliderLimit = Config::Instance()->ExtendedLimits.value_or_default() ? 0.1f : 1.0f;
 

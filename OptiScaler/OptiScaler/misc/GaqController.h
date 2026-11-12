@@ -15,9 +15,11 @@ class GaqController
         return instance;
     }
 
-    float Update(double nowMs, double frameTimeMs)
+    float Update(double nowMs)
     {
         auto config = Config::Instance();
+        auto& state = State::Instance();
+
         if (!config->GaqEnabled.value_or_default())
         {
             _currentRatio = config->GaqMinRatio.value_or_default();
@@ -29,8 +31,12 @@ class GaqController
         const float targetFps = std::clamp(config->GaqTargetFps.value_or_default(), 20.0f, 360.0f);
         const float targetFrameTime = 1000.0f / targetFps;
 
-        // Discard extreme outlier frames (loading screens, pause transitions > 200ms)
-        if (frameTimeMs <= 0.0 || frameTimeMs > 200.0)
+        // Use presentFrameTime first (updated every present regardless of FG state), then fall back to lastFGFrameTime
+        const double frameTimeMs = state.presentFrameTime > 0.0 ? state.presentFrameTime
+                                                               : (state.lastFGFrameTime > 0.0 ? state.lastFGFrameTime : 16.6);
+
+        // Discard extreme outlier frames (loading screens, pause transitions > 250ms)
+        if (frameTimeMs <= 0.0 || frameTimeMs > 250.0)
             return _currentRatio;
 
         const float dt = (_lastTimeMs > 0.0) ? static_cast<float>((nowMs - _lastTimeMs) / 1000.0) : 0.016f;
@@ -42,13 +48,13 @@ class GaqController
         // Positive error means the frame took longer than target (framerate is too low) -> increase ratio to reduce pixels
         const float error = static_cast<float>(frameTimeMs) - targetFrameTime;
 
-        // PID parameters calibrated for smooth sub-pixel resolution shifts
-        constexpr float Kp = 0.005f;
-        constexpr float Ki = 0.0015f;
-        constexpr float Kd = 0.0008f;
+        // PID parameters calibrated for responsive resolution tracking
+        constexpr float Kp = 0.015f;
+        constexpr float Ki = 0.004f;
+        constexpr float Kd = 0.002f;
 
-        // Deadband of 0.5ms to prevent oscillation around target
-        if (std::abs(error) > 0.5f)
+        // Deadband of 0.3ms to prevent oscillation around target
+        if (std::abs(error) > 0.3f)
         {
             _integral = std::clamp(_integral + error * dt, -50.0f, 50.0f);
             const float derivative = (error - _lastError) / dt;
@@ -69,6 +75,11 @@ class GaqController
         }
 
         return _currentRatio;
+    }
+
+    float Update(double nowMs, double frameTimeMs)
+    {
+        return Update(nowMs);
     }
 
     float CurrentRatio() const { return _currentRatio; }
