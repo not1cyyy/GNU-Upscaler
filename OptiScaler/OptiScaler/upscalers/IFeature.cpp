@@ -1,6 +1,7 @@
 #include <pch.h>
 #include <Config.h>
 #include "IFeature.h"
+#include <State.h>
 
 void IFeature::SetHandle(unsigned int InHandleId)
 {
@@ -370,4 +371,9 @@ void IFeature::GetDynamicOutputResolution(NVSDK_NGX_Parameter* InParameters, uns
         *width = fsrDynamicOutputWidth;
         *height = fsrDynamicOutputHeight;
     }
+}
+
+bool IFeature::IsHdr()
+{
+    return _initFlags.IsHdr || State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
 }
