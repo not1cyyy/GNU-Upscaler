@@ -155,7 +155,7 @@ class IFeature
 
     virtual bool AutoExposure() { return _initFlags.AutoExposure; }
     virtual bool DepthInverted() { return _initFlags.DepthInverted; }
-    virtual bool IsHdr() { return _initFlags.IsHdr || State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ; }
+    virtual bool IsHdr();
     virtual bool JitteredMV() { return _initFlags.JitteredMV; }
     virtual bool LowResMV() { return _initFlags.LowResMV; }
     virtual bool DynamicResolution() { return _initFlags.DynamicResolution; }
