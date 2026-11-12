@@ -243,6 +243,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             }
             FGXeFGPaceOnSwapchain.set_from_config(readBool("XeFG", "PaceOnSwapchain"));
             FGXeFGAllowDilatedMV.set_from_config(readBool("XeFG", "AllowDilatedMV"));
+            FGXeFGMinBaseFps.set_from_config(readFloat("XeFG", "MinBaseFps"));
         }
 
         {
@@ -625,6 +626,14 @@ bool Config::Reload(std::filesystem::path iniPath)
         {
             DrsMinOverrideEnabled.set_from_config(readBool("DRS", "DrsMinOverrideEnabled"));
             DrsMaxOverrideEnabled.set_from_config(readBool("DRS", "DrsMaxOverrideEnabled"));
+        }
+
+        // GAQ (GNU Adaptive Quality - Auto-DRS)
+        {
+            GaqEnabled.set_from_config(readBool("GAQ", "Enabled"));
+            GaqTargetFps.set_from_config(readFloat("GAQ", "TargetFps"));
+            GaqMinRatio.set_from_config(readFloat("GAQ", "MinRatio"));
+            GaqMaxRatio.set_from_config(readFloat("GAQ", "MaxRatio"));
         }
 
         // Upscale Ratio Override
@@ -1481,6 +1490,8 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->FGXeFGPaceOnSwapchain.value_for_config()).c_str());
         ini.SetValue("XeFG", "AllowDilatedMV",
                      GetBoolValue(Instance()->FGXeFGAllowDilatedMV.value_for_config()).c_str());
+        ini.SetValue("XeFG", "MinBaseFps",
+                     std::to_string(Instance()->FGXeFGMinBaseFps.value_or_default()).c_str());
     }
 
     {
@@ -1966,6 +1977,14 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->DrsMinOverrideEnabled.value_for_config()).c_str());
         ini.SetValue("DRS", "DrsMaxOverrideEnabled",
                      GetBoolValue(Instance()->DrsMaxOverrideEnabled.value_for_config()).c_str());
+    }
+
+    // GAQ (GNU Adaptive Quality - Auto-DRS)
+    {
+        ini.SetValue("GAQ", "Enabled", GetBoolValue(Instance()->GaqEnabled.value_for_config()).c_str());
+        ini.SetValue("GAQ", "TargetFps", std::to_string(Instance()->GaqTargetFps.value_or_default()).c_str());
+        ini.SetValue("GAQ", "MinRatio", std::to_string(Instance()->GaqMinRatio.value_or_default()).c_str());
+        ini.SetValue("GAQ", "MaxRatio", std::to_string(Instance()->GaqMaxRatio.value_or_default()).c_str());
     }
 
     // Spoofing

@@ -6,6 +6,7 @@
 #include "Config.h"
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
+#include <misc/GaqController.h>
 #include <framegen/nvngx/Nvngx_FG.h>
 
 /// @brief Calculates the resolution scaling ratio override based on the provided quality level and current
@@ -15,6 +16,14 @@
 std::optional<float> GetQualityOverrideRatio(const NVSDK_NGX_PerfQuality_Value input)
 {
     std::optional<float> output;
+
+    if (Config::Instance()->GaqEnabled.value_or_default())
+    {
+        double nowMs = Util::MillisecondsNow();
+        double frameTimeMs = State::Instance().lastFGFrameTime > 0.0 ? State::Instance().lastFGFrameTime : 16.6;
+        output = GaqController::Instance().Update(nowMs, frameTimeMs);
+        return output;
+    }
 
     auto sliderLimit = Config::Instance()->ExtendedLimits.value_or_default() ? 0.1f : 1.0f;
 

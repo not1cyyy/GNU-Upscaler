@@ -322,6 +322,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\Shader_Common.h" />
     <ClInclude Include="misc\SkipSpoof.h" />
     <ClInclude Include="misc\GameConfigs.h" />
+    <ClInclude Include="misc\GaqController.h" />
     <ClInclude Include="shaders\Shader_Dx11.h" />
     <ClInclude Include="spoofing\User32_Spoofing.h" />
     <ClInclude Include="hooks\VulkanwDx12_Hooks.h" />

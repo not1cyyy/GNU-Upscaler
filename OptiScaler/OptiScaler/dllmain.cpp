@@ -1906,6 +1906,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         // Check for Wine
         spdlog::info("");
         State::Instance().isRunningOnLinux = IsRunningOnWine();
+        if (State::Instance().isRunningOnLinux)
+        {
+            const char* gs = getenv("GAMESCOPE_WAYLAND_DISPLAY");
+            const char* desktop = getenv("XDG_CURRENT_DESKTOP");
+            const char* wayland = getenv("WAYLAND_DISPLAY");
+            State::Instance().isGamescopeActive = (gs != nullptr && gs[0] != '\0') || (desktop != nullptr && strstr(desktop, "gamescope") != nullptr);
+            State::Instance().isWaylandActive = (wayland != nullptr && wayland[0] != '\0') || State::Instance().isGamescopeActive;
+            LOG_INFO("Linux Display Subsystem: Gamescope={}, Wayland={}", State::Instance().isGamescopeActive, State::Instance().isWaylandActive);
+        }
 
         // Not foolproof
         // calls LoadLibraryExW inside DllMain but seems mostly fine if we only call NvAPI_GetInterfaceVersionString
