@@ -1085,6 +1085,9 @@
     <ClInclude Include="misc\GameConfigs.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="misc\GaqController.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="shaders\Shader_Dx11.h">
       <Filter>Header Files</Filter>
     </ClInclude>

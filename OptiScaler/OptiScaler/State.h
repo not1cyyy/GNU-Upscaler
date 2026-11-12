@@ -180,6 +180,9 @@ class State
     std::string gameVersion;
     GameEngineType gameEngine = GameEngineType::Other;
     bool isWindows10 = false;
+    bool isRunningOnLinux = false;
+    bool isGamescopeActive = false;
+    bool isWaylandActive = false;
 
     bool nvngxDx11Inited = false;
     bool nvngxDx12Inited = false;

@@ -104,6 +104,13 @@ void FrameLimit::sleep(bool fgActive)
         {
             auto fg = State::Instance().CurrentFG();
             min_interval_us *= fg != nullptr ? fg->GetInterpolatedFrameCount() + 1 : 2;
+
+            // Under Gamescope / Wayland, if PaceOnSwapchain is active, give headroom so batch lands
+            // just in time for the compositor's mailbox without colliding with its internal limiter
+            if (State::Instance().isGamescopeActive && Config::Instance()->FGXeFGPaceOnSwapchain.value_or(true) && min_interval_us > 500)
+            {
+                min_interval_us -= 500;
+            }
         }
 
         static uint64_t previous_frame_time = 0;

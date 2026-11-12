@@ -473,6 +473,12 @@ class Config
     CustomOptional<bool> DrsMinOverrideEnabled { false };
     CustomOptional<bool> DrsMaxOverrideEnabled { false };
 
+    // GNU Adaptive Quality (GAQ - Auto-DRS PID Engine)
+    CustomOptional<bool> GaqEnabled { false };
+    CustomOptional<float> GaqTargetFps { 60.0f };
+    CustomOptional<float> GaqMinRatio { 1.3f };
+    CustomOptional<float> GaqMaxRatio { 2.2f };
+
     // Quality Overrides
     CustomOptional<bool> QualityRatioOverrideEnabled { false };
     CustomOptional<float> QualityRatio_DLAA { 1.0f };
@@ -734,6 +740,7 @@ class Config
     CustomOptional<int> FGXeFGMaxInterpolatedFrames { 5 };
     CustomOptional<bool> FGXeFGPaceOnSwapchain { true };
     CustomOptional<bool> FGXeFGAllowDilatedMV { false };
+    CustomOptional<float> FGXeFGMinBaseFps { 45.0f };
 
     // DLSSG
     CustomOptional<int> FGDLSSGInterpolationCount { 1 }; // For Opti's own SL instance

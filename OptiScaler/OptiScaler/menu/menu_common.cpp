@@ -5,6 +5,7 @@
 #include "input/KeyPressLatch.h"
 #include "PresentRateMeter.h"
 #include <inputs/FG/XeFG_Inputs_Dx12.h>
+#include <misc/GaqController.h>
 
 #include "input/input_system.h"
 
@@ -5805,6 +5806,19 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             }
 
             ImGui::EndDisabled();
+
+            float minBaseFps = config->FGXeFGMinBaseFps.value_or_default();
+            ImGui::SetNextItemWidth(150.0f * menuResScale);
+            if (ImGui::SliderFloat("Base FPS Guard##xefg", &minBaseFps, 30.0f, 90.0f, "%.0f FPS", ImGuiSliderFlags_AlwaysClamp))
+            {
+                config->FGXeFGMinBaseFps = minBaseFps;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit())
+            {
+                config->SaveIni();
+            }
+            ShowTooltip("Prevents high multipliers when native base framerate dips too low,\n"
+                        "eliminating floaty mouse/controller input latency during heavy combat.");
         }
 
         bool fgDV = config->FGXeFGDebugView.value_or_default();
@@ -7694,6 +7708,33 @@ void MenuCommon::RenderUpscaleRatioSettings(RenderMenuContext& ctx)
     auto config = ctx.config;
     auto& currentFeature = ctx.currentFeature;
     auto& menuResScale = ctx.menuResScale;
+
+    // GNU ADAPTIVE QUALITY (GAQ AUTO-DRS) ---
+    GnuUi::SectionHeader("GNU Adaptive Quality (Auto-DRS)");
+
+    bool gaqEnabled = config->GaqEnabled.value_or_default();
+    if (GnuUi::Checkbox("Enable GAQ Auto-DRS", &gaqEnabled))
+    {
+        config->GaqEnabled = gaqEnabled;
+        config->SaveIni();
+    }
+    GnuUi::Help("Dynamically adjusts internal render scale using a hardware PID controller to maintain your target framerate.");
+
+    if (gaqEnabled)
+    {
+        float gaqTarget = config->GaqTargetFps.value_or_default();
+        ImGui::SetNextItemWidth(150.0f * menuResScale);
+        if (ImGui::SliderFloat("GAQ Target FPS", &gaqTarget, 30.0f, 240.0f, "%.0f FPS", ImGuiSliderFlags_AlwaysClamp))
+        {
+            config->GaqTargetFps = gaqTarget;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            config->SaveIni();
+
+        float currentGaqRatio = GaqController::Instance().CurrentRatio();
+        ImGui::TextDisabled("GAQ Live Scale: %.2fx (%.1f%% resolution)", currentGaqRatio, (1.0f / currentGaqRatio) * 100.0f);
+        ImGui::Spacing();
+    }
 
     // UPSCALE RATIO OVERRIDE -----------------
 
