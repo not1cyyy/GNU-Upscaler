@@ -121,23 +121,23 @@ XeFG_DynamicMFG::Result XeFG_DynamicMFG::Update(int targetCount, int framesToInt
             _logMs = now;
         }
 
-        // ADFG Base FPS Latency Floor Guard: Prevent high multipliers when native base framerate dips
+        // ADFG Base FPS Latency Floor Guard: When base FPS dips, safely clamp to 2X (1 frame) so controls stay responsive
         const float minBaseFps = config->FGXeFGMinBaseFps.value_or_default();
-        const double currentBaseFps = state.lastFGFrameTime > 0.0 ? (1000.0 / state.lastFGFrameTime) : 60.0;
+        const double currentBaseFps = state.presentFrameTime > 0.0 ? (1000.0 / state.presentFrameTime)
+                                                                   : (state.lastFGFrameTime > 0.0 ? (1000.0 / state.lastFGFrameTime) : 60.0);
 
         if (minBaseFps > 0.0f && currentBaseFps < minBaseFps)
         {
-            // If heavily struggling (< 75% of min), disable generation; otherwise clamp to 2X (1 frame).
-            const int latencyFloorMax = (currentBaseFps < (minBaseFps * 0.75f)) ? 0 : 1;
-            if (count > latencyFloorMax)
+            // Safely clamp multiplier down to 2X (1 interpolated frame) to preserve low latency without shutting FG off
+            if (count > 1)
             {
-                count = latencyFloorMax;
+                count = 1;
             }
         }
 
-        // 1X: frame generation off, the output keeps its count
-        result.generationOff = count == 0;
-        result.count = count >= 1 ? count : count1;
+        // Keep Frame Gen active: minimum count is 1 (2X generation)
+        result.generationOff = false;
+        result.count = std::max(count, 1);
     }
     else if (_active)
     {

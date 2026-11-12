@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "FfxApi_Dx12.h"
+#include <misc/GaqController.h>
 #include "NVNGX_DLSS.h"
 
 #include "Util.h"
@@ -137,6 +138,12 @@ static bool CreateDLSSContext(ffxContext handle, const ffxDispatchDescUpscale* p
 static std::optional<float> GetQualityOverrideRatioFfx(const uint32_t input)
 {
     std::optional<float> output;
+
+    if (Config::Instance()->GaqEnabled.value_or_default())
+    {
+        output = GaqController::Instance().Update(Util::MillisecondsNow());
+        return output;
+    }
 
     auto sliderLimit = Config::Instance()->ExtendedLimits.value_or_default() ? 0.1f : 1.0f;
 
