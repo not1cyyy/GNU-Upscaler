@@ -249,8 +249,8 @@ if [[ $UNINSTALL -eq 1 ]]; then
         rm -f "$BIN_DIR"/$dll 2>/dev/null || true
     done
 
-    # Remove OptiScaler directories
-    rm -rf "$BIN_DIR/OptiScaler" "$BIN_DIR/D3D12_OptiScaler" "$BIN_DIR/D3D12_Optiscaler" "$BIN_DIR/Licenses"
+    # Remove OptiScaler directories & plugins
+    rm -rf "$BIN_DIR/OptiScaler" "$BIN_DIR/D3D12_OptiScaler" "$BIN_DIR/D3D12_Optiscaler" "$BIN_DIR/Licenses" "$BIN_DIR/plugins"
 
     log_success "GNU-Upscaler has been completely removed from $BIN_DIR"
     exit 0
@@ -376,7 +376,18 @@ if [[ -d "$CACHE_DIR/OptiScaler" ]]; then
     cp -rf "$CACHE_DIR/OptiScaler" "$BIN_DIR/"
 fi
 
-# 3. Copy companion DLLs into game bin directory
+# 3. Copy plugins directory (OptiPatcher.asi, etc.)
+if [[ -d "$CACHE_DIR/plugins" ]]; then
+    log_info "Installing plugins (OptiPatcher.asi)..."
+    mkdir -p "$BIN_DIR/plugins"
+    cp -rf "$CACHE_DIR/plugins/"* "$BIN_DIR/plugins/"
+elif [[ -f "$CACHE_DIR/OptiPatcher.asi" ]]; then
+    log_info "Installing plugin (OptiPatcher.asi)..."
+    mkdir -p "$BIN_DIR/plugins"
+    cp -f "$CACHE_DIR/OptiPatcher.asi" "$BIN_DIR/plugins/OptiPatcher.asi"
+fi
+
+# 4. Copy companion DLLs into game bin directory
 copy_companion() {
     local dll="$1"
     if [[ -f "$CACHE_DIR/$dll" ]]; then

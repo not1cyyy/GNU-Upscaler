@@ -1,0 +1,3477 @@
+// dllmain.cpp : Defines the entry point for the DLL application.
+#include "pch.h"
+
+#include "Util.h"
+#include "Patcher.h"
+#include "Scanner.h"
+
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+#include <algorithm>
+
+static bool _patchResult = false;
+static HMODULE g_hModule = nullptr;
+
+extern "C" __declspec(dllexport) bool PatchResult() { return _patchResult; }
+extern "C" __declspec(dllexport) void InitializeASI() { return; }
+
+#define CHECK_UE(name) exeName == (#name "-win64-shipping.exe") || exeName == (#name "-wingdk-shipping.exe")
+
+static std::vector<BYTE> ParseHexBytes(const std::string& hex)
+{
+    std::vector<BYTE> bytes;
+    for (size_t i = 0; i < hex.size(); )
+    {
+        while (i < hex.size() && (hex[i] == ' ' || hex[i] == '\t' || hex[i] == ',')) ++i;
+        if (i >= hex.size()) break;
+        char* end = nullptr;
+        unsigned long val = std::strtoul(&hex[i], &end, 16);
+        bytes.push_back(static_cast<BYTE>(val));
+        while (i < hex.size() && hex[i] != ' ' && hex[i] != '\t' && hex[i] != ',') ++i;
+    }
+    return bytes;
+}
+
+static bool CheckExternalPatches(HMODULE exeModule, const std::string& exeNameLower)
+{
+    std::vector<std::filesystem::path> candidates;
+    if (g_hModule != nullptr)
+    {
+        candidates.push_back(Util::DllPath(g_hModule).parent_path() / "patches.ini");
+        candidates.push_back(Util::DllPath(g_hModule).parent_path() / "OptiPatcher.ini");
+    }
+    candidates.push_back(Util::ExePath().parent_path() / "patches.ini");
+    candidates.push_back(Util::ExePath().parent_path() / "OptiPatcher.ini");
+
+    for (const auto& path : candidates)
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) continue;
+
+        std::ifstream f(path);
+        if (!f) continue;
+
+        std::string line, currentSection;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> ini;
+
+        while (std::getline(f, line))
+        {
+            size_t start = line.find_first_not_of(" \t\r\n");
+            if (start == std::string::npos) continue;
+            size_t end = line.find_last_not_of(" \t\r\n");
+            std::string t = line.substr(start, end - start + 1);
+
+            if (t.empty() || t[0] == ';' || t[0] == '#') continue;
+
+            if (t[0] == '[' && t.back() == ']')
+            {
+                currentSection = t.substr(1, t.size() - 2);
+                std::transform(currentSection.begin(), currentSection.end(), currentSection.begin(), ::tolower);
+                continue;
+            }
+
+            auto eq = t.find('=');
+            if (eq != std::string::npos && !currentSection.empty())
+            {
+                std::string k = t.substr(0, eq);
+                std::string v = t.substr(eq + 1);
+                k.erase(0, k.find_first_not_of(" \t\r\n"));
+                k.erase(k.find_last_not_of(" \t\r\n") + 1);
+                v.erase(0, v.find_first_not_of(" \t\r\n"));
+                v.erase(v.find_last_not_of(" \t\r\n") + 1);
+                std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+                ini[currentSection][k] = v;
+            }
+        }
+
+        auto secIt = ini.find(exeNameLower);
+        if (secIt == ini.end())
+            secIt = ini.find("generic");
+        if (secIt == ini.end())
+            continue;
+
+        const auto& sec = secIt->second;
+        bool appliedAny = false;
+
+        auto applyOne = [&](const std::string& patKey, const std::string& offKey, const std::string& patchKey) {
+            auto pIt = sec.find(patKey);
+            if (pIt == sec.end() || pIt->second.empty()) return false;
+
+            ptrdiff_t offset = 0;
+            auto oIt = sec.find(offKey);
+            if (oIt != sec.end()) offset = std::strtol(oIt->second.c_str(), nullptr, 0);
+
+            std::vector<BYTE> patchBytes = { 0x0C, 0x01 };
+            auto bIt = sec.find(patchKey);
+            if (bIt != sec.end() && !bIt->second.empty()) patchBytes = ParseHexBytes(bIt->second);
+
+            void* patchAddress = (void*) scanner::GetAddress(exeModule, pIt->second, offset);
+            if (patchAddress != nullptr)
+            {
+                patcher::PatchAddress(patchAddress, &patchBytes);
+                return true;
+            }
+            return false;
+        };
+
+        if (applyOne("pattern", "offset", "patch")) appliedAny = true;
+        for (int i = 1; i <= 8; ++i)
+        {
+            std::string sfx = std::to_string(i);
+            if (applyOne("pattern" + sfx, "offset" + sfx, "patch" + sfx)) appliedAny = true;
+        }
+
+        if (appliedAny)
+            return true;
+    }
+
+    return false;
+}
+
+static bool CheckGenericUnrealEngine(HMODULE exeModule, const std::string& exeNameLower)
+{
+    bool looksLikeUE = (exeNameLower.find("-shipping.exe") != std::string::npos) ||
+                       (exeNameLower.find("-win64") != std::string::npos);
+
+    if (!looksLikeUE)
+    {
+        std::error_code ec;
+        auto exeDir = Util::ExePath().parent_path();
+        if (std::filesystem::exists(exeDir / ".." / ".." / "Engine", ec) ||
+            std::filesystem::exists(exeDir / "Engine", ec))
+        {
+            looksLikeUE = true;
+        }
+    }
+
+    if (!looksLikeUE)
+        return false;
+
+    struct UESignature {
+        std::string_view pattern;
+        ptrdiff_t offset;
+        std::vector<BYTE> patch;
+    };
+
+    static const UESignature kSignatures[] = {
+        // Pattern 1: Canonical UE5 Streamline / DLSS check with mov eax, 4 ... test al, al; jnz
+        { "84 C0 49 8B C7 74 03 49 8B C6 8B 34 30 89 75 80 E8 ? ? ? ? 84 C0 75", 21, { 0x0C, 0x01 } },
+
+        // Pattern 2: Variant with r13/r14 registers
+        { "84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75", 20, { 0x0C, 0x01 } },
+
+        // Pattern 3: Classic UE4 / early UE5 B8 04 00 00 00
+        { "B8 04 00 00 00 74 03 49 8B C7 8B 34 30 4C 89 A4 24 ? ? 00 00 4C 89 B4 24 ? ? 00 00 E8 ? ? ? ? 84 C0 75", 34, { 0x0C, 0x01 } },
+
+        // Pattern 4: Compact UE check: 41 8B 34 36 E8 ... 84 C0 75
+        { "41 8B 34 36 E8 ? ? ? ? 84 C0 75", 10, { 0x0C, 0x01 } },
+
+        // Pattern 5: Direct IsNvidia Vendor Check: cmp [rva], 0x10DE
+        { "81 3D ? ? ? ? DE 10 00 00 ? ? ? ? ? 84 C0 75", 16, { 0x0C, 0x01 } },
+    };
+
+    for (const auto& sig : kSignatures)
+    {
+        void* patchAddress = (void*) scanner::GetAddress(exeModule, sig.pattern, sig.offset);
+        if (patchAddress != nullptr)
+        {
+            patcher::PatchAddress(patchAddress, &sig.patch);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void CheckForPatch()
+{
+    auto exeName = Util::ExePath().filename().string();
+    auto exeNameLower = exeName;
+    std::transform(exeNameLower.begin(), exeNameLower.end(), exeNameLower.begin(), ::tolower);
+    exeName = exeNameLower;
+    auto exeModule = GetModuleHandle(nullptr);
+
+    // 1. External configuration patches (patches.ini / OptiPatcher.ini)
+    if (CheckExternalPatches(exeModule, exeNameLower))
+    {
+        _patchResult = true;
+        return;
+    }
+
+    // Forgive Me Father 2, The Midnight Walk
+    if (CHECK_UE(fmf2) || CHECK_UE(themidnightwalk))
+    {
+        std::string_view pattern("B8 04 00 00 00 74 03 49 8B C7 "
+                                 "8B 34 30 4C 89 A4 24 78 02 00 "
+                                 "00 4C 89 B4 24 38 02 00 00 E8 "
+                                 "? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 34);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // The Elder Scrolls IV: Oblivion Remastered
+    else if (CHECK_UE(oblivionremastered))
+    {
+        // DLSS classic check
+        std::string_view patternDLSSCheck1("84 C0 B8 04 00 00 00 74 03 49 8B C7 8B 34 30 4C 89 A4 24 78 02 00 00 4C "
+                                           "89 B4 24 38 02 00 00 E8 ? ? ? ? 84 C0 75");
+        auto patchAddressDLSSCheck1 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck1, 36);
+
+        if (patchAddressDLSSCheck1 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddressDLSSCheck1, &patch);
+        }
+
+        // IsNvidia under FFXFrameInterpolation
+        std::string_view patternDLSSCheck2("84 C0 74 24 48 85 DB 74 1F E8 ? ? ? ? 84 C0 74");
+        auto patchAddressDLSSCheck2 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck2, 14);
+
+        if (patchAddressDLSSCheck2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddressDLSSCheck2, &patch);
+        }
+
+        // IsNvidia under FFXFSR3TemporalUpscaling
+        std::string_view patternDLSSCheck3("48 85 C0 74 19 B0 01 48 83 C4 28 C3 E8 ? ? ? ? 84 C0 74");
+        auto patchAddressDLSSCheck3 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck3, 17);
+
+        if (patchAddressDLSSCheck3 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddressDLSSCheck3, &patch);
+        }
+
+        _patchResult =
+            patchAddressDLSSCheck1 != nullptr && patchAddressDLSSCheck2 != nullptr && patchAddressDLSSCheck3 != nullptr;
+    }
+
+    // Automation
+    else if (CHECK_UE(automationgame))
+    {
+        std::string_view pattern("E8 ? ? ? ? 84 C0 75 ? 80 3D ? ? ? ? ? 72 ? 48 8D 05 ? ? ? ? 41 B9 ? ? ? ? 4C 8D 05 ? "
+                                 "? ? ? 48 89 44 24 ? 33 D2 33 C9 E8 ? ? ? ? 48 8D 77");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 7);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xEB };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // 171, Ranch Simulator
+    else if (CHECK_UE(bgg) || CHECK_UE(ranch_simulator))
+    {
+        std::string_view pattern("49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 17);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // The Talos Principle 2, Super Meat Boy 3D
+    else if (CHECK_UE(talos2) || CHECK_UE(smb))
+    {
+        std::string_view pattern("42 8B 34 36 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 11);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xEB };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Bellwright, Deadzone Rogue, RuneScape: Dragonwilds
+    else if (CHECK_UE(bellwrightgame) || CHECK_UE(deadzonesteam) || CHECK_UE(rsdragonwilds))
+    {
+        std::string_view pattern("41 8B 34 36 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 11);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xEB };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // The Persistence
+    else if (CHECK_UE(persistence))
+    {
+        std::string_view pattern("33 C9 3B ? ? ? ? ? 0F 95 C1 EB 02 33 C9 8B 1C 8B E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 23);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Lost Records: Bloom & Rage, F1 Manager 2024
+    else if (exeName == "bloom&rage.exe" || exeName == "f1manager24.exe")
+    {
+        std::string_view pattern("49 8B C6 74 03 49 8B C5 46 8B 3C 38 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 17);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Black Myth: Wukong
+    else if (CHECK_UE(b1))
+    {
+        std::string_view pattern("84 C0 75 05 49 8B F4 EB 04 33 C0 8B F0 42 8B 34 36 89 75 90 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 25);
+
+        // Check for benchmark
+        if (patchAddress == nullptr)
+        {
+            std::string_view pattern2("49 8B C6 74 03 49 8B C5 46 8B "
+                                      "3C 38 E8 ? ? ? ? 84 C0 75");
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern2, 17);
+        }
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Banishers: Ghosts of New Eden
+    // inline patch
+    else if (CHECK_UE(banishers))
+    {
+        std::string_view pattern("C6 00 ? E9 ? ? ? ? 85 ? 7E ? 33 D2 44 8B ? 8D 4A");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, -11);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xEB };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Ghostwire: Tokyo
+    // inline patch, double test
+    else if (exeName == "gwt.exe")
+    {
+        std::string_view pattern("E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85 ? ? ? ? 85");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 13);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // METAL GEAR SOLID Δ: SNAKE EATER, ARK: Survival Ascended
+    // inline patch
+    else if (CHECK_UE(mgsdelta) || exeName == "arkascended.exe")
+    {
+        std::string_view pattern("49 8B C5 74 03 49 8B C4 81 3D ? ? ? ? ? ? ? ? 44 8B 04 30");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 8);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // EVERSPACE 2
+    // inline patch
+    else if (CHECK_UE(es2))
+    {
+        std::string_view pattern("48 8D ? ? ? ? ? E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85 ? ? ? ? 85");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 12);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // South of Midnight, Little Nightmares III, Hi-Fi RUSH, Lost Soul Aside, Lies of P, Atomic Heart
+    // inline patch
+    else if (exeName == "southofmidnight.exe" || exeName == "littlenightmaresiii.exe" || exeName == "hi-fi-rush.exe" ||
+             CHECK_UE(projectlsasteam) || CHECK_UE(lop) || CHECK_UE(atomicheart))
+    {
+        std::string_view pattern("48 85 C9 74 05 E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 10);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Project Borealis: Prologue
+    // inline patch
+    else if (CHECK_UE(projectborealis))
+    {
+        std::string_view pattern("B0 01 84 C0 75 05 BB 04 00 00 00 81 3D ? ? ? ? ? ? ? ? 41 8B 1C 1E 74");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 11);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Jusant
+    // inline patch
+    else if (CHECK_UE(asc))
+    {
+        std::string_view pattern("49 8B C4 45 33 FF EB 06 45 33 FF 41 8B C7 81 3D ? ? ? ? ? ? ? ? 44 8B 04 30");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 14);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // FINAL FANTASY VII REBIRTH
+    // inline patch
+    else if (exeName == "ff7rebirth_.exe")
+    {
+        std::string_view pattern(
+            "48 2B E0 80 3D ? ? ? ? ? 0F 85 ? ? ? ? 48 83 3D ? ? ? ? ? 0F 84 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 30);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // DLSS, Stellar Blade
+    // inline patch
+    else if (CHECK_UE(sb))
+    {
+        // DLSS
+        std::string_view patternDLSSCheck1("48 8B C8 81 3D ? ? ? ? ? ? ? ? 45");
+        auto patchAddressDLSSCheck1 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck1, 3);
+
+        if (patchAddressDLSSCheck1 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSSCheck1, &patch);
+        }
+
+        // DLSS UI menu string check
+        std::string_view patternDLSSCheck2("74 05 E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F");
+        auto patchAddressDLSSCheck2 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck2, 7);
+
+        if (patchAddressDLSSCheck2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSSCheck2, &patch);
+        }
+
+        _patchResult = patchAddressDLSSCheck1 != nullptr && patchAddressDLSSCheck2 != nullptr;
+    }
+
+    // Grand Theft Auto: The Trilogy – The Definitive Edition - III, Vice City and San Andreas
+    // inline patch
+    else if (exeName == "sanandreas.exe" || exeName == "libertycity.exe" || exeName == "vicecity.exe")
+    {
+        std::string_view pattern("45 33 E4 E9 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 8);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Suicide Squad: Kill the Justice League
+    // inline patch
+    else if (exeName == "suicidesquad_ktjl.exe")
+    {
+        std::string_view pattern("41 BE 24 00 00 00 84 C0 0F 84 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 14);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Gotham Knights
+    // inline patch
+    else if (exeName == "gothamknights.exe")
+    {
+        // DLSS classic check
+        std::string_view patternDLSSCheck1("48 85 C9 74 05 E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74");
+        auto patchAddressDLSSCheck1 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck1, 10);
+
+        if (patchAddressDLSSCheck1 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSSCheck1, &patch);
+        }
+
+        // DLSS inputs activation check
+        std::string_view patternDLSSCheck2("89 47 38 E9 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85");
+        auto patchAddressDLSSCheck2 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck2, 8);
+
+        if (patchAddressDLSSCheck2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSSCheck2, &patch);
+        }
+
+        // DLSS UI menu string check
+        std::string_view patternDLSSCheck3("E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85");
+        auto patchAddressDLSSCheck3 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck3, 5);
+
+        if (patchAddressDLSSCheck3 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSSCheck3, &patch);
+        }
+
+        _patchResult =
+            patchAddressDLSSCheck1 != nullptr && patchAddressDLSSCheck2 != nullptr && patchAddressDLSSCheck3 != nullptr;
+    }
+
+    // Redfall
+    // inline patch
+    else if (exeName == "redfall.exe")
+    {
+        std::string_view pattern("49 8D 7D 48 E9 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // The Outer Worlds 2
+    // inline patch
+    else if (CHECK_UE(theouterworlds2))
+    {
+        std::string_view pattern("E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For Update 1.2.0.1
+        else
+        {
+            std::string_view pattern2("44 8B C0 E8 ? ? ? ? 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 8);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // S.T.A.L.K.E.R. 2: Heart of Chornobyl
+    // inline patch
+    // Both DLSS and SL checks are xrefs to the general isNvidia CMP
+    else if (CHECK_UE(stalker2))
+    {
+        std::string_view pattern("E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? 85 FF 7E");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 7);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // CODE VEIN II
+    // inline patch
+    else if (CHECK_UE(codevein2))
+    {
+        std::string_view pattern("49 8B C4 81 3D ? ? ? ? ? ? ? ? 44 8B 04 30 74");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 3);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Directive 8020
+    // inline patch
+    else if (CHECK_UE(directive8020))
+    {
+        std::string_view pattern("41 8B DC 81 3D ? ? ? ? ? ? ? ? 41 8B 1C 1E 74");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 3);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // LEGO Batman: Legacy of the Dark Knight
+    // inline patch
+    else if (CHECK_UE(legobatmanlotdk))
+    {
+        std::string_view pattern("E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 41 BC 7C 01 00 00 0F");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Halo: Campaign Evolved
+    // inline patch
+    else if (exeName == "halocampaignevolved.exe")
+    {
+        std::string_view pattern("49 8B C5 81 3D ? ? ? ? ? ? ? ? 74");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 3);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // The Blood of Dawnwalker (+ WinGDK)
+    // inline patch
+    else if (exeName == "dawnwalker.exe" || CHECK_UE(dawnwalker))
+    {
+        std::string_view pattern("33 D2 E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 7);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // SILENT HILL: Townfall
+    // inline patch
+    else if (CHECK_UE(townfall))
+    {
+        struct PatchEntry
+        {
+            std::string_view pattern;
+            int offset;
+        };
+
+        static const PatchEntry patches[] = {
+            { "48 8D ? ? ? ? ? E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F", 12 },       // DLSS check
+            { "0F 84 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85 ? ? ? ? 40 38 79", 6 }, // Reflex check 1
+            { "0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85", 6 },                  // Reflex check 2
+            { "74 14 81 3D ? ? ? ? ? ? ? ? 75 08", 2 },                          // Reflex check 3
+            { "48 8B D9 81 3D ? ? ? ? ? ? ? ? 75", 3 },                          // Reflex check 4
+            { "74 16 81 3D ? ? ? ? ? ? ? ? 75", 2 },                             // Reflex check 5
+        };
+
+        static const std::vector<BYTE> patchBytes = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+
+        bool allPatched = true;
+
+        for (const auto& entry : patches)
+        {
+            auto patchAddress = (void*) scanner::GetAddress(exeModule, entry.pattern, entry.offset);
+
+            if (patchAddress != nullptr)
+            {
+                patcher::PatchAddress(patchAddress, &patchBytes);
+            }
+            else
+            {
+                allPatched = false;
+            }
+        }
+
+        _patchResult = allPatched;
+    }
+
+    // Gears of War: E-Day
+    // inline patch
+    else if (exeName == "goweday-steam.exe")
+    {
+        std::string_view pattern("33 D2 E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 7);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Gears of War: E-Day (Xbox / Game Pass)
+    // inline patch
+    else if (exeName == "goweday.exe")
+    {
+        std::string_view pattern("33 D2 E8 ? ? ? ? 81 3D ? ? ? ? DE 10 00 00 41 BF ? ? ? ? 74");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 7);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Borderlands 4
+    // inline patch
+    else if (exeName == "borderlands4.exe")
+    {
+        std::string_view pattern("0F B6 C0 81 3D ? ? ? ? ? ? ? ? 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 3);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // The Alters
+    else if (CHECK_UE(thealters))
+    {
+        std::string_view pattern("84 C0 49 8B C7 74 03 49 8B C6 8B 34 30 E8 ? ? ? ? 84 C0 75");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 18);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For Update 2.0.1
+        else
+        {
+            std::string_view pattern2("41 8B 34 36 E8 ? ? ? ? 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 9);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // Ghostrunner
+    else if (CHECK_UE(ghostrunner))
+    {
+        std::string_view pattern("75 14 44 88 6F 30");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xEB };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Amid Evil
+    else if (CHECK_UE(amidevil))
+    {
+        std::string_view pattern("48 85 DB 74 08 48 8B CB E8 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 18);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Pacific Drive
+    else if (CHECK_UE(pendriverpro))
+    {
+        std::string_view pattern("4C 89 75 18 48 85 C9 74 05 E8 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Severed Steel (+ Demo), System Shock (2023), Trepang2, High On Life, Ghostrunner 2, Deadlink, Destroy All Humans!
+    // 2 - Reprobed, Supraland Six Inches Under, Deep Rock Galactic, Witchfire, Achilles: Legends Untold, Frozenheim,
+    // Loopmancer, Blacktail, The Lord of the Rings: Gollum, Mandragora: Whispers of the Witch Tree, INDIKA, The Lord of
+    // the Rings: Return to Moria, VLADiK BRUTAL, Hell Pie, Deliver Us Mars, Postal 4: No Regerts, SPRAWL, Echo Point
+    // Nova, Way of the Hunter, Mortal Kombat 1, Ad Infinitum, Sherlock Holmes: The Awakened, Tony Hawk's Pro Skater 3 +
+    // 4, Of Ash and Steel, Voidtrain, Alone in the Dark 2024, Like a Dragon: Ishin!, Icarus, Soulstice, Luna Abyss,
+    // Aliens: Fireteam Elite 2
+    else if (CHECK_UE(thankyouverycool) || CHECK_UE(systemreshock) || CHECK_UE(cppfps) || CHECK_UE(oregon) ||
+             CHECK_UE(ghostrunner2) || CHECK_UE(deadlink) || CHECK_UE(dh) || CHECK_UE(supralandsiu) || CHECK_UE(fsd) ||
+             CHECK_UE(witchfire) || CHECK_UE(achilles) || CHECK_UE(frozenheim) || CHECK_UE(loopmancer) ||
+             CHECK_UE(blacktail) || CHECK_UE(tom) || CHECK_UE(man) || CHECK_UE(indika) || CHECK_UE(moria) ||
+             CHECK_UE(vladik_brutal) || CHECK_UE(hellpie) || CHECK_UE(deliverusmars) || CHECK_UE(postal4) ||
+             CHECK_UE(sprawl) || CHECK_UE(greylock) || CHECK_UE(wayofthehunter) || exeName == "mk12.exe" ||
+             CHECK_UE(adinfinitum) || exeName == "shta.exe" || exeName == "thps34.exe" || CHECK_UE(ofashandsteelgame) ||
+             CHECK_UE(voidtrain) || CHECK_UE(aloneinthedark) || CHECK_UE(likeadragonishin) || CHECK_UE(icarus) ||
+             exeName == "soulstice.exe" || CHECK_UE(lunaabyss) || CHECK_UE(afe2))
+    {
+        std::string_view pattern("48 89 45 ? 48 85 C9 74 05 E8 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Hogwarts Legacy
+    else if (exeName == "hogwartslegacy.exe")
+    {
+        std::string_view pattern("45 8B 3C 8F E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // Pre-DLSS5 update
+        else
+        {
+            std::string_view pattern2("48 89 45 ? 48 85 C9 74 05 E8 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 19);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // METAL EDEN (+ Demo)
+    else if (CHECK_UE(metaleden))
+    {
+        std::string_view pattern("84 C0 49 8B C6 74 03 49 8B C4 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 18);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // RoboCop: Rogue City
+    else if (CHECK_UE(robocop))
+    {
+        // DLSS classic check
+        std::string_view patternDLSSCheck("74 03 49 8B C5 46 8B 3C 38 E8 ? ? ? ? 84 C0 75");
+        auto patchAddressDLSSCheck = (void*) scanner::GetAddress(exeModule, patternDLSSCheck, 14);
+
+        if (patchAddressDLSSCheck != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddressDLSSCheck, &patch);
+        }
+
+        // Show DLSS in game options
+        std::string_view patternOptions("E8 ? ? ? ? 84 C0 74 ? E8 ? ? ? ? 84 C0 75 ? 32 C0");
+        auto patchAddressOptions = (void*) scanner::GetAddress(exeModule, patternOptions, 0);
+
+        if (patchAddressOptions != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressOptions, &patch);
+        }
+
+        // XeFG check
+        std::string_view patternXeFGCheck("83 F8 03 0F 85 ? ? ? ? E8 ? ? ? ? 84 C0 0F 84");
+        auto patchAddressXeFGCheck = (void*) scanner::GetAddress(exeModule, patternXeFGCheck, 14);
+
+        if (patchAddressXeFGCheck != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddressXeFGCheck, &patch);
+        }
+
+        _patchResult = patchAddressDLSSCheck != nullptr && patchAddressOptions != nullptr;
+    }
+
+    // NINJA GAIDEN 2 Black, Hell is Us (+ Demo), Brothers: A Tale of Two Sons Remake,Otherskin, The Sinking City
+    // Remastered, Chernobylite 2: Exclusion Zone, Commandos: Origins, MindsEye, Frostpunk 2, Celestial Empire, Alien:
+    // Rogue Incursion Evolved Edition, Manor Lords, Nobody Wants to Die, Fort Solis, Spirit of the North 2, Tokyo
+    // Xtreme Racer/Shutokou Battle, INDUSTRIA 2, REANIMAL (+ Demo), Keeper (+WinGDK PaganIdol exe), Stygian: Outer
+    // Gods, Tormented Souls 2, Assetto Corsa Rally, SpongeBob SquarePants: Titans of the Tide, Echoes of the End:
+    // Enhanced Edition, Supraworld, Solasta II, Carmageddon: Rogue Shift, Half Sword, I Am Jesus Christ, Star Trek:
+    // Voyager - Across the Unknown, Grounded 2
+    else if (CHECK_UE(ninjagaiden2black) || CHECK_UE(hellisus) || CHECK_UE(brothers) || CHECK_UE(otherskin) ||
+             CHECK_UE(thesinkingcityremastered) || CHECK_UE(chernobylite2) || CHECK_UE(commandos) ||
+             CHECK_UE(mindseye) || CHECK_UE(frostpunk2) || CHECK_UE(china_builder_06) || CHECK_UE(midnight) ||
+             CHECK_UE(manorlords) || CHECK_UE(detnoir) || CHECK_UE(sycamore) || CHECK_UE(sotn2) ||
+             CHECK_UE(tokyoxtremeracer) || CHECK_UE(industria_2) || exeName == "reanimal.exe" || CHECK_UE(keeper) ||
+             CHECK_UE(paganidol) || CHECK_UE(stygian) || CHECK_UE(tormentedsouls2) || exeName == "acr.exe" ||
+             CHECK_UE(ghost) || CHECK_UE(thedarken) || CHECK_UE(supraworld) || CHECK_UE(brimstone) || CHECK_UE(carma) ||
+             CHECK_UE(halfswordue5) || CHECK_UE(imjch) || CHECK_UE(stvoyagersteam) || CHECK_UE(grounded2steam))
+    {
+        std::string_view pattern("84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // RoboCop: Unfinished Business
+    else if (CHECK_UE(robocopunfinishedbusiness))
+    {
+        // Usual DLSS pattern
+        std::string_view pattern("84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        // Show DLSS in game options
+        std::string_view pattern2("E8 ? ? ? ? 84 C0 74 ? E8 ? ? ? ? 84 C0 75 ? 32 C0");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 0);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+
+        _patchResult = patchAddress != nullptr && patchAddress2 != nullptr;
+    }
+
+    // The Talos Principle: Reawakened
+    else if (CHECK_UE(talos1))
+    {
+        std::string_view pattern("84 C0 49 8B C6 74 03 49 8B C4 8B 34 06 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 18);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Mafia: The Old Country
+    else if (exeName == "mafiatheoldcountry.exe")
+    {
+        std::string_view pattern("E8 ? ? ? ? 34 01 0F B6 C0 8B 3C 87 E8 ? ? ? ? 84 C0 0F 84");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 18);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // REMNANT II, Cronos: The New Dawn
+    else if (CHECK_UE(remnant2) || CHECK_UE(cronos))
+    {
+        std::string_view pattern("74 03 49 8B C4 46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 14);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // The First Berserker: Khazan, Flintlock: The Siege of Dawn
+    else if (CHECK_UE(bbq) || CHECK_UE(saltpeter))
+    {
+        std::string_view pattern("0F 84 ? ? ? ? E8 ? ? ? ? E9 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 21);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Sifu, Chernobylite Enhanced Edition, STAR WARS Jedi: Survivor
+    else if (CHECK_UE(sifu) || CHECK_UE(chernobylgame) || exeName == "jedisurvivor.exe")
+    {
+        std::string_view pattern("74 05 E8 ? ? ? ? 45 33 F6 E9 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 20);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Evil West
+    else if (CHECK_UE(highmoon))
+    {
+        std::string_view pattern("74 05 E8 ? ? ? ? 4C 8D ? ? ? ? ? EB 52 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 21);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // SILENT HILL 2 Remake
+    else if (CHECK_UE(shproto))
+    {
+        std::string_view pattern("84 C0 49 8B C6 74 03 49 8B C4 46 8B 3C 38 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Lords of the Fallen 2023, TEKKEN 8, Layers of Fear (2023), The Thaumaturge, Palworld, The Casting of Frank Stone
+    else if (CHECK_UE(lotf2) || CHECK_UE(polaris) || CHECK_UE(layersoffear) || CHECK_UE(thethaumaturge) ||
+             CHECK_UE(palworld) || CHECK_UE(castingfrankstone))
+    {
+        std::string_view pattern("84 C0 49 8B C6 74 03 49 8B C5 46 8B 3C 38 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // WUCHANG: Fallen Feathers
+    else if (CHECK_UE(project_plague) || exeName == "project_plague-deck-shipping.exe")
+    {
+        std::string_view pattern(
+            "75 0C E8 ? ? ? ? 84 C0 49 8B C7 74 03 49 8B C6 8B 34 30 89 75 80 E8 ? ? ? ? 84 C0 75");
+
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 28);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For Update 1.7
+        else
+        {
+            std::string_view pattern2("74 03 49 8B C5 46 8B 3C 38 E8 ? ? ? ? 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 14);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // Avowed
+    else if (CHECK_UE(avowed))
+    {
+        std::string_view pattern("4C 89 AC 24 40 02 00 00 4C 89 B4 24 38 02 00 00 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 21);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For 2.0 update - inline patch
+        else
+        {
+            std::string_view pattern2("31 C0 81 3D ? ? ? ? ? ? ? ? 74");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 2);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            std::string_view pattern3("34 01 0F B6 C0 81 3D ? ? ? ? ? ? ? ? 75");
+            auto patchAddress3 = (void*) scanner::GetAddress(exeModule, pattern3, 5);
+
+            if (patchAddress3 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress3, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr && patchAddress3 != nullptr;
+        }
+    }
+
+    // Land of the Vikings
+    else if (CHECK_UE(vikingoyunu))
+    {
+        std::string_view pattern("4C 8D ? ? ? ? ? E9 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 17);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Daemon X Machina: Titanic Scion, Vampire: The Masquerade - Bloodlines 2
+    else if (CHECK_UE(game) || CHECK_UE(bloodlines2))
+    {
+        std::string_view pattern("4C 89 B4 24 38 02 00 00 E8 ? ? ? ? 84 C0 75 09 C6 47 40");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 13);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // MechWarrior 5: Mercenaries
+    else if (CHECK_UE(mechwarrior))
+    {
+        std::string_view pattern("4C 8B 6C 24 30 EB 4E E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 12);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Quarantine Zone: The Last Check
+    else if (CHECK_UE(qzsim))
+    {
+        std::string_view pattern("45 33 FF 41 8B F7 41 8B 34 36 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 15);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For Update 2.0.2.2586
+        else
+        {
+            std::string_view pattern2("41 8B 34 36 E8 ? ? ? ? 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 9);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // Assetto Corsa Competizione, Bright Memory Infinite
+    else if (CHECK_UE(ac2) || CHECK_UE(brightmemoryinfinite))
+    {
+        std::string_view pattern("C6 47 30 01 E9 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 14);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Tempest Rising, Senua’s Saga: Hellblade II, Until Dawn, Revenge of the Savage Planet, Still Wakes the Deep,
+    // Eternal Strands
+    else if (CHECK_UE(tempest) || CHECK_UE(hellblade2) || CHECK_UE(bates) || CHECK_UE(towers) ||
+             exeName == "stillwakesthedeep.exe" || CHECK_UE(eternalstrandssteam))
+    {
+        std::string_view pattern(
+            "49 8B C7 8B 34 30 4C 89 A4 24 78 02 00 00 4C 89 B4 24 38 02 00 00 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 27);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // SILENT HILL f
+    else if (CHECK_UE(shf))
+    {
+        std::string_view pattern("84 C0 49 8B C6 74 03 49 8B C5 8B 3C 38 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 18);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Riven (2024), Myst (2021)
+    else if (CHECK_UE(riven) || CHECK_UE(myst))
+    {
+        // DLSS classic check
+        std::string_view patternDLSSCheck1("84 C0 49 8B C6 74 03 49 8B C4 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddressDLSSCheck1 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck1, 18);
+
+        if (patchAddressDLSSCheck1 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddressDLSSCheck1, &patch);
+        }
+
+        // DLSS menu string check
+        std::string_view patternDLSSCheck2("48 83 EC 28 E8 ? ? ? ? 84 C0 74 5E 48 83 3D");
+        auto patchAddressDLSSCheck2 = (void*) scanner::GetAddress(exeModule, patternDLSSCheck2, 9);
+
+        if (patchAddressDLSSCheck2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddressDLSSCheck2, &patch);
+        }
+
+        _patchResult = patchAddressDLSSCheck1 != nullptr && patchAddressDLSSCheck2 != nullptr;
+    }
+
+    // Chorus, Shadow Warrior 3: Definitive Edition
+    else if (CHECK_UE(chorus) || exeName == "sw3.exe")
+    {
+        std::string_view pattern("74 05 E8 ? ? ? ? 0F B6 47 30 E9 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 21);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Supraland, Necromunda: Hired Gun, The Ascent
+    else if (CHECK_UE(supraland) || CHECK_UE(necromunda) || CHECK_UE(theascent))
+    {
+        std::string_view pattern("45 33 ED E9 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 13);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Immortals of Aveum
+    else if (CHECK_UE(immortalsofaveum))
+    {
+        std::string_view pattern("84 C0 49 8B C7 74 03 49 8B C6 8B 34 30 89 75 80 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 21);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Deliver Us The Moon
+    else if (CHECK_UE(moonman))
+    {
+        std::string_view pattern("74 05 E8 ? ? ? ? 45 33 ED E9 ? ? ? ? E8 ? ? ? ? 84 C0 75 09");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 20);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // RV There Yet?, Windrose, Subnautica 2, Conan Exiles Enhanced, Deep Rock Galactic: Rogue Core
+    else if (CHECK_UE(ride) || CHECK_UE(windrose) || CHECK_UE(subnautica2) || CHECK_UE(conansandbox) ||
+             CHECK_UE(roguecore))
+    {
+        std::string_view pattern("84 C0 75 05 49 8B F7 EB 02 33 F6 41 8B 34 36 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 20);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Kena: Bridge of Spirits
+    else if (CHECK_UE(kena))
+    {
+        std::string_view pattern("48 8B 4D 40 48 85 C9 74 06 E8 ? ? ? ? 90 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 20);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Clair Obscur: Expedition 33 (+ GOG)
+    else if (CHECK_UE(sandfall) || CHECK_UE(sandfallgog))
+    {
+        std::string_view pattern("84 C0 49 8B C7 74 03 49 8B C5 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 18);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // Pre-1.5 update
+        else
+        {
+            std::string_view pattern2("84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 19);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // The Last Caretaker
+    else if (CHECK_UE(voyagesteam))
+    {
+        std::string_view pattern("E8 ? ? ? ? 44 8B ? ? ? ? ? BA 24 19 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 17);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For Update 6.0
+        else
+        {
+            std::string_view pattern2("BA 54 1B 00 00 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 5);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // Fatekeeper
+    else if (CHECK_UE(slasher))
+    {
+        std::string_view pattern("E8 ? ? ? ? 44 8B ? ? ? ? ? BA E0 12 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 17);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Styx: Blades of Greed (+ Demo)
+    else if (CHECK_UE(styx3))
+    {
+        std::string_view pattern("33 F6 42 8B 34 3E E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 11);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Ready or Not
+    else if (exeName == "readyornotsteam-win64-shipping.exe" || exeName == "readyornot-wingdk-shipping.exe")
+    {
+        std::string_view pattern("84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For 1.4 update
+        else
+        {
+            std::string_view pattern2("4C 89 B4 24 38 02 00 00 E8 ? ? ? ? 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 13);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // ROMEO IS A DEAD MAN
+    else if (CHECK_UE(sevgame))
+    {
+        std::string_view pattern("84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For 1.4.000 update
+        else
+        {
+            std::string_view pattern2("44 8B ? ? ? ? ? BA B8 16 00 00 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 12);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // High On Life 2 (+ WinGDK), Far Far West, ROUTINE, Samson, VOID/BREAKER
+    else if (CHECK_UE(highonlife2) || CHECK_UE(farfarwest) || CHECK_UE(routine) || CHECK_UE(cjsteam) ||
+             CHECK_UE(voidbreaker))
+    {
+        std::string_view pattern("44 8B ? ? ? ? ? BA ? ? 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 12);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Dead as Disco
+    else if (CHECK_UE(pagodasteam))
+    {
+        std::string_view pattern("49 8B F4 41 8B 34 36 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 12);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // InZOI
+    else if (CHECK_UE(inzoi))
+    {
+        // To prevent it disabling features on other vendors, mainly needed for Streamline/DLSS to work
+        std::string_view pattern("48 81 EC 98 00 00 00 80 3D ? ? ? ? 00 0F 85");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xC3 }; // return
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // Unlock all upscalers in the game options
+        std::string_view pattern2(
+            "48 89 5C 24 ? 55 48 8D 6C 24 ? 48 81 EC ? ? ? ? 48 8B D9 48 8D 15 ? ? ? ? 48 8D 4D ? 41 B0");
+        start = 0;
+        patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern2, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xB0, 0x01, 0xC3 }; // return true
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // Regular DLSS check
+        std::string_view pattern3("E8 ? ? ? ? 84 C0 75 ? C6 47 ? ? E9");
+        start = 0;
+        patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern3, 7, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+                _patchResult = true;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // Crisol: Theater of Idols (+Demo)
+    else if (CHECK_UE(crtoiprototype))
+    {
+        std::string_view pattern("84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For 1.2 update
+        else
+        {
+            std::string_view pattern2("BA 74 11 00 00 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 5);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // Gothic 1 Remake
+    else if (CHECK_UE(g1r))
+    {
+        std::string_view pattern("44 8B ? ? ? ? ? BA 44 13 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 12);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For 1.1 update
+        else
+        {
+            std::string_view pattern2("BA 24 13 00 00 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 5);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // Five Nights at Freddy's: Security Breach
+    else if (CHECK_UE(fnaf9))
+    {
+        std::string_view pattern("48 89 45 F8 48 85 C9 74 05 E8 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // DragonSword : Awakening
+    else if (CHECK_UE(dsclient))
+    {
+        std::string_view pattern("4C 89 B4 24 28 02 00 00 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 13);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Enotria: The Last Song
+    else if (CHECK_UE(enotria))
+    {
+        std::string_view pattern("84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 19);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For 1.010 update
+        else
+        {
+            std::string_view pattern2("BA F4 0E 00 00 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 5);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // The Mound: Omen of Cthulhu
+    else if (CHECK_UE(themound))
+    {
+        // Regular DLSS check
+        std::string_view pattern("BA 74 19 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        // DLSS menu string check
+        std::string_view pattern2("0F 8F ? ? ? ? 48 89 5C 24 30 E8 ? ? ? ? 84 C0 0F");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 16);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+
+        _patchResult = patchAddress != nullptr && patchAddress2 != nullptr;
+    }
+
+    // Beast of Reincarnation
+    else if (CHECK_UE(beastofreincarnation))
+    {
+        std::string_view pattern("46 8B 34 30 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+
+        // For 1.0.8 update
+        else
+        {
+            std::string_view pattern2("BA 60 10 00 00 84 C0 75");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 5);
+
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+
+            _patchResult = patchAddress2 != nullptr;
+        }
+    }
+
+    // The Sinking City 2
+    else if (exeName == "thesinkingcity2.exe")
+    {
+        std::string_view pattern("? E4 1A 00 00 84 C0 75 09");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Mortal Shell II
+    else if (CHECK_UE(mortalshell2))
+    {
+        std::string_view pattern("BA 50 16 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // A Plague Tale: Requiem
+    // Streamline check patch (DLSS, DLSSG, Reflex)
+    else if (exeName == "aplaguetalerequiem_x64.exe")
+    {
+        std::string_view pattern("80 3D ? ? ? ? ? 0F 84 ? ? ? ? 45 33 C0 48 8D 15");
+        uintptr_t start = 0;
+        void* patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Resonance: A Plague Tale Legacy
+    // Streamline check patch (DLSS, DLSSG, Reflex)
+    else if (exeName == "resonance.exe")
+    {
+        std::string_view pattern("80 3D ? ? ? ? ? 0F 84 ? ? ? ? 45 33 C0 48 8D 15");
+        uintptr_t start = 0;
+        void* patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // 1666: Amsterdam
+    else if (exeName == "1666amsterdam.exe")
+    {
+        std::string_view pattern("BA 98 16 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Breathedge2
+    else if (CHECK_UE(breathedge2))
+    {
+        std::string_view pattern("BA B4 13 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Crimson Moon
+    else if (CHECK_UE(crimsonmoonngsteam))
+    {
+        std::string_view pattern("BA 50 16 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Titan Quest II
+    else if (CHECK_UE(tq2))
+    {
+        std::string_view pattern("41 8B 34 36 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Clive Barker's Hellraiser: Revival
+    else if (CHECK_UE(hellraiser))
+    {
+        std::string_view pattern("BA 38 13 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Guns of Eschaton Demo
+    else if (CHECK_UE(gunsofeschaton))
+    {
+        std::string_view pattern("BA B8 16 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Valor Mortis
+    else if (CHECK_UE(valormortis))
+    {
+        std::string_view pattern("BA BC 19 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Rivage
+    else if (CHECK_UE(rivage))
+    {
+        std::string_view pattern("BA B4 13 00 00 84 C0 75");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Phantom Blade Zero
+    else if (exeName == "pbz.exe")
+    {
+        static const std::string_view patterns[] = {
+            // DLSS initialization
+            "E8 ? ? ? ? 84 C0 75 ? 80 3D ? ? ? ? 05 72 ? 48 8D 15 "
+            "? ? ? ? 48 8D 0D ? ? ? ? E8 ? ? ? ? C6 47 40 02",
+            // DLSS menu support
+            "E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? 48 8B 5C 24 20",
+            // Streamline/NGX initialization
+            "E8 ? ? ? ? 84 C0 0F 85 ? ? ? ? 48 8B 0D ? ? ? ? 48 89 5C 24 20",
+            // DLSSG support
+            "E8 ? ? ? ? 84 C0 75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 "
+            "00 C6 05 ? ? ? ? 01 48 83 C4 28 C3 E8 ? ? ? ? 84 C0 0F 84 ? "
+            "? ? ? 48 89 7C 24 20 E8 ? ? ? ? 48 8B F8 48 8B 08 48 8B 51 40",
+            // Reflex support
+            "E8 ? ? ? ? 84 C0 75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 "
+            "00 C6 05 ? ? ? ? 01 48 83 C4 28 C3 E8 ? ? ? ? 84 C0 0F 84 ? "
+            "? ? ? 48 89 7C 24 20 E8 ? ? ? ? 48 8B F8 48 8B 08 48 8B 51 50",
+            // FG startup eligibility
+            "E8 ? ? ? ? 84 C0 74 ? 45 84 F6 74 ? 39 7D DF 75 ? 41 B7 01 EB ?",
+            // FG startup classification
+            "E8 ? ? ? ? 84 C0 74 ? 45 84 F6 74 ? 8B 4D DF 83 E9 03 74 ? 83 E9 01",
+            // FG startup fallback
+            "E8 ? ? ? ? 84 C0 74 ? 45 84 F6 74 ? 40 84 F6 75 ? B3 01 EB ? 32 DB",
+            // FG menu support
+            "E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? 48 8D 4C 24 20",
+            // Applying the FG mode
+            "E8 ? ? ? ? 84 C0 74 ? E8 ? ? ? ? 84 C0 74 ? 48 8D 4C 24 20 E8 ? ? ? ?",
+
+        };
+
+        const std::vector<BYTE> patch = { 0x0C, 0x01 };
+        bool allPatched = true;
+        for (const auto& pattern : patterns)
+        {
+            auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 5);
+            if (patchAddress != nullptr)
+            {
+                patcher::PatchAddress(patchAddress, &patch);
+            }
+            else
+            {
+                allPatched = false;
+            }
+        }
+
+        // DLSS vendor lock CMP
+        std::string_view pattern("81 3D ? ? ? ? DE 10 00 00 75 ? B2 01 B1 03 E8 ? ? ? ? 84 C0 74 ?");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 10);
+        if (patchAddress != nullptr)
+        {
+            const std::vector<BYTE> patch = { 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        _patchResult = allPatched && patchAddress != nullptr;
+    }
+
+    // FINAL FANTASY XIV Online
+    else if (exeName == "ffxiv_dx11.exe")
+    {
+        // cmp 0x10DE ; jnz <non-NVIDIA path>
+        // Matches the two vendor gates
+        std::string_view patterns[] = {
+            "81 BF C0 09 00 00 DE 10 00 00 0F 85", // rdi variant
+            "81 BB C0 09 00 00 DE 10 00 00 0F 85"  // rbx variant
+        };
+
+        // 6-byte NOP (66 0F 1F 44 00 00) replaces the 6-byte jnz (0F 85 rel32),
+        // so execution always falls through to the NVIDIA path.
+        std::vector<BYTE> patch = { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 };
+
+        int patched = 0;
+        for (auto pattern : patterns)
+        {
+            auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 10);
+
+            if (patchAddress != nullptr)
+            {
+                patcher::PatchAddress(patchAddress, &patch);
+                patched++;
+            }
+        }
+
+        _patchResult = (patched == 2);
+    }
+
+    // Marvel's Spider-Man 2 (Nixxes)
+    // NxUpscaler only asks Streamline for DLSS ("SL DLSS support") when GetGpuVendor() == 3 (NVIDIA).
+    // DLSS-G and Reflex are not vendor gated, they only depend on the Streamline feature checks.
+    else if (exeName == "spider-man2.exe")
+    {
+        // call [rdx+A8h] (GetGpuVendor); cmp eax, 3; jne ...; lea rcx, [r15+C0h]
+        std::string_view pattern("FF 92 A8 00 00 00 83 F8 03 0F 85 ? ? ? ? 49 8D 8F C0 00 00 00");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 6);
+
+        if (patchAddress != nullptr)
+        {
+            // cmp eax, 3 -> cmp eax, eax; nop
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // The Last of Us Part II Remastered (Nixxes)
+    // DLSS check is vendor locked, but DLSSG and Reflex already work with Streamline spoofing
+    else if (exeName == "tlou-ii.exe" || exeName == "tlou-ii-l.exe")
+    {
+        std::string_view pattern("FF 92 A8 00 00 00 45 33 E4 83 F8 03");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Horizon Forbidden West Complete Edition (Nixxes)
+    // DLSS check is vendor locked, but DLSSG and Reflex already work with Streamline spoofing
+    else if (exeName == "horizonforbiddenwest.exe")
+    {
+        std::string_view pattern("FF 90 98 00 00 00 83 F8 03 0F 85 ? ? ? ? 4C 89 BC 24 C0 01 00 00");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 6);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Ghost of Tsushima DIRECTOR'S CUT (Nixxes)
+    // DLSS check is vendor locked, but DLSSG and Reflex already work with Streamline spoofing
+    else if (exeName == "ghostoftsushima.exe")
+    {
+        std::string_view pattern("FF 92 A0 00 00 00 45 33 F6 83 F8 03");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Ratchet & Clank: Rift Apart (Nixxes)
+    // DLSS check is vendor locked, but DLSSG and Reflex already work with Streamline spoofing
+    else if (exeName == "riftapart.exe")
+    {
+        std::string_view pattern("FF 92 98 00 00 00 45 33 E4 83 F8 03");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Horizon Zero Dawn Remastered (Nixxes)
+    // DLSS check is vendor locked, but DLSSG and Reflex already work with Streamline spoofing
+    else if (exeName == "horizonzerodawnremastered.exe")
+    {
+        std::string_view pattern("FF 90 A0 00 00 00 45 33 F6 83 F8 03");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Marvel’s Spider-Man Remastered, Marvel's Spider-Man: Miles Morales (Nixxes)
+    // DLSS check is vendor locked, but DLSSG and Reflex already work with Streamline spoofing
+    else if (exeName == "spider-man.exe" || exeName == "milesmorales.exe")
+    {
+        std::string_view pattern("FF 92 98 00 00 00 45 33 E4 83 F8 03");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // DEATH STRANDING 2: ON THE BEACH (Nixxes)
+    // DLSS check is vendor locked, but DLSSG and Reflex already work with Streamline spoofing
+    else if (exeName == "ds2.exe")
+    {
+        std::string_view pattern("FF 90 A8 00 00 00 45 33 F6 83 F8 03");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Enshrouded
+    // cmp 10DE right above "[graphics] Skipping DLSS on non-Nvidia GPU"
+    else if (exeName == "enshrouded.exe")
+    {
+        std::string_view pattern("? ? ? ? ? DE 10 00 00 74 ? 0F");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xEB, 0x39 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // DOOM Eternal
+    // just nops a line for main game exe
+    else if (exeName == "doometernalx64vk.exe")
+    {
+        std::string_view pattern("80 3D ? ? ? ? ? 66 C7 05 "
+                                 "? ? ? ? ? ? 48 C7 05 ? "
+                                 "? ? ? ? ? ? ? 0F 84 ? "
+                                 "? ? ? 80 3D ? ? ? ? ? "
+                                 "0F 84 ? ? ? ? 48 8B ? ? " // aiming at 0F 84
+                                 "? ? ? 48 8D");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 40);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // DOOM Eternal - Sandbox
+    // nops a line for sandbox exe
+    else if (exeName == "doomsandbox64vk.exe")
+    {
+        std::string_view pattern("48 C7 05 ? ? ? ? ? ? ? "
+                                 "? 0F 84 ? ? ? ? 80 3D ? "
+                                 "? ? ? ? 0F 84 ? ? ? ? "
+                                 "48 8B ? ? ? ? ? 48 8D");
+        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 24);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Lego Builder's Journey
+    // Patching Nvidia name to enable DLSS on Turkish locale
+    else if (exeName == "builder's journey.exe")
+    {
+        auto unityPlayerModule = GetModuleHandleA("UnityPlayer.dll");
+        if (unityPlayerModule != nullptr)
+        {
+            std::string_view pattern("41 54 49 00 4E 56 49 44 49 41");
+            auto patchAddress = (void*) scanner::GetAddressFromWholeModule(unityPlayerModule, pattern, 5);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x76, 0x69, 0x64, 0x69, 0x61 };
+                patcher::PatchAddress(patchAddress, &patch);
+
+                // Don't set patch result to true since this is only a workaround for Turkish locale
+                // not an actual DLSS check patch
+                _patchResult = false;
+            }
+        }
+    }
+
+    // Jurassic World Evolution 2
+    else if (exeName == "jwe2.exe")
+    {
+        std::string_view pattern("E8 ? ? ? ? 81 BC 24 60 04 00 00 DE 10 00 00");
+        auto patchAddress = (void*) scanner::GetAddressFromWholeModule(exeModule, pattern, 16);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Jurassic World Evolution 3
+    else if (exeName == "jwe3.exe")
+    {
+        std::string_view pattern("81 BD C0 03 00 00 02 10 00 00");
+        auto patchAddress = (void*) scanner::GetAddressFromWholeModule(exeModule, pattern, 10);
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Red Dead Redemption 2
+    else if (exeName == "rdr2.exe")
+    {
+        // DLSS, vendor gate called before NGX init, cmp vendor, 2 -> cmp al, al
+        std::string_view patternDLSS("48 85 C0 74 0A 80 B8 D9 1C 00 00 02 0F 94 C3");
+        auto patchAddressDLSS = (void*) scanner::GetAddress(exeModule, patternDLSS, 5);
+
+        if (patchAddressDLSS != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x38, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSS, &patch);
+        }
+
+        // Reflex, vendor check in Reflex init (NvLowLatencyVk on Vulkan, NvAPI on DX12)
+        std::string_view patternReflex("80 B9 D9 1C 00 00 02 0F 85 ? ? ? ?");
+        auto patchAddressReflex = (void*) scanner::GetAddress(exeModule, patternReflex, 7);
+
+        if (patchAddressReflex != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressReflex, &patch);
+        }
+
+        // NvAPI init, vendor id 0x10DE check, DX12 Reflex disables itself without NvAPI
+        std::string_view patternNvApi("81 B9 00 01 00 00 DE 10 00 00 48 8B D9 0F 85");
+        auto patchAddressNvApi = (void*) scanner::GetAddress(exeModule, patternNvApi, 13);
+
+        if (patchAddressNvApi != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressNvApi, &patch);
+        }
+
+        // Settings menu "is NVIDIA" condition, cmp vendor, 2 -> cmp al, al
+        std::string_view patternMenu("33 C0 80 B8 D9 1C 00 00 02 0F 94 C0 48 83 C4 20 5B C3");
+        auto patchAddressMenu = (void*) scanner::GetAddress(exeModule, patternMenu, 2);
+
+        if (patchAddressMenu != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x38, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressMenu, &patch);
+        }
+        _patchResult = patchAddressDLSS != nullptr && patchAddressReflex != nullptr && patchAddressNvApi != nullptr &&
+                       patchAddressMenu != nullptr;
+    }
+
+    // DLSSG / Extra
+
+    // DLSSG
+    //
+    // The Talos Principle 2, Hell is Us (+ Demo), Robocop: Rogue City, Supraworld, The Talos Principle Reawakened,
+    // REMNANT II , The Elder Scrolls IV: Oblivion Remastered, Tokyo Xtreme Racer/Shutokou Battle, Titan Quest II, 171,
+    // Still Wakes the Deep, WUCHANG: Fallen Feathers, RoboCop: Unfinished Business, Forgive me Father 2, Metal Eden (+
+    // Demo), Enotria: The Last Song, Bloom&Rage, The Alters, Ready or Not, VOID/BREAKER, SILENT HILL 2 Remake, NINJA
+    // GAIDEN 2 Black, Flintlock: The Siege of Dawn, , Eternal Strands, Lost Soul Aside, Cronos: The New Dawn, Daemon X
+    // Machina: Titanic Scion, Deadzone Rogue, The Sinking City Remastered, Chernobylite 2: Exclusion Zone, Tempest
+    // Rising, MindsEye, Crisol: Theater of Idols (+ Demo), Frostpunk 2, Senua’s Saga: Hellblade II, Celestial Empire,
+    // Alien: Rogue Incursion Evolved Edition, Until Dawn, Immortals of Aveum, Fort Solis, Postal 4: No Regerts, Spirit
+    // of the North 2, INDUSTRIA 2, REANIMAL (+ Demo), The Casting of Frank Stone, Echoes of the End: Enhanced Edition,
+    // Palworld, Quarantine Zone: The Last Check, Half Sword, InZOI
+    if (CHECK_UE(talos2) || CHECK_UE(hellisus) || CHECK_UE(robocop) || CHECK_UE(supraworld) || CHECK_UE(talos1) ||
+        CHECK_UE(remnant2) || CHECK_UE(oblivionremastered) || CHECK_UE(tokyoxtremeracer) || CHECK_UE(tq2) ||
+        CHECK_UE(bgg) || exeName == "stillwakesthedeep.exe" || CHECK_UE(project_plague) ||
+        CHECK_UE(robocopunfinishedbusiness) || exeName == "bloom&rage.exe" || CHECK_UE(fmf2) || CHECK_UE(metaleden) ||
+        CHECK_UE(enotria) || CHECK_UE(thealters) || exeName == "readyornotsteam-win64-shipping.exe" ||
+        exeName == "readyornot-wingdk-shipping.exe" || CHECK_UE(voidbreaker) || CHECK_UE(shproto) ||
+        CHECK_UE(ninjagaiden2black) || CHECK_UE(saltpeter) || CHECK_UE(eternalstrandssteam) ||
+        CHECK_UE(projectlsasteam) || CHECK_UE(cronos) || CHECK_UE(game) || CHECK_UE(deadzonesteam) ||
+        CHECK_UE(thesinkingcityremastered) || CHECK_UE(chernobylite2) || CHECK_UE(tempest) || CHECK_UE(mindseye) ||
+        CHECK_UE(crtoiprototype) || CHECK_UE(frostpunk2) || CHECK_UE(hellblade2) || CHECK_UE(china_builder_06) ||
+        CHECK_UE(midnight) || CHECK_UE(bates) || CHECK_UE(immortalsofaveum) || CHECK_UE(sycamore) ||
+        CHECK_UE(postal4) || CHECK_UE(sotn2) || CHECK_UE(industria_2) || exeName == "reanimal.exe" ||
+        CHECK_UE(castingfrankstone) || CHECK_UE(thedarken) || CHECK_UE(palworld) || CHECK_UE(qzsim) ||
+        CHECK_UE(halfswordue5) || CHECK_UE(inzoi))
+
+    // 10 lines of games per pattern should be enough before it gets messy, keep adding to the new section below
+
+    {
+        std::string_view pattern("75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG
+    //
+    // Keeper (+WinGDK PaganIdol exe), Vampire: The Masquerade - Bloodlines 2, Stygian: Outer Gods, The Last Caretaker,
+    // Assetto Corsa Rally, SpongeBob SquarePants: Titans of the Tide, Styx: Blades of Greed (+ Demo), ROMEO IS A DEAD
+    // MAN, High On Life 2, Far Far West, Solasta II, I Am Jesus Christ, Samson, Star Trek: Voyager - Across the
+    // Unknown, Super Meat Boy 3D, Dead as Disco, Conan Exiles Enhanced, Deep Rock Galactic: Rogue Core, Grounded 2,
+    // Fatekeeper, Gothic 1 Remake, The Sinking City 2, DragonSword : Awakening, The Mound: Omen of Cthulhu, 1666:
+    // Amsterdam, Breathedge 2, Crimson Moon, RuneScape: Dragonwilds, Clive Barker's Hellraiser: Revival, Guns of
+    // Eschaton Demo
+    else if (CHECK_UE(keeper) || CHECK_UE(paganidol) || CHECK_UE(bloodlines2) || CHECK_UE(stygian) ||
+             CHECK_UE(voyagesteam) || exeName == "acr.exe" || CHECK_UE(ghost) || CHECK_UE(styx3) || CHECK_UE(sevgame) ||
+             CHECK_UE(highonlife2) || CHECK_UE(farfarwest) || CHECK_UE(brimstone) || CHECK_UE(imjch) ||
+             CHECK_UE(cjsteam) || CHECK_UE(stvoyagersteam) || CHECK_UE(smb) || CHECK_UE(pagodasteam) ||
+             CHECK_UE(conansandbox) || CHECK_UE(roguecore) || CHECK_UE(grounded2steam) || CHECK_UE(slasher) ||
+             CHECK_UE(g1r) || exeName == "thesinkingcity2.exe" || CHECK_UE(dsclient) || CHECK_UE(themound) ||
+             exeName == "1666amsterdam.exe" || CHECK_UE(breathedge2) || CHECK_UE(crimsonmoonngsteam) ||
+             CHECK_UE(rsdragonwilds) || CHECK_UE(hellraiser) || CHECK_UE(gunsofeschaton))
+    {
+        std::string_view pattern("75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, Subnautica 2
+    else if (CHECK_UE(subnautica2))
+    {
+        // Regular SL patch
+        std::string_view pattern1("75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern1, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // Skip over isAMD inside SL plugin, likely related to usage of an old plugin
+        std::string_view pattern2("E8 ? ? ? ? 84 C0 74 ? 80 3D ? ? ? ? ? 0F 82 ? ? ? ? 48 8D 15 ? ? ? ? 48 8D 0D ? ? ? "
+                                  "? E8 ? ? ? ? E9 ? ? ? ? 48 89 9C 24");
+        start = 0;
+        patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern2, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // Always show FG in the game settings, for Intel because the game only checks for Nvidia and AMD
+        std::string_view pattern3("40 53 48 83 EC ? 48 8B 89 ? ? ? ? E8 ? ? ? ? 3C");
+        patchAddress = (void*) scanner::GetAddress(exeModule, pattern3, 0);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xB0, 0x00, 0xC3 }; // return false
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        std::string_view pattern4("8B DD 65 48 8B 04 25");
+        patchAddress = (void*) scanner::GetAddress(exeModule, pattern4, 0);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+    }
+
+    // DLSSG
+    // Deep Rock Galactic, Black Myth: Wukong, Lords of the Fallen 2023
+    else if (CHECK_UE(fsd) || CHECK_UE(b1) || CHECK_UE(lotf2))
+    {
+        std::string_view pattern2("75 ? B9 ? ? ? ? C6 05 ? ? ? ? ? 89 0D");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 0);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xEB };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+    }
+
+    // DLSSG
+    // Banishers: Ghosts of New Eden, Jusant
+    else if (CHECK_UE(banishers) || CHECK_UE(asc))
+    {
+        //// Makes the game always tag resources, this means that DLSSG inputs work but Nukem's mod doesn't
+        // std::string_view pattern2("48 83 EC ? E8 ? ? ? ? 84 C0 75 ? 48 83 C4 ? C3 65 48 8B 04 25 ? ? ? ? BA");
+        // auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 11);
+
+        // if (patchAddress2 != nullptr)
+        //{
+        //     std::vector<BYTE> patch = { 0x90, 0x90 };
+        //     patcher::PatchAddress(patchAddress2, &patch);
+        // }
+
+        // DLSSG check
+        // inline patch
+        std::string_view patternDLSSGCheck1(
+            "80 3D ? ? ? ? ? 74 09 80 3D ? ? ? ? ? 74 30 80 3D ? ? ? ? ? 75 27 81 3D ? ? ? ? ? ? ? ? 75 1B 80 3D ? ? ? "
+            "? ? 74 12 80 3D ? ? ? ? ? 74 09 48 83 C4 28 E9 ? ? ? ? 32 C0 48 83 C4 28");
+        auto patchAddressDLSSGCheck1 = (void*) scanner::GetAddress(exeModule, patternDLSSGCheck1, 27);
+
+        if (patchAddressDLSSGCheck1 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSSGCheck1, &patch);
+        }
+    }
+
+    // Disable dilated MVs, Palworld
+    else if (CHECK_UE(palworld))
+    {
+        std::string_view pattern2("83 FE ? 0F B6 C8");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 2);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x00 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+    }
+
+    // DLSSG
+    //
+    // Witchfire, Ghostrunner 2, Deliver Us Mars, Layers of Fear (2023), The Thaumaturge, The Midnight Walk, Windrose
+    else if (CHECK_UE(witchfire) || CHECK_UE(ghostrunner2) || CHECK_UE(deliverusmars) || CHECK_UE(layersoffear) ||
+             CHECK_UE(thethaumaturge) || CHECK_UE(themidnightwalk) || CHECK_UE(windrose))
+    {
+        std::string_view pattern(
+            "80 3D ? ? ? ? ? 74 0D 80 3D ? ? ? ? ? 0F 84 ? ? ? ? 80 3D ? ? ? ? ? 0F 85 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 40, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress + 34;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, The First Berserker: Khazan
+    else if (CHECK_UE(bbq))
+    {
+        std::string_view pattern("75 ? C7 05 ? ? ? ? ? ? ? ? C6 05 ? ? ? ? ? B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress + 24;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, EVERSPACE 2
+    // inline patch
+    else if (CHECK_UE(es2))
+    {
+        // DLSSG, Deep DVC
+        std::string_view patternDLSSGCheck1("81 3D ? ? ? ? ? ? ? ? 0F 85 ? ? ? ? E8 ? ? ? ? 84 C0");
+        auto patchAddressDLSSGCheck1 = (void*) scanner::GetAddress(exeModule, patternDLSSGCheck1, 0);
+
+        if (patchAddressDLSSGCheck1 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSSGCheck1, &patch);
+        }
+
+        // Reflex
+        std::string_view patternDLSSGCheck2("81 3D ? ? ? ? ? ? ? ? 75 78 E8 ? ? ? ? 84 C0");
+        auto patchAddressDLSSGCheck2 = (void*) scanner::GetAddress(exeModule, patternDLSSGCheck2, 0);
+
+        if (patchAddressDLSSGCheck2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSSGCheck2, &patch);
+        }
+
+        // Late Warp
+        std::string_view patternDLSSGCheck3("81 3D ? ? ? ? ? ? ? ? 75 57 E8 ? ? ? ? 84 C0");
+        auto patchAddressDLSSGCheck3 = (void*) scanner::GetAddress(exeModule, patternDLSSGCheck3, 0);
+
+        if (patchAddressDLSSGCheck3 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddressDLSSGCheck3, &patch);
+        }
+
+        _patchResult = patchAddressDLSSGCheck1 != nullptr;
+    }
+
+    // DLSSG
+    // inline patch
+    //
+    // Project Borealis: Prologue, Atomic Heart, ARK: Survival Ascended, Little Nightmares III, Stellar Blade
+    else if (CHECK_UE(projectborealis) || CHECK_UE(atomicheart) || exeName == "arkascended.exe" ||
+             exeName == "littlenightmaresiii.exe" || CHECK_UE(sb))
+    {
+        std::string_view pattern("80 3D ? ? ? ? ? 74 0D 80 3D ? ? ? ? ? 0F 84 ? ? ? ? 80 3D ? ? ? ? ? 0F 85 ? ? ? ? 81 "
+                                 "3D ? ? ? ? ? ? ? ? 74");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 35, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress + 46;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, Redfall
+    // inline patch
+    else if (exeName == "redfall.exe")
+    {
+        std::string_view pattern2("80 3D ? ? ? ? ? 74 0D 80 3D ? ? ? ? ? 0F 84 ? ? ? ? 80 3D ? ? ? ? ? 0F 85 ? ? ? ? "
+                                  "81 3D ? ? ? ? ? ? ? ? 0F 85");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 35);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+    }
+
+    // DLSSG, The Outer Worlds 2
+    // inline patch
+    else if (CHECK_UE(theouterworlds2))
+    {
+        std::string_view pattern(
+            "44 38 ? ? ? ? ? 0F 85 ? ? ? ? 44 38 ? ? ? ? ? 0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 26, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress + 38;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, FINAL FANTASY VII REBIRTH
+    // inline patch
+    else if (exeName == "ff7rebirth_.exe")
+    {
+        std::string_view pattern2("48 85 C9 0F 84 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 9);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+    }
+
+    // DLSSG, Directive 8020
+    // inline patch
+    else if (CHECK_UE(directive8020))
+    {
+        std::string_view pattern("80 3D ? ? ? ? ? 74 0D 80 3D ? ? ? ? ? 0F 84 ? ? ? ? 80 3D ? ? ? ? ? 0F 85 ? ? ? ? 81 "
+                                 "3D ? ? ? ? ? ? ? ? 74");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 35, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress + 46;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // LEGO Batman: Legacy of the Dark Knight
+    // inline patch
+    else if (CHECK_UE(legobatmanlotdk))
+    {
+        std::string_view pattern("0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F 85");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 6, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, Gears of War: E-Day
+    // inline patch
+    else if (exeName == "goweday-steam.exe")
+    {
+        // SL checks
+        std::string_view pattern("75 1C 81 3D ? ? ? ? ? ? ? ? 74");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 2, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // IsNvidia check above 2nd L"FFXFrameInterpolation"
+        std::string_view pattern3("89 3C 8A EB 72 81 3D ? ? ? ? ? ? ? ? 75");
+        auto patchAddress3 = (void*) scanner::GetAddress(exeModule, pattern3, 5);
+
+        if (patchAddress3 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress3, &patch);
+        }
+
+        // Some IsNvidia check (redundant?)
+        std::string_view pattern2("44 38 ? ? ? ? ? 0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 13);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+
+        // New SL config check
+        std::string_view pattern4("4C 8B E9 75 10 81 3D ? ? ? ? ? ? ? ? 0F");
+        auto patchAddress4 = (void*) scanner::GetAddress(exeModule, pattern4, 5);
+
+        if (patchAddress4 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress4, &patch);
+        }
+    }
+
+    // DLSSG, Gears of War: E-Day (Xbox / Game Pass)
+    // inline patch
+    else if (exeName == "goweday.exe")
+    {
+        // SL checks
+        std::string_view pattern("75 1C 81 3D ? ? ? ? DE 10 00 00 74");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 2, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // IsNvidia check above 2nd L"FFXFrameInterpolation"
+        std::string_view pattern3("E8 ? ? ? ? EB ? 81 3D ? ? ? ? DE 10 00 00 75");
+        auto patchAddress3 = (void*) scanner::GetAddress(exeModule, pattern3, 7);
+
+        if (patchAddress3 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress3, &patch);
+        }
+
+        // Some IsNvidia check (redundant?)
+        std::string_view pattern2("44 38 ? ? ? ? ? 0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 13);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+
+        // New SL config check
+        std::string_view pattern4("4C 8B ? 75 10 81 3D ? ? ? ? ? ? ? ? 0F");
+        auto patchAddress4 = (void*) scanner::GetAddress(exeModule, pattern4, 5);
+
+        if (patchAddress4 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress4, &patch);
+        }
+    }
+
+    // DLSSG, STAR WARS Jedi: Survivor
+    else if (exeName == "jedisurvivor.exe")
+    {
+        std::string_view pattern2(
+            "80 3D ? ? ? ? ? 74 09 80 3D ? ? ? ? ? 74 2D 80 3D ? ? ? ? ? 75 24 E8 ? ? ? ? 84 C0 74");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 32);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+    }
+
+    // DLSSG, Icarus
+    else if (CHECK_UE(icarus))
+    {
+        std::string_view pattern2(
+            "80 3D ? ? ? ? ? 74 09 80 3D ? ? ? ? ? 74 24 80 3D ? ? ? ? ? 75 1B E8 ? ? ? ? 84 C0 74");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 32);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+    }
+
+    // DLSSG, Bellwright
+    else if (CHECK_UE(bellwrightgame))
+    {
+        std::string_view pattern("75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        bool patched = false;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+                patched = true;
+            }
+        } while (patchAddress != nullptr);
+
+        // DLSSG string menu check
+        std::string_view pattern2(
+            "8B 02 83 F8 01 0F 84 ? ? ? ? 83 F8 02 75 0F 48 8B 09 48 8B 89 E0 03 00 00 E9 ? ? ? ? B0 01 C3");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 0);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xB0, 0x01, 0xC3 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+
+        _patchResult = patched || patchAddress2 != nullptr;
+    }
+
+    // DLSSG, METAL GEAR SOLID Δ: SNAKE EATER
+    else if (CHECK_UE(mgsdelta))
+    {
+        // Make slForceTagging always return true
+        std::string_view pattern2("48 83 EC 28 65 48 8B 04 25 58 00 00 00 B9 E4 00 00 00 48 8B 00 8B 04 01 39 ? ? ? ? "
+                                  "? 7F 1E 80 3D ? ? ? ? ? 75");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 0);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xB0, 0x01, 0xC3 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+
+        //// DLSSG
+        // std::string_view patternDLSSGCheck1("80 3D ? ? ? ? ? 74 0D 80 3D ? ? ? ? ? 0F 84 ? ? ? ? 80 3D ? ? ? ? ? 0F
+        // 85 "
+        //                                     "? ? ? ? 81 3D ? ? ? ? ? ? ? ? 74 19 B9 02 00 00 00 C6 05");
+        // auto patchAddressDLSSGCheck1 = (void*) scanner::GetAddress(exeModule, patternDLSSGCheck1, 35);
+
+        // if (patchAddressDLSSGCheck1 != nullptr)
+        //{
+        //     std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+        //     patcher::PatchAddress(patchAddressDLSSGCheck1, &patch);
+        // }
+    }
+
+    // DLSSG, S.T.A.L.K.E.R. 2: Heart of Chornobyl
+    // inline patch
+    // Both DLSS and SL checks are xrefs to the general isNvidia CMP
+    else if (CHECK_UE(stalker2))
+    {
+        std::string_view pattern("E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? 80 3D ? ? ? ? ? 0F 85 ? ? ? ? F6 05");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 7, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // Halo: Campaign Evolved
+    // inline patch
+    else if (exeName == "halocampaignevolved.exe")
+    {
+        std::string_view pattern("80 3D ? ? ? ? ? 74 0D 80 3D ? ? ? ? ? 0F 84 ? ? ? ? 80 3D ? ? ? ? ? 0F 85 ? ? ? ? 81 "
+                                 "3D ? ? ? ? ? ? ? ? 74");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 35, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress + 46;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, Clair Obscur: Expedition 33 (+ GOG)
+    else if (CHECK_UE(sandfall) || CHECK_UE(sandfallgog))
+    {
+        // DLSSG Streamline checks
+        std::string_view pattern("75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // DLSSG menu string check
+        std::string_view pattern2("8B D8 45 33 FF E8 ? ? ? ? 84 C0 0F 84");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 10);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+    }
+
+    // DLSSG, Avowed
+    else if (CHECK_UE(avowed))
+    {
+        std::string_view pattern("75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // For 2.0 update - inline patch
+        if (patchAddress == nullptr)
+        {
+            std::string_view pattern2("80 3D ? ? ? ? ? 0F 85 ? ? ? ? B8 02 00 00 00 81 3D ? ? ? ? ? ? ? ? 0F 85");
+            uintptr_t start = 0;
+            void* patchAddress2 = nullptr;
+            do
+            {
+                patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 18, start);
+                if (patchAddress2 != nullptr)
+                {
+                    std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                    patcher::PatchAddress(patchAddress2, &patch);
+                    start = (uintptr_t) patchAddress2 + 30;
+                }
+            } while (patchAddress2 != nullptr);
+        }
+    }
+
+    // DLSSG, Mortal Shell II
+    else if (CHECK_UE(mortalshell2))
+    {
+        {
+            std::string_view pattern("E8 ? ? ? ? 84 C0 75 ? C7 05");
+            uintptr_t start = 0;
+            void* patchAddress = nullptr;
+            do
+            {
+                patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 7, start);
+                if (patchAddress != nullptr)
+                {
+                    std::vector<BYTE> patch = { 0xEB };
+                    patcher::PatchAddress(patchAddress, &patch);
+                    start = (uintptr_t) patchAddress;
+                }
+            } while (patchAddress != nullptr);
+
+            // This game apparently has a check inside a script
+            // We can't patch the script itself BUT it calls a special function inside the exe to grab the GPU's name
+            // We replace the address of the global adapater name with a pointer to our "Nvidia"
+            std::string_view pattern2("48 63 3D ? ? ? ? 48 8B 35 ? ? ? ? 48 89 4C 24");
+            auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 0);
+            if (patchAddress2 != nullptr)
+            {
+                std::vector<BYTE> patch = {
+                    0x6A, 0x07,                                     // push 7 (Length of Nvidia + null terminator)
+                    0x5F,                                           // pop rdi
+                    0x48, 0xBE,                                     // mov rsi, ...
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // To be filled with a pointer to the string
+                    0x90                                            // nop
+                };
+
+                static const wchar_t* nvidiaString = L"Nvidia";
+                memcpy(&patch[5], &nvidiaString, sizeof(void*));
+
+                patcher::PatchAddress(patchAddress2, &patch);
+            }
+        }
+    }
+
+    // DLSSG, Beast of Reincarnation
+    // SL plugin added with Update 1.0.9
+    else if (CHECK_UE(beastofreincarnation))
+    {
+        std::string_view pattern(
+            "80 3D ? ? ? ? ? 74 0D 80 3D ? ? ? ? ? 0F 84 ? ? ? ? 80 3D ? ? ? ? ? 0F 85 ? ? ? ? E8 ? ? ? ? 84 C0 75");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 40, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, The Blood of Dawnwalker (+ WinGDK)
+    // inline patch
+    else if (exeName == "dawnwalker.exe" || CHECK_UE(dawnwalker))
+    {
+        std::string_view pattern(
+            "44 38 ? ? ? ? ? 0F 85 ? ? ? ? 44 38 ? ? ? ? ? 0F 85 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? 0F");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 26, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, Valor Mortis
+    else if (CHECK_UE(valormortis))
+    {
+        std::string_view pattern("75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // Another SL check
+        std::string_view pattern2("75 29 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 7);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+
+        // Reflex Markers check?
+        std::string_view pattern3("48 83 EC ? E8 ? ? ? ? 81 3D ? ? ? ? ? ? ? ? ?");
+        auto patchAddress3 = (void*) scanner::GetAddress(exeModule, pattern3, 9);
+
+        if (patchAddress3 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress3, &patch);
+        }
+    }
+
+    // DLSSG, Rivage
+    else if (CHECK_UE(rivage))
+    {
+        std::string_view pattern("75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // Another SL check
+        std::string_view pattern2("75 29 E8 ? ? ? ? 84 C0 75");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 7);
+
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress2, &patch);
+        }
+    }
+
+    // DLSSG, Borderlands 4
+    // SL checks are CALLs/xrefs to the 2nd isNvidia CMP below the DLSS CMP check
+    else if (exeName == "borderlands4.exe")
+    {
+        std::string_view pattern("0F 85 ? ? ? ? E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? B8");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 11, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, Hogwarts Legacy
+    else if (exeName == "hogwartslegacy.exe")
+    {
+        // SL checks
+        std::string_view pattern("75 ? C7 05 ? ? ? ? 02 00 00 00 B8 02 00 00 00");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xEB };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        // SL init plugin
+        std::string_view pattern2("E8 ? ? ? ? 84 C0 75 49 E8");
+        auto patchAddress2 = (void*) scanner::GetAddress(exeModule, pattern2, 5);
+        if (patchAddress2 != nullptr)
+        {
+            std::vector<BYTE> patch2 = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress2, &patch2);
+        }
+
+        // Another SL string - DeepDVC
+        std::string_view pattern3("75 29 E8 ? ? ? ? 84 C0 75 17 B8");
+        auto patchAddress3 = (void*) scanner::GetAddress(exeModule, pattern3, 7);
+        if (patchAddress3 != nullptr)
+        {
+            std::vector<BYTE> patch3 = { 0x0C, 0x01 };
+            patcher::PatchAddress(patchAddress3, &patch3);
+        }
+    }
+
+    // DLSSG, Mafia: The Old Country
+    else if (exeName == "mafiatheoldcountry.exe")
+    {
+        std::string_view pattern("80 3D ? ? ? ? ? 0F 94 C0 80 3D ? ? ? ? ? 0F 95 C1 08 C1 BE 01 00 00 00 80 F9 01 0F "
+                                 "85 ? ? ? ? 80 3D ? ? ? ? ? 0F 85 ? ? ? ? E8 ? ? ? ? 84 C0 0F 84");
+        uintptr_t start = 0;
+        void* patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 54, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0x0C, 0x01 };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress + 54;
+            }
+        } while (patchAddress != nullptr);
+    }
+
+    // DLSSG, Sackboy
+    else if (CHECK_UE(sackboy))
+    {
+        // DLSSG Streamline checks
+        std::string_view pattern("0F 84 ? ? ? ? 48 8B 5D ? 45 33 F6");
+        uintptr_t start = 0;
+        void* patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = {
+                0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            };
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        std::string_view pattern2("E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? 41 80 7F ? ? 0F 85");
+        start = 0;
+        patchAddress = (void*) scanner::GetAddress(exeModule, pattern2, 0, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = {
+                0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            };
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        std::string_view pattern3("E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? 40 38 6E ? 0F 85");
+        start = 0;
+        patchAddress = (void*) scanner::GetAddress(exeModule, pattern3, 0, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = {
+                0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            };
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        std::string_view pattern4("48 83 EC ? 65 48 8B 04 25 ? ? ? ? 8B 0D ? ? ? ? BA ? ? ? ? 48 8B 0C C8 8B 04 0A 39 "
+                                  "05 ? ? ? ? 7F ? 80 3D ? ? ? ? ? 74 ? 80 3D ? ? ? ? ? 74 ? 80 3D ? ? ? ? ? 75 ? E8");
+        start = 0;
+        patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern4, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = { 0xB0, 0x01, 0xC3 }; // return true
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        std::string_view pattern5("0F 84 ? ? ? ? 33 D2 66 C7 44 24 ? ? ? 41 B8 ? ? ? ? 48 8D 4C 24 ? E8");
+        start = 0;
+        patchAddress = nullptr;
+        do
+        {
+            patchAddress = (void*) scanner::GetAddress(exeModule, pattern5, 0, start);
+            if (patchAddress != nullptr)
+            {
+                std::vector<BYTE> patch = {
+                    0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                };
+                patcher::PatchAddress(patchAddress, &patch);
+                start = (uintptr_t) patchAddress;
+            }
+        } while (patchAddress != nullptr);
+
+        std::string_view pattern7("81 BC 24 ? ? ? ? DE 10 00 00 48 8B 4C 24 ? 74");
+        start = 0;
+        patchAddress = (void*) scanner::GetAddress(exeModule, pattern7, 16, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0xEB };
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        // D3D12 RHI creates the device via agsDriverExtensionsDX12_CreateDevice on AMD which bypasses sl.interposer
+        // skip the AMD check to use the regular D3D12CreateDevice path
+        std::string_view pattern8("E8 ? ? ? ? 4C 8D 35 ? ? ? ? 84 C0 0F 84 ? ? ? ? 48 8B 47 ? 4C 39 60");
+        start = 0;
+        patchAddress = (void*) scanner::GetAddress(exeModule, pattern8, 0, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x30, 0xC0, 0x90, 0x90, 0x90 }; // xor al, al
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        std::string_view pattern6("0F 84 ? ? ? ? E8 ? ? ? ? 84 C0 0F 84 ? ? ? ? E8");
+        start = 0;
+        patchAddress = (void*) scanner::GetAddress(exeModule, pattern6, 0, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = {
+                0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            };
+            patcher::PatchAddress(patchAddress, &patch);
+            _patchResult = true;
+        }
+    }
+
+    // Streamline, No Man's Sky
+    else if (exeName == "nms.exe")
+    {
+        // slShutdown on vendor string name comparison
+        std::string_view pattern("48 85 C0 0F 84 ? ? ? ? 48 8D 1D ? ? ? ? 48 8B CB");
+        uintptr_t start = 0;
+        void* patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 0, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = {
+                0xEB,
+                0x6E,
+            };
+            patcher::PatchAddress(patchAddress, &patch);
+        }
+
+        // sl dispatch check, var set by a vendorid != amd
+        // check controls call to a function that calls slIsFeatureSupported(1000)
+        std::string_view pattern2("80 3D ? ? ? ? ? 74 ? E8 ? ? ? ? 0F B6 05");
+        start = 0;
+        patchAddress = (void*) scanner::GetAddress(exeModule, pattern2, 0, start);
+
+        if (patchAddress != nullptr)
+        {
+            std::vector<BYTE> patch = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+            patcher::PatchAddress(patchAddress, &patch);
+
+            _patchResult = true;
+        }
+    }
+
+    //// Crimson Desert
+    // else if (exeName == "NOT-crimsondesert.exe")
+    //{
+    //     // Emulate only the tiny post-helper state for the DLSS path.
+    //     std::string patternCodeCave;
+
+    //    for (int i = 0; i < 512; i++)
+    //    {
+    //        if (i != 0)
+    //            patternCodeCave += ' ';
+
+    //        patternCodeCave += "CC";
+    //    }
+
+    //    auto patchAddrCodeCave = (void*) scanner::GetAddress(exeModule, patternCodeCave, 0);
+
+    //    std::string_view patternLocalVendorStateCall(
+    //        "4C 8B BD 20 09 00 00 0F B6 95 30 09 00 00 49 8B CF E8 ? ? ? ? 90 48 8B 4C 24 40");
+    //    auto patchAddrLocalVendorStateCall = (void*) scanner::GetAddress(exeModule, patternLocalVendorStateCall, 17);
+
+    //    if (patchAddrCodeCave != nullptr && patchAddrLocalVendorStateCall != nullptr)
+    //    {
+    //        std::vector<BYTE> cavePatch = {
+    //            0xC6, 0x41, 0x10, 0x01, 0x48, 0x8B, 0x41, 0x08, 0xC6, 0x40, 0x59, 0x01, 0xC3
+    //        };
+    //        patcher::PatchAddress(patchAddrCodeCave, &cavePatch);
+
+    //        intptr_t relativeCall = (intptr_t) patchAddrCodeCave - ((intptr_t) patchAddrLocalVendorStateCall + 5);
+    //        std::vector<BYTE> callPatch = { 0xE8, (BYTE) (relativeCall & 0xFF), (BYTE) ((relativeCall >> 8) & 0xFF),
+    //                                        (BYTE) ((relativeCall >> 16) & 0xFF),
+    //                                        (BYTE) ((relativeCall >> 24) & 0xFF) };
+    //        patcher::PatchAddress(patchAddrLocalVendorStateCall, &callPatch);
+    //    }
+
+    //    // Vendor-class gate bypass
+    //    std::string_view patternStreamlineVendorGate("45 38 6E 1C 0F 84 ? ? ? ? 80 3D ? ? ? ? 01 75 78 41 C6 46 1C
+    //    01"); auto patchAddrStreamlineVendorGate = (void*) scanner::GetAddress(exeModule, patternStreamlineVendorGate,
+    //    0);
+
+    //    if (patchAddrStreamlineVendorGate != nullptr)
+    //    {
+    //        std::vector<BYTE> patch6 = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    //        patcher::PatchAddress((void*) ((uintptr_t) patchAddrStreamlineVendorGate + 4), &patch6);
+    //        std::vector<BYTE> patch2 = { 0x90, 0x90 };
+    //        patcher::PatchAddress((void*) ((uintptr_t) patchAddrStreamlineVendorGate + 17), &patch2);
+    //    }
+
+    //    _patchResult = patchAddrCodeCave != nullptr && patchAddrLocalVendorStateCall != nullptr &&
+    //                   patchAddrStreamlineVendorGate != nullptr;
+    //}
+
+    // 2. Generic Unreal Engine heuristic scanner (auto-unlock for unlisted UE games)
+    if (!_patchResult)
+    {
+        if (CheckGenericUnrealEngine(exeModule, exeNameLower))
+        {
+            _patchResult = true;
+        }
+    }
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+{
+    switch (ul_reason_for_call)
+    {
+    case DLL_PROCESS_ATTACH:
+        g_hModule = hModule;
+        DisableThreadLibraryCalls(hModule);
+        CheckForPatch();
+        break;
+
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+    case DLL_PROCESS_DETACH:
+        break;
+    }
+
+    return TRUE;
+}
