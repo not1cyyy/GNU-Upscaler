@@ -30,10 +30,17 @@ jobs:
         run: |
           msbuild /m /p:Configuration=Release /p:Platform=x64 OptiScaler.sln /verbosity:minimal
 
+      - name: Build OptiPatcher
+        working-directory: OptiPatcher
+        shell: cmd
+        run: |
+          msbuild /m /p:Configuration=Release /p:Platform=x64 OptiPatcher.sln /verbosity:minimal
+
       - name: Prepare Artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path ".\dist"
+          New-Item -ItemType Directory -Force -Path ".\dist\plugins"
           
           # Check common output locations
           $dll = Get-ChildItem -Path ".\OptiScaler" -Recurse -Filter "OptiScaler.dll" | Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
@@ -44,6 +51,15 @@ jobs:
           Write-Host "Found compiled DLL: $($dll.FullName)"
           Copy-Item -Path $dll.FullName -Destination ".\dist\OptiScaler.dll" -Force
           Copy-Item -Path ".\OptiScaler\OptiScaler.ini" -Destination ".\dist\OptiScaler.ini" -Force
+
+          # Copy OptiPatcher plugin
+          $patcher = Get-ChildItem -Path ".\OptiPatcher" -Recurse -Filter "OptiPatcher.asi" | Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
+          if ($patcher) {
+              Write-Host "Found compiled OptiPatcher: $($patcher.FullName)"
+              Copy-Item -Path $patcher.FullName -Destination ".\dist\plugins\OptiPatcher.asi" -Force
+          } else {
+              Write-Warning "OptiPatcher.asi not found in build output!"
+          }
 
           # Copy OptiScaler backend directory if produced by post-build
           $backendDir = Get-ChildItem -Path ".\OptiScaler" -Recurse -Directory -Filter "OptiScaler" | Where-Object { $_.FullName -match "Release" } | Select-Object -First 1

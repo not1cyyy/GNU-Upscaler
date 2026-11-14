@@ -1,0 +1,256 @@
+## Currently supported games
+
+---
+
+<!--
+TEMPLATE FOR NEW ENTRIES
+| GAME NAME           | ✔️/❌ | ✅/⛔ | Notes go here                | 
+-->
+
+| Game | DLSS | DLSS-FG | Notes  |
+| ---- | :--: | :-----: | ------ |
+| 1666: Amsterdam | ✔️ | ✅ |  |
+| 171 | ✔️ | ✅ |  |
+| Achilles: Legends Untold | ✔️ | N/A |  |
+| Ad Infinitum | ✔️ | N/A |  |
+| Alien: Rogue Incursion Evolved Edition | ✔️ | ✅ |  |
+| Aliens: Fireteam Elite 2 | ✔️ | N/A |  |
+| Alone in the Dark 2024 | ✔️ | N/A |  |
+| Amid Evil | ✔️ | N/A |  |
+| A Plague Tale: Requiem | ✔️ | ✅ | _SL1, no HUDless_ |
+| ARK: Survival Ascended | ✔️ | ✅ | _Needs testing_ |
+| Assetto Corsa Competizione | ✔️ | N/A |  |
+| Assetto Corsa Rally | ✔️ | ✅ |  |
+| Atomic Heart | ✔️ | ✅ |  |
+| Automation - The Car Company Tycoon Game | ✔️ | N/A |  |
+| Avowed | ✔️ | ✅ |  |
+| Banishers: Ghosts of New Eden | ✔️ | ✅ |  |
+| Beast of Reincarnation | ✔️ | ✅ | _Coupled FG added since Update 1.0.9_ |
+| Bellwright | ✔️ | ✅ | _DLSS and DLSSG are coupled; requires selecting DLSS as the upscaler for DLSSG inputs to work_ |
+| Blacktail | ✔️ | N/A |  |
+| Black Myth: Wukong | ✔️ | ✅ |  |
+| Borderlands 4 | ✔️ | ✅ |  |
+| Breathedge 2 | ✔️ | ✅ |  |
+| Bright Memory Infinite | ✔️ | ⛔ | _SL1_ |
+| Brothers: A Tale of Two Sons Remake | ✔️ | N/A |  |
+| Carmageddon: Rogue Shift | ✔️ | N/A |  |
+| Celestial Empire | ✔️ | ✅ |  |
+| Chernobylite Enhanced Edition | ✔️ | N/A | _DX12 mode recommended, but should work for DX11 too_ |
+| Chernobylite 2: Exclusion Zone | ✔️ | ✅ |  |
+| Chorus | ✔️ | N/A |  |
+| Clair Obscur: Expedition 33 | ✔️ | ✅ |  |
+| Clive Barker's Hellraiser: Revival | ✔️ | ✅ |  |
+| CODE VEIN II | ✔️ | N/A |  |
+| Commandos: Origins | ✔️ | N/A |  |
+| Conan Exiles Enhanced | ✔️ | ✅ | _Requires **disabling BattlEye** under Game - More in Funcom Launcher, or launching the game directly through `ConanSandbox-Win64-Shipping.exe`_ |
+| Crimson Moon | ✔️ | ✅ |  |
+| Crisol: Theater of Idols | ✔️ | ✅ | _Demo should also be supported_ |
+| Cronos: The New Dawn | ✔️ | ✅ |  |
+| Crimson Desert | ❌ | ⛔ | Disabled for now ~~_Steam and Xbox, ignore driver version warning_~~ |
+| Daemon X Machina: Titanic Scion | ✔️ | ✅ | _SL checks patched, but DLSSG is hidden atm, requires manual activation. Check [special notes](#special-notes) <br> To make AL2/XeLL work properly, might require **Reflex - Force Enable** option through Fakenvapi_ |
+| Deadlink | ✔️ | N/A | _Only DX12, no XeSS mode_ |
+| Deadzone Rogue | ✔️ | ✅ | _Steam exe_ |
+| Dead as Disco | ✔️ | ✅ | _Steam exe_ |
+| DEATH STRANDING 2: ON THE BEACH | ✔️ | ✅ | _DLSS is only vendor locked, DLSSG and Reflex are available already through Streamline spoofing_ |
+| Deep Rock Galactic | ✔️ | ✅ |  |
+| Deep Rock Galactic: Rogue Core | ✔️ | ✅ |  |
+| Deliver Us Mars | ✔️ | ✅ |  |
+| Deliver Us The Moon | ✔️ | N/A |  |
+| Destroy All Humans! 2 - Reprobed | ✔️ | ⛔ | _SL1_ |
+| Directive 8020 | ✔️ | ✅ |  |
+| DOOM Eternal (+ Sandbox) | ✔️ | N/A | _Sandbox exe also supported, RT working_ |
+| DragonSword : Awakening | ✔️ | ✅ |  |
+| Echo Point Nova | ✔️ | N/A |  |
+| Echoes of the End: Enhanced Edition | ✔️ | ✅ |  |
+| Enotria: The Last Song | ✔️ | ✅ |  |
+| Enshrouded | ✔️ | N/A |  |
+| Eternal Strands | ✔️ | ✅ | _Steam exe_ |
+| EVERSPACE 2 | ✔️ | ✅ |  |
+| Evil West | ✔️ | N/A |  |
+| F1 Manager 2024 | ✔️ | N/A |  |
+| Far Far West | ✔️ | ✅ |  |
+| Fatekeeper | ✔️ | ✅ |  |
+| FINAL FANTASY VII REBIRTH | ✔️ | ✅ |  |
+| FINAL FANTASY XIV Online | ✔️ | N/A |  |
+| Five Nights at Freddy's: Security Breach | ✔️ | N/A |  |
+| Flintlock: The Siege of Dawn | ✔️ | ✅ |  |
+| Forgive Me Father 2 | ✔️ | ✅ |  |
+| Fort Solis | ✔️ | ✅ |  |
+| Frostpunk 2 | ✔️ | ✅ |  |
+| Frozenheim | ✔️ | N/A |  |
+| Gears of War: E-Day | ✔️ | ✅ | _Requires disabling EAC in order to use OptiScaler, as well as using Opti as `d3d12.dll` for Patcher to load_ |
+| Ghost of Tsushima DIRECTOR'S CUT | ✔️ | ✅ | _DLSS is only vendor locked, DLSSG and Reflex are available already through Streamline spoofing_ |
+| Ghostrunner | ✔️ | N/A |  |
+| Ghostrunner 2 | ✔️ | ✅ | _Requires retoggling FG on every boot if not working_ |
+| Ghostwire: Tokyo | ✔️ | N/A |  |
+| Gotham Knights | ✔️ | N/A |  |
+| Gothic 1 Remake | ✔️ | ✅ |  |
+| Grand Theft Auto III – The Definitive Edition | ✔️ | N/A |  |
+| Grand Theft Auto: San Andreas – The Definitive Edition | ✔️ | N/A |  |
+| Grand Theft Auto: Vice City – The Definitive Edition | ✔️ | N/A |  |
+| Grounded 2 | ✔️ | N/A | _SL patterns patched for future usage_ |
+| Guns of Eschaton Demo | ✔️ | ✅ |  |
+| Half Sword | ✔️ | ✅ |  |
+| Halo: Campaign Evolved | ✔️ | ✅ |  |
+| Hell is Us | ✔️ | ✅ | _Demo should also be supported_ |
+| Hell Pie | ✔️ | N/A |  |
+| Hi-Fi RUSH | ✔️ | N/A | _Latest update replaced Denuvo with VMProtect which blocks Patcher_ |
+| High On Life | ✔️ | N/A |  |
+| High On Life 2 | ✔️ | ✅ |  |
+| Hogwarts Legacy | ✔️ | ✅ |  |
+| Horizon Forbidden West Complete Edition | ✔️ | ✅ | _DLSS is only vendor locked, DLSSG and Reflex are available already through Streamline spoofing_ |
+| Horizon Zero Dawn Remastered | ✔️ | ✅ | _DLSS is only vendor locked, DLSSG and Reflex are available already through Streamline spoofing_ |
+| I Am Jesus Christ | ✔️ | ✅ |  |
+| Icarus | ✔️ | ✅ |  |
+| Immortals of Aveum | ✔️ | ✅ |  |
+| INDIKA | ✔️ | N/A |  |
+| INDUSTRIA 2 | ✔️ | ✅ |  |
+| InZOI | ✔️ | ✅ | _Built-in FSR FG is broken when using patcher, stick to DLSSG_ |
+| Jurassic World Evolution 2 | ✔️ | ✅ |  |
+| Jurassic World Evolution 3 | ✔️ | ✅ |  |
+| Jusant | ✔️ | ✅ |  |
+| Keeper | ✔️ | ✅ | _WinGDK exe supported also_ |
+| Kena: Bridge of Spirits | ✔️ | N/A |  |
+| Land of the Vikings | ✔️ | N/A |  |
+| Layers of Fear (2023) | ✔️ | ✅ |  |
+| LEGO Batman: Legacy of the Dark Knight | ✔️ | ✅ |  |
+| Lies of P | ✔️ | N/A |  |
+| Like a Dragon: Ishin! | ✔️ | N/A |  |
+| Little Nightmares III | ✔️ | ✅ | _Game doesn't send a HUDless resource_ |
+| Lords of the Fallen 2023 | ✔️ | ✅ | _To enable DLSS Frame Generation, add `-DLSSFG` as a launch command - [PCGW](https://www.pcgamingwiki.com/wiki/Lords_of_the_Fallen_(2023)#Video)_ |
+| Loopmancer | ✔️ | ⛔ | _SL1_ |
+| Lost Records: Bloom & Rage | ✔️ | ✅ |  |
+| Lost Soul Aside | ✔️ | ✅ | _Steam exe_ |
+| Luna Abyss | ✔️ | N/A |  |
+| Mafia: The Old Country | ✔️ | ✅ | _Man of Honor DLC Update added antitamper DRM (VMProtect?) which now blocks Patcher from working_ |
+| Mandragora: Whispers of the Witch Tree | ✔️ | N/A |  |
+| Manor Lords | ✔️ | N/A |  |
+| Marvel's Spider-Man 2 | ✔️ | ✅ | _DLSS is only vendor locked, DLSSG and Reflex are available already through Streamline spoofing_ |
+| Marvel's Spider-Man: Miles Morales | ✔️ | ✅ | _DLSS is only vendor locked, DLSSG and Reflex are available already through Streamline spoofing_ |
+| Marvel’s Spider-Man Remastered | ✔️ | ✅ | _DLSS is only vendor locked, DLSSG and Reflex are available already through Streamline spoofing_ |
+| MechWarrior 5: Mercenaries | ✔️ | N/A |  |
+| Metal Eden | ✔️ | ✅ | _Demo should also be supported_ |
+| METAL GEAR SOLID Δ: SNAKE EATER | ✔️ | ✅ | _Requires OptiScaler **0.9 build** for DLSS-FG patch, **DLSSG SL** inputs <br> DLSS-FG won't be exposed in options, but FG Active should make Streamline state ON - [Screenshot](https://i.ibb.co/7xxcxj4z/METAL-GEAR-SOLID-SNAKE-EATER-2025-09-04-00-00.png) <br> To make AL2/XeLL work properly, requires **Reflex - Force Enable** option through Fakenvapi, since Reflex is hidden <br> To fix weird transparencies, check [special notes](#special-notes)_ |
+| MindsEye | ✔️ | ✅ |  |
+| Mortal Kombat 1 | ✔️ | N/A |  |
+| Mortal Shell 2 | ✔️ | ✅ |  |
+| Myst (2021) | ✔️ | N/A |  |
+| Necromunda: Hired Gun | ✔️ | N/A |  |
+| NINJA GAIDEN 2 Black | ✔️ | ✅ |  |
+| Nobody Wants to Die | ✔️ | N/A |  |
+| No Man's Sky | ✔️ | ✅ |  |
+| Of Ash and Steel | ✔️ | N/A |  |
+| Otherskin | ✔️ | N/A |  |
+| Pacific Drive | ✔️ | N/A |  |
+| Palworld | ✔️ | ✅ |  |
+| Phantom Blade Zero | ✔️ | ✅ |  |
+| Postal 4: No Regerts | ✔️ | ✅ | _Game doesn't send a HUDless resource_ |
+| Project Borealis: Prologue | ✔️ | ✅ | _Requires retoggling DLSS on every game boot if not working_ |
+| Quarantine Zone: The Last Check | ✔️ | ✅ | _SL checks patched for future use_ |
+| Ranch Simulator | ✔️ | N/A |  |
+| Ratchet & Clank: Rift Apart | ✔️ | ✅ | _DLSS is only vendor locked, DLSSG and Reflex are available already through Streamline spoofing_ |
+| Ready or Not | ✔️ | ✅ | _Steam exe_ |
+| REANIMAL | ✔️ | ✅ | _For future use_ |
+| Red Dead Redemption 2 | ✔️ | N/A | _Check [link](https://github.com/optiscaler/OptiScaler/issues/388#issuecomment-3173010106) for install, thanks to 0x-FADED_ |
+| Redfall | ✔️ | ✅ |  |
+| REMNANT II | ✔️ | ✅ |  |
+| Resonance: A Plague Tale Legacy | ✔️ | ✅ |  |
+| Revenge of the Savage Planet | ✔️ | N/A |  |
+| Rivage | ✔️ | ✅ |  |
+| Riven (2024) | ✔️ | N/A |  |
+| Robocop Rogue City | ✔️ | ✅ |  |
+| Robocop Unfinished Business | ✔️ | ✅ |  |
+| ROMEO IS A DEAD MAN | ✔️ | ✅ |  |
+| ROUTINE | ✔️ | N/A |  |
+| RuneScape: Dragonwilds | ✔️ | ✅ |  |
+| RV There Yet? | ✔️ | N/A |  |
+| Samson | ✔️ | ✅ |  |
+| Senua’s Saga: Hellblade II | ✔️ | ✅ |  |
+| Severed Steel | ✔️ | N/A |  |
+| Shadow Warrior 3: Definitive Edition | ✔️ | N/A | _Add Fakenvapi if framerate locked to very low numbers (might force Reflex on unsupported GPUs)_ |
+| Sherlock Holmes: The Awakened | ✔️ | N/A |  |
+| Sifu | ✔️ | N/A |  |
+| SILENT HILL 2 Remake | ✔️ | ✅ |  |
+| SILENT HILL f | ✔️ | N/A |  |
+| SILENT HILL: Townfall | ✔️ | N/A |  |
+| Solasta II | ✔️ | ✅ |  |
+| Soulstice | ✔️ | N/A |  |
+| South of Midnight | ✔️ | N/A |  |
+| Spirit of the North 2 | ✔️ | ✅ | _Game doesn't send a HUDless resource_ |
+| SpongeBob SquarePants: Titans of the Tide | ✔️ | ✅ |  |
+| SPRAWL | ✔️ | N/A |  |
+| S.T.A.L.K.E.R. 2: Heart of Chornobyl | ✔️ | ✅ |  |
+| Star Trek: Voyager - Across the Unknown | ✔️ | ✅ |  |
+| STAR WARS Jedi: Survivor | ✔️ | ✅ |  |
+| Stellar Blade | ✔️ | ✅ |  |
+| Still Wakes the Deep | ✔️ | ✅ |  |
+| Stygian: Outer Gods | ✔️ | ✅ |  |
+| Styx: Blades of Greed | ✔️ | ✅ | _Demo should also be supported_ |
+| Subnautica 2 | ✔️ | ✅ | _FG will always be visible in the game options_ |
+| Suicide Squad: Kill the Justice League | ✔️ | N/A | _Useable only in **Offline mode** with **EAC disabled**_ |
+| Super Meat Boy 3D | ✔️ | ✅ | _Check [Wiki entry](https://github.com/optiscaler/OptiScaler/wiki/Super-Meat-Boy-3D) for more info_ |
+| Supraland | ✔️ | N/A |  |
+| Supraland Six Inches Under | ✔️ | N/A | _Requires using `Testing` beta branch on Steam due to a slider game bug where DLSS isn't selectable_ |
+| Supraworld | ✔️ | ✅ |  |
+| System Shock (2023) | ✔️ | N/A |  |
+| TEKKEN 8 | ✔️ | N/A |  |
+| Tempest Rising | ✔️ | ✅ |  |
+| The Alters | ✔️ | ✅ |  |
+| The Ascent | ✔️ | N/A |  |
+| The Blood of Dawnwalker | ✔️ | ✅ |  |
+| The Casting of Frank Stone | ✔️ | ✅ |  |
+| The Elder Scrolls IV: Oblivion Remastered | ✔️ | ✅ |  |
+| The First Berserker: Khazan | ✔️ | ✅ |  |
+| The Last Caretaker | ✔️ | ✅ |  |
+| The Last of Us Part II Remastered | ✔️ | ✅ | _DLSS is only vendor locked, DLSSG and Reflex are available already through Streamline spoofing_ |
+| The Lord of the Rings: Gollum™ | ✔️ | ⛔ | _SL1_ |
+| The Lord of the Rings: Return to Moria™ | ✔️ | N/A |  |
+| The Midnight Walk | ✔️ | ✅ | _Game doesn't respect settings, please check [Wiki entry](https://github.com/optiscaler/OptiScaler/wiki/The-Midnight-Walk) on how to fix upscalers and FG_ |
+| The Mound: Omen of Cthulhu | ✔️ | ✅ |  |
+| The Outer Worlds 2 | ✔️ | ✅ |  |
+| The Persistence | ✔️ | N/A |  |
+| The Sinking City Remastered | ✔️ | ✅ |  |
+| The Sinking City 2 | ✔️ | ✅ |  |
+| The Talos Principle 2 | ✔️ | ✅ |  |
+| The Talos Principle: Reawakened | ✔️ | ✅ |  |
+| The Thaumaturge | ✔️ | ✅ |  |
+| Titan Quest II | ✔️ | ✅ |  |
+| Tokyo Xtreme Racer/Shutokou Battle | ✔️ | ✅ |  |
+| Tony Hawk's Pro Skater 3 + 4 | ✔️ | N/A |  |
+| Tormented Souls 2 | ✔️ | N/A |  |
+| Trepang2 | ✔️ | N/A |  |
+| Until Dawn | ✔️ | ✅ |  |
+| Valor Mortis | ✔️ | ✅ |  |
+| Vampire: The Masquerade - Bloodlines 2 | ✔️ | ✅ |  |
+| VLADiK BRUTAL | ✔️ | N/A |  |
+| VOID/BREAKER | ✔️ | ✅ | _SL checks patched, but DLSSG is hidden atm, requires manual activation. Check [special notes](#special-notes) <br> To make AL2/XeLL work properly, might require **Reflex - Force Enable** option through Fakenvapi_ |
+| Voidtrain | ✔️ | N/A |  |
+| Way of the Hunter | ✔️ | N/A | _Requires a restart after switching to DLSS inputs if not working_ |
+| Witchfire | ✔️ | ✅ |  |
+| Windrose | ✔️ | ✅ |  |
+| WUCHANG: Fallen Feathers | ✔️ | ✅ |  |
+
+---
+
+> [!NOTE]
+> ### Special notes
+> * To fix weird transparencies in **METAL GEAR SOLID Δ: SNAKE EATER**, add this to **Engine.ini**  
+>	* Engine.ini location - `%LOCALAPPDATA%\MGSDelta\Saved\Config\Windows\`  
+> ```ini
+> [SystemSettings]
+> r.Streamline.ClearSceneColorAlpha=false
+> ```
+> ---
+> * To enable **"hidden" DLSS-FG** (e.g. Daemon X Machina: Titanic Scion), you have to add these commands to **Engine.ini** (locations below)
+>	* If no **Engine.ini present**, then create one and make it **read-only** to avoid being deleted (same goes if the game deletes it on launch in general)
+> ```ini
+> [SystemSettings]
+> r.Streamline.DLSSG.Enable=1
+> t.Streamline.Reflex.Enable=1
+> r.Streamline.DilateMotionVectors=0
+> r.Streamline.ClearSceneColorAlpha=false
+> r.NGX.DLSS.DilateMotionVectors=0
+> ``` 
+> * **Daemon X Machina: Titanic Scion** - `%LOCALAPPDATA%\DXMTS\Saved\Config\Windows` 
+> * **VOID/BREAKER** - `%LOCALAPPDATA%\VOIDBREAKER\Saved\Config\Windows` 
+> * **Quarantine Zone: The Last Check** - `%LOCALAPPDATA%\QZSim\Saved\Config\Windows`
