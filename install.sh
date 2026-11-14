@@ -221,9 +221,15 @@ fi
 log_info "Game binary directory resolved to:"
 echo -e "    ${BOLD}${BIN_DIR}${RESET}"
 
-# ── Uninstall Mode ───────────────────────────────────────────────────────────
+# ── Check for Existing Installation ──────────────────────────────────────────
 
-if [[ $UNINSTALL -eq 1 ]]; then
+is_already_installed() {
+    [[ -f "$BIN_DIR/OptiScaler.dll" ]] || \
+    [[ -f "$BIN_DIR/OptiScaler.ini" ]] || \
+    [[ -d "$BIN_DIR/OptiScaler" ]]
+}
+
+do_uninstall() {
     echo ""
     log_info "Uninstalling GNU-Upscaler from: $BIN_DIR"
     
@@ -254,6 +260,35 @@ if [[ $UNINSTALL -eq 1 ]]; then
 
     log_success "GNU-Upscaler has been completely removed from $BIN_DIR"
     exit 0
+}
+
+if [[ $UNINSTALL -eq 1 ]]; then
+    do_uninstall
+fi
+
+# If already installed and no specific config flags were given, prompt for action
+if is_already_installed && [[ -z "$CONFIG_UPSCALER" && $CONFIG_FG -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
+    echo ""
+    log_warn "GNU-Upscaler is already installed in this directory."
+    echo -e "Choose an action:"
+    echo -e "  ${BOLD}[1]${RESET} Reinstall or update files (default)"
+    echo -e "  ${BOLD}[2]${RESET} Uninstall GNU-Upscaler"
+    echo -e "  ${BOLD}[3]${RESET} Cancel"
+    read -r -p "Enter choice [1-3] (default 1): " choice
+    choice="${choice:-1}"
+
+    case "$choice" in
+        2)
+            do_uninstall
+            ;;
+        3)
+            echo "Operation cancelled."
+            exit 0
+            ;;
+        *)
+            log_info "Proceeding with reinstall / update..."
+            ;;
+    esac
 fi
 
 # ── Fetch & Cache GNU-Upscaler Build ─────────────────────────────────────────
