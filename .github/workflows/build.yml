@@ -6,6 +6,8 @@ on:
     paths-ignore:
       - 'README.md'
       - 'install.sh'
+  schedule:
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -71,6 +73,51 @@ jobs:
           if ($backendDir) {
               Copy-Item -Path $backendDir.FullName -Destination ".\dist\OptiScaler" -Recurse -Force
           }
+
+          # Fetch all FSR4 custom provider variants (INT8 & FP8) from Optiscaler-Client repos
+          $headers = @{
+              "User-Agent" = "gnu-upscaler-ci"
+              "Authorization" = "Bearer ${{ secrets.GITHUB_TOKEN }}"
+          }
+          $extraRepos = @(
+              @{ Repo = "Optiscaler-Client/OptiScaler-Extras"; Suffix = "INT8" },
+              @{ Repo = "Optiscaler-Client/OptiScaler-Extras-FP8"; Suffix = "FP8" }
+          )
+          New-Item -ItemType Directory -Force -Path ".\dist\custom" | Out-Null
+          New-Item -ItemType Directory -Force -Path ".\tmp_extras" | Out-Null
+
+          foreach ($entry in $extraRepos) {
+              $apiUrl = "https://api.github.com/repos/$($entry.Repo)/releases?per_page=20"
+              try {
+                  $releases = Invoke-RestMethod -Uri $apiUrl -Headers $headers -TimeoutSec 30
+                  foreach ($rel in $releases) {
+                      $tag = $rel.tag_name -replace '[^a-zA-Z0-9._-]', '_'
+                      $asset = $rel.assets | Where-Object { $_.name -match '\.(zip|7z)$' } | Select-Object -First 1
+                      if (-not $asset) { continue }
+
+                      $variantName = "${tag}_$($entry.Suffix)"
+                      $targetDir = ".\dist\custom\$variantName\ffx"
+                      $extractDir = ".\tmp_extras\$variantName"
+                      $archivePath = ".\tmp_extras\$($asset.name)"
+
+                      Write-Host "Fetching $($entry.Repo) -> $variantName ($($asset.name))"
+                      Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $archivePath -TimeoutSec 120
+                      New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+                      & 7z x -y "-o$extractDir" $archivePath | Out-Null
+
+                      $dlls = Get-ChildItem -Path $extractDir -Recurse -Filter "*.dll"
+                      if ($dlls) {
+                          New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+                          foreach ($d in $dlls) {
+                              Copy-Item -Path $d.FullName -Destination $targetDir -Force
+                          }
+                      }
+                  }
+              } catch {
+                  Write-Warning "Failed to fetch extras from $($entry.Repo): $_"
+              }
+          }
+          Remove-Item -Path ".\tmp_extras" -Recurse -Force -ErrorAction SilentlyContinue
           
           # Create zip bundle
           Compress-Archive -Path ".\dist\*" -DestinationPath ".\dist\GNU-Upscaler-latest.zip" -Force
