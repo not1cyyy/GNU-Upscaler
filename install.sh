@@ -26,7 +26,7 @@ CONFIG_OPTIFG=0
 CONFIG_GAQ=0
 CONFIG_XEFG=0
 CONFIG_MFG=""
-FETCH_EXTRAS=0
+FETCH_EXTRAS=""
 
 SUPPORTED_PROXIES=("dxgi.dll" "winmm.dll" "version.dll" "d3d12.dll" "dbghelp.dll" "wininet.dll" "winhttp.dll")
 
@@ -67,7 +67,7 @@ ${BOLD}Options:${RESET}
   --xefg                    Set Frame Generation output to XeFG
   --mfg=<mult>              Enable XeFG Multi-Frame Generation (2x, 3x, 4x, 6x, 10x)
   --gaq                     Enable GNU Adaptive Quality (GAQ Auto-DRS)
-  --fetch-extras            Download latest FSR4 INT8/FP8 variants into custom/
+  --fetch-extras[=filter]   Download FSR4 INT8/FP8 variants into custom/ (default: recommended, or 'all' / tag filter)
   -u, --update              Force re-check and download of the latest CI build
   --uninstall               Remove GNU-Upscaler / OptiScaler from the target game
   -h, --help                Show this help message
@@ -186,7 +186,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --fetch-extras)
-            FETCH_EXTRAS=1
+            FETCH_EXTRAS="recommended"
+            shift
+            ;;
+        --fetch-extras=*)
+            FETCH_EXTRAS="${1#*=}"
             shift
             ;;
         -*)
@@ -627,9 +631,18 @@ fetch_extras_providers() {
             fi
         done < <(printf '%s' "$json" | python3 -c "
 import json, sys
+mode = sys.argv[1].lower()
 try:
-    for r in json.load(sys.stdin):
+    releases = json.load(sys.stdin)
+    for idx, r in enumerate(releases):
         tag = r.get('tag_name', '')
+        tl = tag.lower()
+        if mode == 'recommended':
+            if idx != 0 and 'lossy' not in tl and 'exact' not in tl:
+                continue
+        elif mode != 'all':
+            if mode not in tl:
+                continue
         for a in r.get('assets', []):
             name = a.get('name', '')
             if name.endswith(('.zip', '.7z')):
@@ -637,12 +650,12 @@ try:
                 break
 except Exception:
     pass
-" 2>/dev/null)
+" "$FETCH_EXTRAS" 2>/dev/null)
     done
     rm -rf "$tmp_extras"
 }
 
-if [[ $FETCH_EXTRAS -eq 1 ]]; then
+if [[ -n "$FETCH_EXTRAS" ]]; then
     fetch_extras_providers
 fi
 
