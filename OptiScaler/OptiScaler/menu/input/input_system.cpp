@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "input_system_internal.h"
 
+#include <Config.h>
 #include <include/imgui/imgui.h>
 
 namespace OptiInput
@@ -738,27 +739,11 @@ void PollInputFallbackLocked()
     if (_state.PolledMouseUsedThisFrame)
         _state.PolledMouseFrameCount++;
 
-    BYTE keyState[256] = {};
-    const bool hasKeyboardState = (o_GetKeyboardState != nullptr && o_GetKeyboardState(keyState) != FALSE);
-
     if (_state.MenuVisible)
     {
-        if (hasKeyboardState)
+        // Skip full 256-key polling if window messages already delivered keyboard events this frame
+        if (!_state.ReceivedWindowMessageThisFrame)
         {
-            // Single-call fast path: check all 256 keys directly from memory (0 Wine IPC roundtrips)
-            for (int vk = 0; vk < 256; ++vk)
-            {
-                const bool wasDown = _state.Keys[vk].Down;
-                const bool down = (keyState[vk] & 0x80) != 0;
-                UpdateVirtualKeyFromStateLocked(vk, down, time);
-
-                if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
-                    _state.PolledKeyboardUsedThisFrame = true;
-            }
-        }
-        else
-        {
-            // Fallback to individual polling if GetKeyboardState failed
             for (int vk = 0; vk < 256; ++vk)
             {
                 const bool wasDown = _state.Keys[vk].Down;
@@ -771,35 +756,37 @@ void PollInputFallbackLocked()
     }
     else
     {
-        // When overlay menu is closed, inspect only potential shortcut/toggle keys
+        // When overlay menu is closed, poll only potential shortcut/toggle keys + configured user hotkeys
         static const int shortcutKeys[] = {
             VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT,
             VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
             VK_PAUSE, VK_SCROLL, VK_SNAPSHOT, VK_OEM_3
         };
 
-        if (hasKeyboardState)
-        {
-            for (int vk : shortcutKeys)
-            {
-                const bool wasDown = _state.Keys[vk].Down;
-                const bool down = (keyState[vk] & 0x80) != 0;
-                UpdateVirtualKeyFromStateLocked(vk, down, time);
+        auto pollKey = [&](int vk) {
+            if (vk <= 0 || vk >= 256)
+                return;
+            const bool wasDown = _state.Keys[vk].Down;
+            PollVirtualKeyLocked(vk, time);
+            if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
+                _state.PolledKeyboardUsedThisFrame = true;
+        };
 
-                if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
-                    _state.PolledKeyboardUsedThisFrame = true;
-            }
-        }
-        else
-        {
-            for (int vk : shortcutKeys)
-            {
-                const bool wasDown = _state.Keys[vk].Down;
-                PollVirtualKeyLocked(vk, time);
+        for (int vk : shortcutKeys)
+            pollKey(vk);
 
-                if (_state.Keys[vk].Down != wasDown || _state.Keys[vk].Pressed || _state.Keys[vk].Released)
-                    _state.PolledKeyboardUsedThisFrame = true;
-            }
+        auto cfg = Config::Instance();
+        const int customKeys[] = {
+            cfg->ShortcutKey.value_or_default(),
+            cfg->FpsShortcutKey.value_or_default(),
+            cfg->FpsCycleShortcutKey.value_or_default(),
+            cfg->FGShortcutKey.value_or_default(),
+        };
+        for (int vk : customKeys)
+        {
+            const bool alreadyPolled = std::ranges::any_of(shortcutKeys, [vk](int k) { return k == vk; });
+            if (!alreadyPolled)
+                pollKey(vk);
         }
     }
 

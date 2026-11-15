@@ -944,6 +944,8 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
         static double lastPresentTime = 0.0;
         auto now = Util::MillisecondsNow();
         state.lastFGFrameTime = lastPresentTime > 0.0 ? now - lastPresentTime : 0.0;
+        if (state.lastFGFrameTime > 0.0)
+            state.presentFrameTime = state.lastFGFrameTime;
         lastPresentTime = now;
 
         if (fg->IsActive() && !fg->IsPaused())

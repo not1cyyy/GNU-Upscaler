@@ -383,6 +383,11 @@ ffxReturnCode_t ffxCreateContext_Dx12FG(ffxContext* context, ffxCreateContextDes
             {
                 LOG_ERROR("FG Swapchain creation error, currentFG: {:X}, currentFGSwapchain: {:X}",
                           (size_t) s.currentFG, (size_t) s.currentFGSwapchain);
+                if (s.activeFgOutput == FGOutput::NoFG)
+                {
+                    *context = (ffxContext) scContext;
+                    return FFX_API_RETURN_OK;
+                }
             }
         }
         else
@@ -440,6 +445,11 @@ ffxReturnCode_t ffxCreateContext_Dx12FG(ffxContext* context, ffxCreateContextDes
             {
                 LOG_ERROR("FG Swapchain creation error, currentFG: {:X}, currentFGSwapchain: {:X}",
                           (size_t) s.currentFG, (size_t) s.currentFGSwapchain);
+                if (s.activeFgOutput == FGOutput::NoFG)
+                {
+                    *context = (ffxContext) scContext;
+                    return FFX_API_RETURN_OK;
+                }
             }
         }
         else

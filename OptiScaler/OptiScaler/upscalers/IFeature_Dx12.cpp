@@ -186,7 +186,8 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
                   rcasConstants.Sharpness = _actualSharpness.value_or(_sharpness);
                   rcasConstants.DepthIsLinear = DepthLinear();
                   rcasConstants.DepthIsReversed = DepthInverted();
-                  rcasConstants.IsHdr = IsHdr();
+                  rcasConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
+                                        State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
 
                   // Restore value
                   _sharpness = _actualSharpness.value_or(_sharpness);

@@ -375,5 +375,5 @@ void IFeature::GetDynamicOutputResolution(NVSDK_NGX_Parameter* InParameters, uns
 
 bool IFeature::IsHdr()
 {
-    return _initFlags.IsHdr || State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+    return _initFlags.IsHdr;
 }

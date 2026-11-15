@@ -97,7 +97,7 @@ void FrameLimit::sleep(bool fgActive)
 {
     if (auto fpsCap = targetFps(); fpsCap > 0.0f)
     {
-        uint64_t min_interval_us = std::clamp((uint64_t) (1'000'000 / fpsCap), 0ULL, 100'000'000ULL);
+        uint64_t min_interval_us = std::clamp((uint64_t) (1'000'000.0 / fpsCap), 0ULL, 100'000'000ULL);
 
         // The limit counts presented frames, the real frames come once per batch
         if (fgActive)

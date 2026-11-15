@@ -71,6 +71,16 @@ jobs:
           if ($backendDir) {
               Copy-Item -Path $backendDir.FullName -Destination ".\dist\OptiScaler" -Recurse -Force
           }
+
+          # Copy XeSS / XeFG / XeLL runtime DLLs
+          foreach ($xessDll in @("libxess_fg.dll", "libxell.dll", "libxess.dll", "libxess_dx11.dll")) {
+              $src = ".\OptiScaler\external\xess\bin\$xessDll"
+              if (Test-Path $src) {
+                  Copy-Item -Path $src -Destination ".\dist\$xessDll" -Force
+              } else {
+                  Write-Warning "$xessDll not found at $src"
+              }
+          }
           
           # Create zip bundle
           Compress-Archive -Path ".\dist\*" -DestinationPath ".\dist\GNU-Upscaler-latest.zip" -Force

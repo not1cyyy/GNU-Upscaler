@@ -68,8 +68,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
         params.flags |= FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
     }
 
-    const bool isHDR = State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
-    if (Config::Instance()->FsrNonLinearPQ.value_or(isHDR))
+    if (Config::Instance()->FsrNonLinearPQ.value_or_default())
         params.flags |= FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ;
     else if (Config::Instance()->FsrNonLinearSRGB.value_or_default())
         params.flags |= FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;

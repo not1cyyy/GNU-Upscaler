@@ -1693,10 +1693,11 @@ void CheckForExcludedProcess()
     }
 
     // Check if anti-cheat binaries exist alongside the executable
+    std::error_code ec;
     auto exeDir = Util::ExePath().parent_path();
     for (const auto& mod : acModules)
     {
-        if (std::filesystem::exists(exeDir / mod))
+        if (std::filesystem::exists(exeDir / mod, ec))
         {
             _passThruMode = true;
             return;

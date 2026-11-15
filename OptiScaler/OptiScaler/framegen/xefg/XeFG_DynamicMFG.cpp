@@ -123,8 +123,9 @@ XeFG_DynamicMFG::Result XeFG_DynamicMFG::Update(int targetCount, int framesToInt
 
         // ADFG Base FPS Latency Floor Guard: When base FPS dips, safely clamp to 2X (1 frame) so controls stay responsive
         const float minBaseFps = config->FGXeFGMinBaseFps.value_or_default();
-        const double currentBaseFps = state.presentFrameTime > 0.0 ? (1000.0 / state.presentFrameTime)
-                                                                   : (state.lastFGFrameTime > 0.0 ? (1000.0 / state.lastFGFrameTime) : 60.0);
+        const double baseFrameMs = state.lastFGFrameTime > 0.0 ? state.lastFGFrameTime
+                                                               : (state.presentFrameTime > 0.0 ? state.presentFrameTime : 0.0);
+        const double currentBaseFps = baseFrameMs > 0.0 ? (1000.0 / baseFrameMs) : 60.0;
 
         if (minBaseFps > 0.0f && currentBaseFps < minBaseFps)
         {
