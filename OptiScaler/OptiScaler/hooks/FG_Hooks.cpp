@@ -1369,6 +1369,8 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
 
         _lastFGFrameTime = now;
         state.lastFGFrameTime = ftDelta;
+        if (ftDelta > 0.0)
+            state.presentFrameTime = ftDelta;
 
         LOG_DEBUG("flags: {:X}, Frametime: {}", Flags, ftDelta);
 

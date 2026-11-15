@@ -18,7 +18,13 @@ std::vector<SectionRange> GetExecSections(HMODULE hMod)
 
     BYTE* base = reinterpret_cast<BYTE*>(hMod);
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return secs;
+
     auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return secs;
+
     auto first = IMAGE_FIRST_SECTION(nt);
 
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i)
@@ -76,7 +82,7 @@ static ParsedPattern ParsePattern(std::string_view mask)
                 p.first_fixed_idx = p.bytes.size() - 1;
                 p.first_fixed_byte = static_cast<uint8_t>(val);
             }
-            while (i < mask.size() && mask[i] != ' ' && mask[i] != '\t')
+            while (i < mask.size() && mask[i] != ' ' && mask[i] != '\t' && mask[i] != '\r' && mask[i] != '\n')
                 ++i;
         }
     }
@@ -129,13 +135,19 @@ static uintptr_t FindPatternFast(uintptr_t startAddress, uintptr_t maxSize, cons
 uintptr_t scanner::GetAddressFromWholeModule(HMODULE module, const std::string_view pattern, ptrdiff_t offset,
                                              uintptr_t startAddress)
 {
-    const static uintptr_t moduleBase = reinterpret_cast<uintptr_t>(module);
-    const static uintptr_t moduleEnd = [&]()
-    {
-        auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS64>(
-            moduleBase + reinterpret_cast<PIMAGE_DOS_HEADER>(moduleBase)->e_lfanew);
-        return static_cast<uintptr_t>(moduleBase + ntHeaders->OptionalHeader.SizeOfImage);
-    }();
+    if (module == nullptr)
+        return NULL;
+
+    const uintptr_t moduleBase = reinterpret_cast<uintptr_t>(module);
+    auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(moduleBase);
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+        return NULL;
+
+    auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS64>(moduleBase + dosHeader->e_lfanew);
+    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
+        return NULL;
+
+    const uintptr_t moduleEnd = static_cast<uintptr_t>(moduleBase + ntHeaders->OptionalHeader.SizeOfImage);
 
     auto parsed = ParsePattern(pattern);
     if (parsed.bytes.empty())
@@ -160,7 +172,8 @@ uintptr_t scanner::GetAddressFromWholeModule(HMODULE module, const std::string_v
 uintptr_t scanner::GetAddress(const std::wstring_view moduleName, const std::string_view pattern, ptrdiff_t offset,
                               uintptr_t startAddress)
 {
-    auto module = GetModuleHandle(moduleName.data());
+    std::wstring moduleNameOwned(moduleName);
+    auto module = GetModuleHandle(moduleNameOwned.c_str());
     return GetAddress(module, pattern, offset, startAddress);
 }
 

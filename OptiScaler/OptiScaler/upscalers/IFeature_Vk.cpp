@@ -179,7 +179,8 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
                   rcasConstants.Sharpness = _actualSharpness.value_or(_sharpness);
                   rcasConstants.DepthIsLinear = DepthLinear();
                   rcasConstants.DepthIsReversed = DepthInverted();
-                  rcasConstants.IsHdr = IsHdr();
+                  rcasConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
+                                        State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
 
                   _sharpness = _actualSharpness.value_or(_sharpness);
                   _actualSharpness.reset();

@@ -201,7 +201,8 @@ bool IFeature_Dx11::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Par
                   rcasConstants.Sharpness = _actualSharpness.value_or(_sharpness);
                   rcasConstants.DepthIsLinear = DepthLinear();
                   rcasConstants.DepthIsReversed = DepthInverted();
-                  rcasConstants.IsHdr = IsHdr();
+                  rcasConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
+                                        State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
 
                   // Restore value
                   _sharpness = _actualSharpness.value_or(_sharpness);

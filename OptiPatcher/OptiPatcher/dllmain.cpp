@@ -67,21 +67,31 @@ static bool CheckExternalPatches(HMODULE exeModule, const std::string& exeNameLo
             if (t[0] == '[' && t.back() == ']')
             {
                 currentSection = t.substr(1, t.size() - 2);
-                std::transform(currentSection.begin(), currentSection.end(), currentSection.begin(), ::tolower);
+                std::transform(currentSection.begin(), currentSection.end(), currentSection.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 continue;
             }
 
             auto eq = t.find('=');
             if (eq != std::string::npos && !currentSection.empty())
             {
+                auto trim = [](std::string& s) {
+                    const size_t first = s.find_first_not_of(" \t\r\n");
+                    if (first == std::string::npos) {
+                        s.clear();
+                        return;
+                    }
+                    const size_t last = s.find_last_not_of(" \t\r\n");
+                    s = s.substr(first, last - first + 1);
+                };
                 std::string k = t.substr(0, eq);
                 std::string v = t.substr(eq + 1);
-                k.erase(0, k.find_first_not_of(" \t\r\n"));
-                k.erase(k.find_last_not_of(" \t\r\n") + 1);
-                v.erase(0, v.find_first_not_of(" \t\r\n"));
-                v.erase(v.find_last_not_of(" \t\r\n") + 1);
-                std::transform(k.begin(), k.end(), k.begin(), ::tolower);
-                ini[currentSection][k] = v;
+                trim(k);
+                trim(v);
+                std::transform(k.begin(), k.end(), k.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (!k.empty())
+                    ini[currentSection][k] = v;
             }
         }
 
@@ -158,17 +168,14 @@ static bool CheckGenericUnrealEngine(HMODULE exeModule, const std::string& exeNa
         // Pattern 1: Canonical UE5 Streamline / DLSS check with mov eax, 4 ... test al, al; jnz
         { "84 C0 49 8B C7 74 03 49 8B C6 8B 34 30 89 75 80 E8 ? ? ? ? 84 C0 75", 21, { 0x0C, 0x01 } },
 
-        // Pattern 2: Variant with r13/r14 registers
-        { "84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75", 20, { 0x0C, 0x01 } },
+        // Pattern 2: Variant with r13/r14 registers (offset 19 lands on '84 C0')
+        { "84 C0 49 8B C7 74 03 49 8B C5 46 8B 34 30 E8 ? ? ? ? 84 C0 75", 19, { 0x0C, 0x01 } },
 
         // Pattern 3: Classic UE4 / early UE5 B8 04 00 00 00
         { "B8 04 00 00 00 74 03 49 8B C7 8B 34 30 4C 89 A4 24 ? ? 00 00 4C 89 B4 24 ? ? 00 00 E8 ? ? ? ? 84 C0 75", 34, { 0x0C, 0x01 } },
 
-        // Pattern 4: Compact UE check: 41 8B 34 36 E8 ... 84 C0 75
-        { "41 8B 34 36 E8 ? ? ? ? 84 C0 75", 10, { 0x0C, 0x01 } },
-
-        // Pattern 5: Direct IsNvidia Vendor Check: cmp [rva], 0x10DE
-        { "81 3D ? ? ? ? DE 10 00 00 ? ? ? ? ? 84 C0 75", 16, { 0x0C, 0x01 } },
+        // Pattern 4: Direct IsNvidia Vendor Check: cmp [rva], 0x10DE ... test al, al; jnz (offset 15 lands on '84 C0')
+        { "81 3D ? ? ? ? DE 10 00 00 ? ? ? ? ? 84 C0 75", 15, { 0x0C, 0x01 } },
     };
 
     for (const auto& sig : kSignatures)

@@ -967,25 +967,31 @@ bool XeFG_Dx12::Dispatch()
         memcpy(constData.viewMatrix, view.r, sizeof(view));
     }
 
-    if (Config::Instance()->FGXeFGDepthInverted.value_or_default())
-        std::swap(_cameraNear[fIndex], _cameraFar[fIndex]);
+    float nearPlane = _cameraNear[fIndex];
+    float farPlane = _cameraFar[fIndex];
 
-    if (_infiniteDepth && _cameraFar[fIndex] > _cameraNear[fIndex])
-        _cameraFar[fIndex] = std::numeric_limits<float>::infinity();
-    else if (_infiniteDepth && _cameraNear[fIndex] > _cameraFar[fIndex])
-        _cameraNear[fIndex] = std::numeric_limits<float>::infinity();
+    const bool depthInverted = Config::Instance()->FGXeFGDepthInverted.has_value()
+                                   ? Config::Instance()->FGXeFGDepthInverted.value()
+                                   : (State::Instance().gameEngine == GameEngineType::Unreal);
+    if (depthInverted)
+        std::swap(nearPlane, farPlane);
+
+    if (_infiniteDepth && farPlane > nearPlane)
+        farPlane = std::numeric_limits<float>::infinity();
+    else if (_infiniteDepth && nearPlane > farPlane)
+        nearPlane = std::numeric_limits<float>::infinity();
 
     // Cyberpunk seems to be sending LH so do the same
     // it also sends some extra data in usually empty spots but no idea what that is
-    if (_cameraNear[fIndex] > 0.f && _cameraFar[fIndex] > 0.f &&
+    if (nearPlane > 0.f && farPlane > 0.f &&
         !XMScalarNearEqual(_cameraVFov[fIndex], 0.0f, 0.00001f) &&
         !XMScalarNearEqual(_cameraAspectRatio[fIndex], 0.0f, 0.00001f))
     {
-        if (XMScalarNearEqual(_cameraNear[fIndex], _cameraFar[fIndex], 0.00001f))
-            _cameraFar[fIndex]++;
+        if (XMScalarNearEqual(nearPlane, farPlane, 0.00001f))
+            farPlane++;
 
         auto projectionMatrix = XMMatrixPerspectiveFovLH(_cameraVFov[fIndex], _cameraAspectRatio[fIndex],
-                                                         _cameraNear[fIndex], _cameraFar[fIndex]);
+                                                         nearPlane, farPlane);
         memcpy(constData.projectionMatrix, projectionMatrix.r, sizeof(projectionMatrix));
     }
     else
@@ -1480,6 +1486,7 @@ bool XeFG_Dx12::Present()
     bool result = false;
 
     // if (IsActive() && !IsPaused())
+    if (fIndex >= 0 && fIndex < BUFFER_COUNT)
     {
         bool uiReady = false;
         if (_uiCommandListResetted[fIndex])
@@ -1496,7 +1503,7 @@ bool XeFG_Dx12::Present()
         }
 
         bool scReady = false;
-        if (fIndex < BUFFER_COUNT && _scCommandListResetted[fIndex])
+        if (_scCommandListResetted[fIndex])
         {
             LOG_DEBUG("Closing _scCommandList[{}]: {:X}", fIndex, (size_t) _scCommandList[fIndex]);
             auto closeResult = _scCommandList[fIndex]->Close();
@@ -1510,21 +1517,24 @@ bool XeFG_Dx12::Present()
         }
 
         // Batch command lists into a single ExecuteCommandLists call to eliminate redundant queue submissions
-        ID3D12CommandList* batchLists[2];
-        UINT batchCount = 0;
-        if (uiReady) batchLists[batchCount++] = _uiCommandList[fIndex];
-        if (scReady) batchLists[batchCount++] = _scCommandList[fIndex];
-
-        if (batchCount > 0)
+        if (_gameCommandQueue != nullptr)
         {
-            _gameCommandQueue->ExecuteCommandLists(batchCount, batchLists);
+            ID3D12CommandList* batchLists[2];
+            UINT batchCount = 0;
+            if (uiReady) batchLists[batchCount++] = _uiCommandList[fIndex];
+            if (scReady) batchLists[batchCount++] = _scCommandList[fIndex];
+
+            if (batchCount > 0)
+            {
+                _gameCommandQueue->ExecuteCommandLists(batchCount, batchLists);
+            }
+
+            if (uiReady)
+                _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
+
+            if (scReady)
+                _scAllocatorFenceValues[fIndex] = SignalSCFence();
         }
-
-        if (uiReady)
-            _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
-
-        if (scReady)
-            _scAllocatorFenceValues[fIndex] = SignalSCFence();
     }
 
     if ((_fgFramePresentId - _lastFGFramePresentId) > 3 && IsActive() && !_waitingNewFrameData)

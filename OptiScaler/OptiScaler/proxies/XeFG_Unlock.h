@@ -38,6 +38,10 @@ inline bool Apply(HMODULE libxefgModule)
     if (libxefgModule == nullptr)
         return false;
 
+    static HMODULE s_lastPatchedModule = nullptr;
+    if (s_lastPatchedModule == libxefgModule)
+        return true;
+
     auto base = reinterpret_cast<uint8_t*>(libxefgModule);
 
     auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
@@ -125,13 +129,27 @@ inline bool Apply(HMODULE libxefgModule)
         // 2. Dynamic AOB Pattern Fallback (resilient against new DLL versions and Wine/Proton relocations)
         if (sigPattern != nullptr && sigMask != nullptr && textStart != nullptr && textSize > 0)
         {
-            uint8_t* match = FindPattern(textStart, textSize, sigPattern, sigMask);
-            if (match != nullptr)
+            uint8_t* searchPtr = textStart;
+            size_t remaining = textSize;
+            while (remaining > 0)
             {
+                uint8_t* match = FindPattern(searchPtr, remaining, sigPattern, sigMask);
+                if (match == nullptr)
+                    break;
+
                 void* dynamicTarget = match + sigTargetOffset;
-                const size_t foundRva = reinterpret_cast<uint8_t*>(dynamicTarget) - base;
-                LOG_INFO("XeFG Unlock: {} located via AOB pattern scan at 0x{:X}", name, foundRva);
-                return patch(dynamicTarget, expected, patchBytes, patchSize, name);
+                if (expected == nullptr || memcmp(dynamicTarget, expected, patchSize) == 0)
+                {
+                    const size_t foundRva = reinterpret_cast<uint8_t*>(dynamicTarget) - base;
+                    LOG_INFO("XeFG Unlock: {} located via AOB pattern scan at 0x{:X}", name, foundRva);
+                    return patch(dynamicTarget, expected, patchBytes, patchSize, name);
+                }
+
+                const size_t advance = static_cast<size_t>((match + 1) - searchPtr);
+                if (advance >= remaining)
+                    break;
+                searchPtr += advance;
+                remaining -= advance;
             }
         }
 
@@ -187,9 +205,12 @@ inline bool Apply(HMODULE libxefgModule)
         const uint8_t u5_exp[] = { 0xB8, 0x01, 0x00, 0x00, 0x00 };
         const uint8_t u5_pat[] = { 0xB8, static_cast<uint8_t>(ceiling), 0x00, 0x00, 0x00 };
         const uint8_t u5_sig[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0x89, 0x47, 0x20, 0x33, 0xC0 };
-        if (resolveAndPatch(0x20973B, u5_exp, u5_pat, sizeof(u5_exp), u5_sig, "x?xxxxxxx", 0, "U5/reported-maximum"))
+        if (resolveAndPatch(0x20973B, u5_exp, u5_pat, sizeof(u5_exp), u5_sig, "x?xxxxxxxx", 0, "U5/reported-maximum"))
             successCount++;
     }
+
+    if (successCount > 0)
+        s_lastPatchedModule = libxefgModule;
 
     LOG_INFO("XeFG Unlock: {}/5 patches applied (MFG unlocked up to {}X, ceiling: {})", successCount, ceiling + 1, ceiling);
     return successCount == 5;

@@ -628,6 +628,8 @@ fetch_extras_providers() {
                 while IFS= read -r dll_path; do
                     cp -f "$dll_path" "$target_ffx/"
                 done <<< "$found_dlls"
+            else
+                log_warn "No DLLs extracted from ${asset_name} (if .7z failed, install p7zip)"
             fi
         done < <(printf '%s' "$json" | python3 -c "
 import json, sys
