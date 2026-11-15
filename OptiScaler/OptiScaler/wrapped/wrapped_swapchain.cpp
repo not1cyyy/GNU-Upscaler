@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "wrapped_swapchain.h"
+#include <fsr4/FSR4Models.h>
 
 #include <Util.h>
 #include <Config.h>
@@ -510,6 +511,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                     State::Instance().upscaleTimes.pop_front();
                     State::Instance().lastUpscalerGpuMs = upscalerTime;
                     State::Instance().frameTimeMutex.unlock();
+                    FSR4Models::EvaluateGpuBudget(upscalerTime);
                 }
             }
         }

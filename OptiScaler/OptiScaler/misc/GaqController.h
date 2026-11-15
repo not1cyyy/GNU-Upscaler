@@ -137,7 +137,31 @@ class GaqController
             _lastError = 0.0f;
         }
 
-        return _currentRatio;
+        // Motion-Adaptive GAQ Boost: proactively raise upscale ratio during fast camera turns/swipes
+        const float maxMotionBoost = std::clamp(config->GaqMotionBoost.value_or_default(), 0.0f, 0.6f);
+        if (maxMotionBoost > 0.001f)
+        {
+            const int64_t mouseNow = state.mouseMotionCounter.load(std::memory_order_relaxed);
+            const int64_t mouseStep = std::max<int64_t>(0, mouseNow - _lastMouseCounter);
+            _lastMouseCounter = mouseNow;
+
+            const float mouseRatePerSec = dt > 0.001f ? static_cast<float>(mouseStep) / dt : 0.0f;
+            const float mouseSignal = std::clamp((mouseRatePerSec - 250.0f) / 1400.0f, 0.0f, 1.0f);
+            const float camVel = static_cast<float>(state.cameraAngularSpeed.load(std::memory_order_relaxed));
+            const float camSignal = std::clamp(camVel / 2.5f, 0.0f, 1.0f);
+
+            const float targetBoost = std::max(mouseSignal, camSignal) * maxMotionBoost;
+            const float alpha = targetBoost > _motionBoostOffset ? std::min(1.0f, dt * 12.0f) : std::min(1.0f, dt * 3.0f);
+            _motionBoostOffset += (targetBoost - _motionBoostOffset) * alpha;
+            if (_motionBoostOffset < 0.001f)
+                _motionBoostOffset = 0.0f;
+        }
+        else
+        {
+            _motionBoostOffset = 0.0f;
+        }
+
+        return std::clamp(_currentRatio + _motionBoostOffset, minRatio, maxRatio);
     }
 
     float Update(double nowMs, double frameTimeMs)
@@ -148,7 +172,10 @@ class GaqController
     float CurrentRatio() const
     {
         std::lock_guard<std::mutex> lock(_mutex);
-        return _currentRatio;
+        auto* config = Config::Instance();
+        const float minRatio = std::clamp(config->GaqMinRatio.value_or_default(), 1.0f, 3.0f);
+        const float maxRatio = std::clamp(config->GaqMaxRatio.value_or_default(), minRatio, 4.0f);
+        return std::clamp(_currentRatio + _motionBoostOffset, minRatio, maxRatio);
     }
 
   private:
@@ -156,6 +183,8 @@ class GaqController
     float _currentRatio = 1.3f;
     float _integral = 0.0f;
     float _lastError = 0.0f;
+    float _motionBoostOffset = 0.0f;
+    int64_t _lastMouseCounter = 0;
     double _lastTimeMs = 0.0;
     double _emaActiveMs = 0.0;
     double _emaUpscalerMs = 0.0;

@@ -23,4 +23,7 @@ class FSR4Models
     static std::optional<FSR4Model> ActiveModel(HMODULE module);
 
     static const char* Name(FSR4Model model);
+
+    // Monitors FSR 4 GPU pass duration and steps down model/preset when exceeding Fsr4MaxGpuMs
+    static void EvaluateGpuBudget(double upscalerGpuMs);
 };

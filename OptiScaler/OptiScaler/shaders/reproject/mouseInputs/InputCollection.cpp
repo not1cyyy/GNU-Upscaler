@@ -4,6 +4,7 @@
 
 #include <thread>
 #include <algorithm>
+#include <cmath>
 #include <intrin.h>
 
 void InputCollection::writeLiveSinks()
@@ -31,6 +32,11 @@ void InputCollection::addNewDelta(InputDelta delta)
         cumulativeX += (uint32_t) delta.x;
         cumulativeY += (uint32_t) delta.y;
         writeLiveSinks();
+
+        const int64_t travel =
+            std::abs(static_cast<int64_t>(delta.x)) + std::abs(static_cast<int64_t>(delta.y));
+        if (travel > 0)
+            State::Instance().mouseMotionCounter.fetch_add(travel, std::memory_order_relaxed);
     }
 
     std::unique_lock<std::shared_mutex> lock(simDeltasMutex);

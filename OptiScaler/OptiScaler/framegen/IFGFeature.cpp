@@ -412,6 +412,12 @@ bool IFGFeature::DetectCameraCut(int fIndex)
         const float forwardDot =
             nx * _lastCameraForward[0] + ny * _lastCameraForward[1] + nz * _lastCameraForward[2];
 
+        // Publish angular velocity (rad/s) for motion-adaptive DRS boost
+        const double angleRad = std::acos(std::clamp(static_cast<double>(forwardDot), -1.0, 1.0));
+        const double frameMs =
+            std::clamp(State::Instance().lastFGFrameTime > 0.0 ? State::Instance().lastFGFrameTime : 16.6, 1.0, 200.0);
+        State::Instance().cameraAngularSpeed.store(angleRad / (frameMs * 0.001), std::memory_order_relaxed);
+
         // Trigger optical-flow history reset on >25m teleport or >70 deg single-frame camera snap
         if (dist > posThreshold || forwardDot < 0.342f)
         {

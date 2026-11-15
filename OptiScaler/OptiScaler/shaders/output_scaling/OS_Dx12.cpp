@@ -32,10 +32,11 @@ bool OS_Dx12::CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InSou
                                    uint32_t InHeight, D3D12_RESOURCE_STATES InState)
 {
     auto resourceFlags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const auto packedFormat = Shader_Dx12::SelectPackedIntermediateFormat(InDevice, InSource->GetDesc().Format);
 
     auto oldBuffer = _buffer;
-    auto result =
-        Shader_Dx12::CreateBufferResource(InDevice, InSource, InState, &_buffer, resourceFlags, InWidth, InHeight);
+    auto result = Shader_Dx12::CreateBufferResource(InDevice, InSource, InState, &_buffer, resourceFlags, InWidth,
+                                                    InHeight, packedFormat);
 
     if (result && _buffer != oldBuffer)
     {

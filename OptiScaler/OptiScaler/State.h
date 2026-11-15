@@ -401,6 +401,8 @@ class State
     double lastLimiterSleepMs = 0.0;
     double lastActiveFrameMs = 0.0;
     bool adfgClamped = false;
+    std::atomic<int64_t> mouseMotionCounter { 0 };
+    std::atomic<double> cameraAngularSpeed { 0.0 };
     std::mutex frameTimeMutex;
 
     // Opti checking if everything is setup correctly on game launch

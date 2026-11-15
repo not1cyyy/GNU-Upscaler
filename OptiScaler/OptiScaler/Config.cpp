@@ -178,6 +178,8 @@ bool Config::Reload(std::filesystem::path iniPath)
             FGHUDFixUIUnblend.set_from_config(readBool("OptiFG", "HUDFixUIUnblend"));
             FGImmediateCapture.set_from_config(readBool("OptiFG", "HUDFixImmediate"));
             FGHudfixPersistentBindings.set_from_config(readBool("OptiFG", "HUDFixPersistentBindings"));
+            FGZeroCopyHudless.set_from_config(readBool("OptiFG", "ZeroCopyHudless"));
+            FGHudCopyTileSkip.set_from_config(readBool("OptiFG", "HudCopyTileSkip"));
             FGUseShards.set_from_config(readBool("OptiFG", "UseShards"));
             FGAlwaysTrackHeaps.set_from_config(readBool("OptiFG", "AlwaysTrackHeaps"));
             FGResourceBlocking.set_from_config(readBool("OptiFG", "ResourceBlocking"));
@@ -242,6 +244,8 @@ bool Config::Reload(std::filesystem::path iniPath)
                 FGXeFGMaxInterpolatedFrames.reset();
             }
             FGXeFGPaceOnSwapchain.set_from_config(readBool("XeFG", "PaceOnSwapchain"));
+            if (auto setting = readInt("XeFG", "MaxWaitMs"); setting.has_value())
+                FGXeFGMaxWaitMs.set_from_config(std::clamp(setting.value(), 0, 100));
             FGXeFGAllowDilatedMV.set_from_config(readBool("XeFG", "AllowDilatedMV"));
             FGXeFGMinBaseFps.set_from_config(readFloat("XeFG", "MinBaseFps"));
         }
@@ -332,6 +336,8 @@ bool Config::Reload(std::filesystem::path iniPath)
                 Fsr4Preset.set_from_config(setting);
 
             Fsr4Model.set_from_config(readEnum<FSR4Model>("FSR", "Fsr4Model"));
+            if (auto setting = readFloat("FSR", "Fsr4MaxGpuMs"); setting.has_value())
+                Fsr4MaxGpuMs.set_from_config(std::max(0.0f, setting.value()));
 
             FsrNonLinearColorSpace.set_from_config(readBool("FSR", "FsrNonLinearColorSpace"));
             FsrNonLinearPQ.set_from_config(readBool("FSR", "FsrNonLinearPQ"));
@@ -614,6 +620,8 @@ bool Config::Reload(std::filesystem::path iniPath)
         // DX12 Async Compute
         {
             Dx12AsyncCompute.set_from_config(readBool("DX12", "AsyncCompute"));
+            Dx12PackedBuffers.set_from_config(readBool("DX12", "PackedBuffers"));
+            Dx12CmdListFastPath.set_from_config(readBool("DX12", "CmdListFastPath"));
         }
 
         // Init Flags
@@ -639,6 +647,8 @@ bool Config::Reload(std::filesystem::path iniPath)
             GaqTargetFps.set_from_config(readFloat("GAQ", "TargetFps"));
             GaqMinRatio.set_from_config(readFloat("GAQ", "MinRatio"));
             GaqMaxRatio.set_from_config(readFloat("GAQ", "MaxRatio"));
+            if (auto setting = readFloat("GAQ", "MotionBoost"); setting.has_value())
+                GaqMotionBoost.set_from_config(std::clamp(setting.value(), 0.0f, 0.6f));
         }
 
         // Upscale Ratio Override
@@ -1493,6 +1503,7 @@ bool Config::SaveIni()
                      GetIntValue(Instance()->FGXeFGMaxInterpolatedFrames.value_for_config()).c_str());
         ini.SetValue("XeFG", "PaceOnSwapchain",
                      GetBoolValue(Instance()->FGXeFGPaceOnSwapchain.value_for_config()).c_str());
+        ini.SetValue("XeFG", "MaxWaitMs", GetIntValue(Instance()->FGXeFGMaxWaitMs.value_for_config()).c_str());
         ini.SetValue("XeFG", "AllowDilatedMV",
                      GetBoolValue(Instance()->FGXeFGAllowDilatedMV.value_for_config()).c_str());
         ini.SetValue("XeFG", "MinBaseFps",
@@ -1549,6 +1560,10 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->FGImmediateCapture.value_for_config()).c_str());
         ini.SetValue("OptiFG", "HUDFixPersistentBindings",
                      GetBoolValue(Instance()->FGHudfixPersistentBindings.value_for_config()).c_str());
+        ini.SetValue("OptiFG", "ZeroCopyHudless",
+                     GetBoolValue(Instance()->FGZeroCopyHudless.value_for_config()).c_str());
+        ini.SetValue("OptiFG", "HudCopyTileSkip",
+                     GetBoolValue(Instance()->FGHudCopyTileSkip.value_for_config()).c_str());
         ini.SetValue("OptiFG", "UseShards", GetBoolValue(Instance()->FGUseShards.value_for_config()).c_str());
         ini.SetValue("OptiFG", "AlwaysTrackHeaps",
                      GetBoolValue(Instance()->FGAlwaysTrackHeaps.value_for_config()).c_str());
@@ -1616,9 +1631,12 @@ bool Config::SaveIni()
         ini.SetValue("OutputScaling", "Downscaler", GetIntValue(Instance()->OutputScalingDownscaler).c_str());
     }
 
-    // DX12 Async Compute
+    // DX12 Async Compute & Fast Paths
     {
         ini.SetValue("DX12", "AsyncCompute", GetBoolValue(Instance()->Dx12AsyncCompute.value_for_config()).c_str());
+        ini.SetValue("DX12", "PackedBuffers", GetBoolValue(Instance()->Dx12PackedBuffers.value_for_config()).c_str());
+        ini.SetValue("DX12", "CmdListFastPath",
+                     GetBoolValue(Instance()->Dx12CmdListFastPath.value_for_config()).c_str());
     }
 
     // FSR common
@@ -1655,6 +1673,7 @@ bool Config::SaveIni()
         ini.SetValue("FSR", "Fsr4GpuSupport", GetIntValue(Instance()->Fsr4GpuSupport.value_for_config()).c_str());
         ini.SetValue("FSR", "Fsr4Preset", GetIntValue(Instance()->Fsr4Preset.value_for_config()).c_str());
         ini.SetValue("FSR", "Fsr4Model", GetIntValue(Instance()->Fsr4Model.value_for_config()).c_str());
+        ini.SetValue("FSR", "Fsr4MaxGpuMs", GetFloatValue(Instance()->Fsr4MaxGpuMs.value_for_config()).c_str());
         ini.SetValue("FSR", "Fsr4EnableWatermark",
                      GetBoolValue(Instance()->Fsr4EnableWatermark.value_for_config()).c_str());
         ini.SetValue("FSR", "Fsr4DoNotLoadAmdxc64",
@@ -1995,6 +2014,7 @@ bool Config::SaveIni()
         ini.SetValue("GAQ", "TargetFps", std::to_string(Instance()->GaqTargetFps.value_or_default()).c_str());
         ini.SetValue("GAQ", "MinRatio", std::to_string(Instance()->GaqMinRatio.value_or_default()).c_str());
         ini.SetValue("GAQ", "MaxRatio", std::to_string(Instance()->GaqMaxRatio.value_or_default()).c_str());
+        ini.SetValue("GAQ", "MotionBoost", std::to_string(Instance()->GaqMotionBoost.value_or_default()).c_str());
     }
 
     // Spoofing

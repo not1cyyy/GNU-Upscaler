@@ -107,6 +107,61 @@ bool Shader_Dx12::CreateComputePipeline(ID3D12Device* device, ID3D12PipelineStat
                                CD3DX12_SHADER_BYTECODE(bytecode, bytecodeSize));
 }
 
+DXGI_FORMAT Shader_Dx12::SelectPackedIntermediateFormat(ID3D12Device* InDevice, DXGI_FORMAT sourceFormat)
+{
+    if (InDevice == nullptr || !Config::Instance()->Dx12PackedBuffers.value_or_default())
+        return DXGI_FORMAT_UNKNOWN;
+
+    // Only pack wide 64/128-bit HDR float intermediate targets down to 32-bit R11G11B10_FLOAT
+    switch (sourceFormat)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        break;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+
+    static std::mutex supportMutex;
+    static ID3D12Device* cachedDevice = nullptr;
+    static bool cachedSupported = false;
+
+    bool supported = false;
+    {
+        std::scoped_lock lock(supportMutex);
+        if (InDevice == cachedDevice)
+        {
+            supported = cachedSupported;
+        }
+        else
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS options {};
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport { DXGI_FORMAT_R11G11B10_FLOAT, D3D12_FORMAT_SUPPORT1_NONE,
+                                                              D3D12_FORMAT_SUPPORT2_NONE };
+            constexpr auto req1 =
+                D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+            constexpr auto req2 = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE | D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+
+            if (SUCCEEDED(InDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
+                options.TypedUAVLoadAdditionalFormats &&
+                SUCCEEDED(InDevice->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport,
+                                                        sizeof(formatSupport))) &&
+                (formatSupport.Support1 & req1) == req1 && (formatSupport.Support2 & req2) == req2)
+            {
+                supported = true;
+            }
+
+            cachedDevice = InDevice;
+            cachedSupported = supported;
+            LOG_DEBUG("DX12 R11G11B10_FLOAT packed intermediate UAV support: {}", supported);
+        }
+    }
+
+    return supported ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_UNKNOWN;
+}
+
 bool Shader_Dx12::CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InResource,
                                        D3D12_RESOURCE_STATES InState, ID3D12Resource** OutResource,
                                        D3D12_RESOURCE_FLAGS ResourceFlags, uint64_t InWidth, uint32_t InHeight,
