@@ -27,6 +27,7 @@ CONFIG_GAQ=0
 CONFIG_XEFG=0
 CONFIG_MFG=""
 FETCH_EXTRAS=""
+AUTO_STEAM=0
 
 SUPPORTED_PROXIES=("dxgi.dll" "winmm.dll" "version.dll" "d3d12.dll" "dbghelp.dll" "wininet.dll" "winhttp.dll")
 
@@ -68,6 +69,7 @@ ${BOLD}Options:${RESET}
   --mfg=<mult>              Enable XeFG Multi-Frame Generation (2x, 3x, 4x, 6x, 10x)
   --gaq                     Enable GNU Adaptive Quality (GAQ Auto-DRS)
   --fetch-extras[=filter]   Download FSR4 INT8/FP8 variants into custom/ (default: recommended, or 'all' / tag filter)
+  --auto-steam              Automatically inject WINEDLLOVERRIDES into Steam localconfig.vdf (with .bak backup)
   -u, --update              Force re-check and download of the latest CI build
   --uninstall               Remove GNU-Upscaler / OptiScaler from the target game
   -h, --help                Show this help message
@@ -191,6 +193,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --fetch-extras=*)
             FETCH_EXTRAS="${1#*=}"
+            shift
+            ;;
+        --auto-steam)
+            AUTO_STEAM=1
             shift
             ;;
         -*)
@@ -413,6 +419,7 @@ do_uninstall() {
     rmdir "$BIN_DIR/plugins" 2>/dev/null || true
 
     log_success "GNU-Upscaler has been completely removed from $BIN_DIR"
+    patch_steam_launch_options "remove" "${PROXY_CHOICE%.dll}" || true
     exit 0
 }
 
@@ -545,6 +552,280 @@ except Exception:
     fi
 
     log_success "GNU-Upscaler build ready in cache."
+}
+
+detect_steam_appid() {
+    local target_dir="${1:-$BIN_DIR}"
+    python3 -c '
+import glob, os, re, sys
+
+cur = os.path.realpath(sys.argv[1])
+install_dir = None
+steamapps_dir = None
+
+while True:
+    parent = os.path.dirname(cur)
+    grandparent = os.path.dirname(parent)
+    if os.path.basename(parent) == "common" and os.path.basename(grandparent) == "steamapps":
+        install_dir = os.path.basename(cur)
+        steamapps_dir = grandparent
+        break
+    if parent == cur:
+        break
+    cur = parent
+
+if not install_dir or not steamapps_dir:
+    sys.exit(0)
+
+exact_match = None
+ci_match = None
+for acf in sorted(glob.glob(os.path.join(steamapps_dir, "appmanifest_*.acf"))):
+    try:
+        with open(acf, "r", encoding="utf-8", errors="ignore") as f:
+            txt = f.read()
+        m_id = re.search(r"\"appid\"\s+\"(\d+)\"", txt, re.IGNORECASE)
+        m_dir = re.search(r"\"installdir\"\s+\"([^\"]+)\"", txt, re.IGNORECASE)
+        if not m_id or not m_dir:
+            continue
+        if m_dir.group(1) == install_dir:
+            exact_match = m_id.group(1)
+            break
+        if m_dir.group(1).lower() == install_dir.lower() and not ci_match:
+            ci_match = m_id.group(1)
+    except Exception:
+        pass
+
+if exact_match or ci_match:
+    print(exact_match or ci_match)
+' "$target_dir" 2>/dev/null || true
+}
+
+patch_steam_launch_options() {
+    local action="${1:-add}"
+    local proxy_stem="${2:-${PROXY_CHOICE%.dll}}"
+
+    local appid
+    appid="$(detect_steam_appid "$BIN_DIR")"
+    [[ -z "$appid" ]] && return 0
+
+    local vdf_files=()
+    mapfile -t vdf_files < <(python3 -c '
+import glob, os
+patterns = [
+    os.path.expanduser("~/.local/share/Steam/userdata/*/config/localconfig.vdf"),
+    os.path.expanduser("~/.steam/steam/userdata/*/config/localconfig.vdf"),
+    os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.local/share/Steam/userdata/*/config/localconfig.vdf"),
+]
+seen = set()
+for pat in patterns:
+    for p in sorted(glob.glob(pat)):
+        rp = os.path.realpath(p)
+        if os.path.isfile(rp) and rp not in seen:
+            seen.add(rp)
+            print(rp)
+' 2>/dev/null || true)
+
+    [[ ${#vdf_files[@]} -eq 0 ]] && return 0
+
+    if [[ "$action" == "add" ]]; then
+        if [[ $AUTO_STEAM -eq 0 ]]; then
+            local reply="n"
+            if [[ -t 0 || -r /dev/tty ]]; then
+                prompt_read "Detected Steam AppID ${appid}. Inject WINEDLLOVERRIDES=\"${proxy_stem}=n,b\" into Steam launch options? [Y/n]: " reply
+                reply="${reply:-y}"
+            fi
+            if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+                return 0
+            fi
+        fi
+
+        if command -v pgrep >/dev/null 2>&1 && pgrep -x steam >/dev/null 2>&1; then
+            log_warn "Steam appears to be running; restart Steam (or close Steam before editing if it overwrites localconfig.vdf on exit)."
+        fi
+    elif [[ $AUTO_STEAM -eq 0 ]]; then
+        local reply="y"
+        if [[ -t 0 || -r /dev/tty ]]; then
+            prompt_read "Detected Steam AppID ${appid}. Remove WINEDLLOVERRIDES=${proxy_stem}=n,b from Steam launch options? [Y/n]: " reply
+            reply="${reply:-y}"
+        fi
+        if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+            return 0
+        fi
+    fi
+
+    for vdf in "${vdf_files[@]}"; do
+        local result
+        result="$(python3 -c '
+import re, shutil, sys
+
+vdf_path, appid, stem, mode = sys.argv[1:5]
+
+with open(vdf_path, "r", encoding="utf-8", errors="ignore") as f:
+    text = f.read()
+
+def vdf_unescape(s):
+    return s.replace("\\\\", "\\").replace("\\\"", "\"")
+
+def vdf_escape(s):
+    return s.replace("\\", "\\\\").replace("\"", "\\\"")
+
+def merge_launch_options(existing, stem, mode):
+    existing = existing.strip()
+    override_token = f"{stem}=n,b"
+    env_pat = re.compile(r"WINEDLLOVERRIDES=(?:\"([^\"]*)\"|([^\s]+))")
+    m = env_pat.search(existing)
+
+    if mode == "remove":
+        if not m:
+            return existing
+        raw_val = m.group(1) if m.group(1) is not None else m.group(2)
+        parts = [p for p in raw_val.split(";") if p and p.split("=", 1)[0].lower() != stem.lower()]
+        if parts:
+            replacement = "WINEDLLOVERRIDES=\"" + ";".join(parts) + "\""
+            updated = existing[:m.start()] + replacement + existing[m.end():]
+        else:
+            updated = (existing[:m.start()] + " " + existing[m.end():]).strip()
+            updated = re.sub(r"\s{2,}", " ", updated)
+            if updated == "%command%":
+                updated = ""
+        return updated
+
+    # mode == "add"
+    if m:
+        raw_val = m.group(1) if m.group(1) is not None else m.group(2)
+        parts = [p for p in raw_val.split(";") if p]
+        replaced = False
+        new_parts = []
+        for p in parts:
+            if p.split("=", 1)[0].lower() == stem.lower():
+                if not replaced:
+                    new_parts.append(override_token)
+                    replaced = True
+            else:
+                new_parts.append(p)
+        if not replaced:
+            new_parts.append(override_token)
+        replacement = "WINEDLLOVERRIDES=\"" + ";".join(new_parts) + "\""
+        updated = existing[:m.start()] + replacement + existing[m.end():]
+        if "%command%" not in updated:
+            updated = f"{updated} %command%".strip()
+        return updated
+
+    prefix = f"WINEDLLOVERRIDES=\"{override_token}\""
+    if not existing:
+        return f"{prefix} %command%"
+    if "%command%" in existing:
+        return f"{prefix} {existing}"
+    return f"{prefix} %command% {existing}"
+
+lines = text.splitlines(keepends=True)
+newline = "\r\n" if (lines and lines[0].endswith("\r\n")) else "\n"
+
+stack = []
+pending_key = None
+qstr_re = re.compile(r"\"((?:[^\"\\]|\\.)*)\"")
+
+apps_path = ["userlocalconfigstore", "software", "valve", "steam", "apps"]
+target_path = apps_path + [appid.lower()]
+
+apps_end_idx = None
+appid_open_idx = None
+appid_indent = "\t\t\t\t\t"
+launch_line_idx = None
+launch_old_val = ""
+launch_indent = "\t\t\t\t\t\t"
+
+for idx, raw_line in enumerate(lines):
+    s = raw_line.strip()
+    if not s or s.startswith("//"):
+        continue
+
+    if s == "{":
+        if pending_key is not None:
+            stack.append(pending_key.lower())
+            pending_key = None
+        else:
+            stack.append("")
+        if stack == target_path and appid_open_idx is None:
+            appid_open_idx = idx
+            m_ind = re.match(r"^(\s*)", raw_line)
+            if m_ind:
+                appid_indent = m_ind.group(1)
+                launch_indent = appid_indent + "\t"
+        continue
+
+    if s == "}":
+        if stack == target_path and apps_end_idx is None:
+            pass
+        if stack == apps_path and apps_end_idx is None:
+            apps_end_idx = idx
+        if stack:
+            stack.pop()
+        pending_key = None
+        continue
+
+    tokens = [vdf_unescape(m.group(1)) for m in qstr_re.finditer(s)]
+    if len(tokens) == 1:
+        pending_key = tokens[0]
+    elif len(tokens) >= 2:
+        pending_key = None
+        key_l = tokens[0].lower()
+        val = tokens[1]
+        if stack == target_path and key_l == "launchoptions":
+            launch_line_idx = idx
+            launch_old_val = val
+            m_ind = re.match(r"^(\s*)", raw_line)
+            if m_ind:
+                launch_indent = m_ind.group(1)
+
+if mode == "remove" and launch_line_idx is None:
+    print("unchanged")
+    sys.exit(0)
+
+new_val = merge_launch_options(launch_old_val, stem, mode)
+if launch_line_idx is not None and new_val == launch_old_val:
+    print("unchanged")
+    sys.exit(0)
+if launch_line_idx is None and mode == "add" and not new_val:
+    print("unchanged")
+    sys.exit(0)
+
+escaped_new = vdf_escape(new_val)
+if launch_line_idx is not None:
+    lines[launch_line_idx] = f"{launch_indent}\"LaunchOptions\"\t\t\"{escaped_new}\"{newline}"
+elif appid_open_idx is not None:
+    lines.insert(appid_open_idx + 1, f"{launch_indent}\"LaunchOptions\"\t\t\"{escaped_new}\"{newline}")
+elif apps_end_idx is not None:
+    block = [
+        f"{appid_indent}\"{appid}\"{newline}",
+        f"{appid_indent}{{{newline}",
+        f"{appid_indent}\t\"LaunchOptions\"\t\t\"{escaped_new}\"{newline}",
+        f"{appid_indent}}}{newline}",
+    ]
+    lines[apps_end_idx:apps_end_idx] = block
+else:
+    print("not_found")
+    sys.exit(0)
+
+shutil.copy2(vdf_path, vdf_path + ".bak")
+with open(vdf_path, "w", encoding="utf-8", errors="ignore") as f:
+    f.writelines(lines)
+print(f"updated:{new_val}")
+' "$vdf" "$appid" "$proxy_stem" "$action" 2>/dev/null || true)"
+
+        case "$result" in
+            updated:*)
+                local opts="${result#updated:}"
+                log_success "Updated Steam AppID ${appid} LaunchOptions in ${vdf} (backup: ${vdf}.bak)"
+                if [[ -n "$opts" ]]; then
+                    echo -e "  ${DIM}LaunchOptions:${RESET} ${CYAN}${opts}${RESET}"
+                fi
+                ;;
+            not_found)
+                log_warn "Could not find Software->Valve->Steam->apps section in ${vdf}"
+                ;;
+        esac
+    done
 }
 
 fetch_latest_build
@@ -833,6 +1114,9 @@ log_success "GNU-Upscaler installed successfully!"
 echo -e "${DIM}Target:${RESET} ${BIN_DIR}/${PROXY_CHOICE}"
 echo -e "${DIM}Config:${RESET} ${INI_TARGET}"
 echo ""
+
+patch_steam_launch_options "add" "${PROXY_CHOICE%.dll}"
+
 echo -e "${BOLD}Tip for Linux / Proton:${RESET}"
 echo "If the game does not load the proxy DLL automatically, ensure WINEDLLOVERRIDES is set:"
 echo -e "  ${CYAN}WINEDLLOVERRIDES=\"${PROXY_CHOICE%.dll}=n,b\" %command%${RESET}"

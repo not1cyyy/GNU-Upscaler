@@ -97,9 +97,16 @@ class IFGFeature
     uint64_t _timeSinceSimStart = 0;
     bool _reprojectionActive = false;
 
+    float _lastCameraPosition[3] = {};
+    float _lastCameraForward[3] = {};
+    bool _hasLastCamera = false;
+
     bool CheckForRealObject(std::string functionName, IUnknown* pObject, IUnknown** ppRealObject);
     int GetDispatchIndex(UINT64& willDispatchFrame);
     UINT64 NextDispatchFrame();
+
+    // Detects single-frame camera teleports or hard cuts so FG resets stale optical-flow history
+    bool DetectCameraCut(int fIndex);
 
     // The frame's camera and the mouse input since its simulation start, for the reprojection of the presented frame
     // Depth and motion vector sizes are left to the caller

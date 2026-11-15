@@ -1754,7 +1754,12 @@ DWORD WINAPI getGpuInfo(LPVOID hModuleVoid)
 
     // If DX12 already loaded then grab the full GPU info right away
     if (hModuleVoid)
+    {
         IdentifyGpu::updateD3d12Capabilities();
+        primaryGpu = IdentifyGpu::getPrimaryGpu();
+    }
+
+    CustomProviders::AutoSelectForGpu(primaryGpu);
 
     return 0;
 }

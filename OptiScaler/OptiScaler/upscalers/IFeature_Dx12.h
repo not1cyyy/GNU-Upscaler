@@ -9,6 +9,7 @@
 #include <shaders/rcas/RCAS_Dx12.h>
 #include <shaders/bias/Bias_Dx12.h>
 #include <shaders/magnifier/Magnifier_Dx12.h>
+#include <shaders/AsyncCompute_Dx12.h>
 #include <gpu_time/GpuTime_Dx12.h>
 
 class IFeature_Dx12 : public virtual IFeature
@@ -27,9 +28,30 @@ class IFeature_Dx12 : public virtual IFeature
         ID3D12Resource* outputBuffer = nullptr;
     };
 
+    struct PendingAsyncPostPasses
+    {
+        bool active = false;
+        ID3D12Resource* paramMotion = nullptr;
+        ID3D12Resource* paramDepth = nullptr;
+        bool runOutputScaler = false;
+        ID3D12Resource* osInput = nullptr;
+        ID3D12Resource* osOutput = nullptr;
+        bool runRcas = false;
+        ID3D12Resource* rcasInput = nullptr;
+        ID3D12Resource* rcasOutput = nullptr;
+        RcasConstants rcasConstants {};
+        bool runMagnifier = false;
+        ID3D12Resource* magInput = nullptr;
+        ID3D12Resource* magOutput = nullptr;
+    };
+
     std::vector<std::tuple<ID3D12Resource*, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES>> _barrierTransitions;
+    bool _deferPostPasses = false;
+    PendingAsyncPostPasses _pendingAsyncPasses {};
 
     void RestoreBarriers(ID3D12GraphicsCommandList* InCommandList);
+    RcasConstants BuildRcasConstants(NVSDK_NGX_Parameter* InParameters);
+    bool ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const PendingAsyncPostPasses& passes);
 
   protected:
     ID3D12Device* Device = nullptr;
@@ -38,6 +60,7 @@ class IFeature_Dx12 : public virtual IFeature
     std::unique_ptr<RCAS_Dx12> RCAS = nullptr;
     std::unique_ptr<Bias_Dx12> Bias = nullptr;
     std::unique_ptr<Magnifier_Dx12> Magnifier = nullptr;
+    std::unique_ptr<AsyncCompute_Dx12> AsyncCompute = nullptr;
 
     std::unique_ptr<GpuTime_Dx12> UpscalerTime = nullptr;
 
@@ -54,6 +77,8 @@ class IFeature_Dx12 : public virtual IFeature
   public:
     bool Init(ID3D12Device* InDevice, ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
     bool Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
+    void SetDeferPostPasses(bool defer) { _deferPostPasses = defer; }
+    bool DispatchPendingPostPassesAsync(ID3D12CommandQueue* directQueue);
 
     API Api() const override { return API::DX12; }
     std::optional<double> ReadUpscalerTime(void* commandQueue) override;

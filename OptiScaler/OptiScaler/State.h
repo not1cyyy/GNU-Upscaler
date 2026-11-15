@@ -397,6 +397,10 @@ class State
     double presentFrameTime = 0.0;
     // Time the game's last present to the FG swapchain took, with the FPS limiter's sleep (V-Sync, a full queue)
     double lastFGPresentMs = 0.0;
+    double lastUpscalerGpuMs = 0.0;
+    double lastLimiterSleepMs = 0.0;
+    double lastActiveFrameMs = 0.0;
+    bool adfgClamped = false;
     std::mutex frameTimeMutex;
 
     // Opti checking if everything is setup correctly on game launch

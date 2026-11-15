@@ -896,7 +896,7 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
     }
 
     if (!Config::Instance()->FGSkipReset.value_or_default())
-        params->reset = (_reset[fIndex] != 0);
+        params->reset = (_reset[fIndex] != 0) || DetectCameraCut(fIndex);
     else
         params->reset = 0;
 

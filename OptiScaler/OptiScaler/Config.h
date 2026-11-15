@@ -547,6 +547,7 @@ class Config
     CustomOptional<bool> OutputScalingEnabled { false };
     CustomOptional<float> OutputScalingMultiplier { 1.5f };
     CustomOptional<Scaler> OutputScalingDownscaler { Scaler::FSR1 };
+    CustomOptional<bool> Dx12AsyncCompute { true };
 
     // FSR
     CustomOptional<bool> FsrDebugView { false };
