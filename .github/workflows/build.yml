@@ -3,6 +3,9 @@ name: Build GNU-Upscaler
 on:
   push:
     branches: [ "main", "master" ]
+    paths-ignore:
+      - 'README.md'
+      - 'install.sh'
   workflow_dispatch:
 
 permissions:
@@ -15,6 +18,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Add 7-Zip to PATH
         shell: pwsh

@@ -59,7 +59,19 @@ Bundles an upgraded OptiPatcher ASI plugin with a SIMD byte scanner. It includes
 
 ## Installation
 
-Clone the repository and run `install.sh` pointing to your game directory or executable:
+Run the installer directly without cloning the repository:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/not1cyyy/GNU-Upscaler/main/install.sh)
+```
+
+Or pass options and a game path directly:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/not1cyyy/GNU-Upscaler/main/install.sh) --fsr4 --fg "/path/to/game"
+```
+
+Alternatively, clone the repository and run `install.sh` locally:
 
 ```bash
 git clone https://github.com/not1cyyy/GNU-Upscaler.git
@@ -67,7 +79,7 @@ cd GNU-Upscaler
 ./install.sh "/path/to/game"
 ```
 
-The installer fetches the newest release archive from GitHub and caches it in `~/.cache/gnu-upscaler/`. It detects game binary folders like `Binaries/Win64` automatically.
+The installer fetches the newest release archive from GitHub and caches it in `~/.cache/gnu-upscaler/`. It detects game binary folders like `Binaries/Win64` automatically, and can auto-discover installed Steam games when run without arguments.
 
 If you run `./install.sh` inside a game directory without arguments, it detects the current folder and prompts for confirmation.
 
@@ -79,6 +91,9 @@ If you run `./install.sh` inside a game directory without arguments, it detects 
 
 # Universal frame generation for games without native FG options
 ./install.sh --optifg "/path/to/game"
+
+# Enable XeFG multi-frame generation (2x, 3x, 4x, 6x, 10x) and GAQ Auto-DRS
+./install.sh --xefg --mfg=6x --gaq "/path/to/game"
 
 # Use a different proxy DLL (default is dxgi.dll)
 ./install.sh --proxy=version.dll "/path/to/game"

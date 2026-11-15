@@ -23,6 +23,11 @@ TARGET_PATH=""
 CONFIG_UPSCALER=""
 CONFIG_FG=0
 CONFIG_OPTIFG=0
+CONFIG_GAQ=0
+CONFIG_XEFG=0
+CONFIG_MFG=""
+
+SUPPORTED_PROXIES=("dxgi.dll" "winmm.dll" "version.dll" "d3d12.dll" "dbghelp.dll" "wininet.dll" "winhttp.dll")
 
 # Colors for terminal output
 BOLD="\033[1m"
@@ -58,6 +63,9 @@ ${BOLD}Options:${RESET}
   --dlss                    Configure OptiScaler.ini for NVIDIA DLSS upscaling
   --fg                      Enable Frame Generation (auto DLSS-G / FSR-FG route)
   --optifg                  Enable OptiFG (Universal frame generation with HUD fix)
+  --xefg                    Set Frame Generation output to XeFG
+  --mfg=<mult>              Enable XeFG Multi-Frame Generation (2x, 3x, 4x, 6x, 10x)
+  --gaq                     Enable GNU Adaptive Quality (GAQ Auto-DRS)
   -u, --update              Force re-check and download of the latest CI build
   --uninstall               Remove GNU-Upscaler / OptiScaler from the target game
   -h, --help                Show this help message
@@ -65,9 +73,47 @@ ${BOLD}Options:${RESET}
 ${BOLD}Examples:${RESET}
   $0 \"/home/user/Games/Stellar Blade\"
   $0 --proxy=dxgi.dll --fsr4 --fg \"/path/to/game\"
-  $0 --optifg \"~/Games/Cyberpunk 2077\"
+  $0 --optifg --xefg --mfg=6x \"~/Games/Cyberpunk 2077\"
   $0 --uninstall \"/path/to/game\""
     exit 0
+}
+
+prompt_read() {
+    local prompt_text="$1"
+    local var_name="$2"
+    if [[ -r /dev/tty ]]; then
+        read -r -p "$prompt_text" "$var_name" < /dev/tty
+    else
+        read -r -p "$prompt_text" "$var_name"
+    fi
+}
+
+check_dependencies() {
+    local missing=()
+    for cmd in curl python3; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+    if ! command -v bsdtar >/dev/null 2>&1 && ! command -v unzip >/dev/null 2>&1; then
+        missing+=("bsdtar or unzip")
+    fi
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing[*]}"
+        exit 1
+    fi
+}
+
+validate_proxy() {
+    local candidate="$1"
+    for p in "${SUPPORTED_PROXIES[@]}"; do
+        if [[ "$p" == "$candidate" ]]; then
+            return 0
+        fi
+    done
+    log_error "Unsupported proxy DLL: '$candidate'"
+    echo "Supported proxies: ${SUPPORTED_PROXIES[*]}" >&2
+    exit 1
 }
 
 # ── Argument Parsing ─────────────────────────────────────────────────────────
@@ -88,6 +134,14 @@ while [[ $# -gt 0 ]]; do
         --proxy=*)
             PROXY_CHOICE="${1#*=}"
             shift
+            ;;
+        --proxy)
+            if [[ -z "${2:-}" || "$2" == -* ]]; then
+                log_error "--proxy requires a DLL filename argument"
+                exit 1
+            fi
+            PROXY_CHOICE="$2"
+            shift 2
             ;;
         --fsr4)
             CONFIG_UPSCALER="fsr4"
@@ -114,6 +168,21 @@ while [[ $# -gt 0 ]]; do
             CONFIG_FG=1
             shift
             ;;
+        --xefg)
+            CONFIG_XEFG=1
+            CONFIG_FG=1
+            shift
+            ;;
+        --mfg=*)
+            CONFIG_MFG="${1#*=}"
+            CONFIG_XEFG=1
+            CONFIG_FG=1
+            shift
+            ;;
+        --gaq)
+            CONFIG_GAQ=1
+            shift
+            ;;
         -*)
             log_error "Unknown option: $1"
             echo "Run '$0 --help' for usage."
@@ -130,6 +199,19 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+check_dependencies
+validate_proxy "$PROXY_CHOICE"
+
+if [[ -n "$CONFIG_MFG" ]]; then
+    case "${CONFIG_MFG,,}" in
+        2x|3x|4x|6x|10x) ;;
+        *)
+            log_error "Unsupported --mfg multiplier: '$CONFIG_MFG' (expected 2x, 3x, 4x, 6x, or 10x)"
+            exit 1
+            ;;
+    esac
+fi
 
 # ── Target Resolution ────────────────────────────────────────────────────────
 
@@ -188,6 +270,48 @@ resolve_game_bin_dir() {
     echo "$target"
 }
 
+discover_steam_games() {
+    python3 -c '
+import os, re
+
+candidates = [
+    os.path.expanduser("~/.local/share/Steam/steamapps/libraryfolders.vdf"),
+    os.path.expanduser("~/.steam/steam/steamapps/libraryfolders.vdf"),
+    os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/libraryfolders.vdf"),
+]
+
+lib_paths = []
+for vdf in candidates:
+    if os.path.isfile(vdf):
+        try:
+            with open(vdf, "r", encoding="utf-8", errors="ignore") as f:
+                for m in re.finditer(r"\"path\"\s+\"([^\"]+)\"", f.read()):
+                    p = m.group(1).replace("\\\\", "/")
+                    if os.path.isdir(os.path.join(p, "steamapps", "common")):
+                        lib_paths.append(os.path.join(p, "steamapps", "common"))
+        except Exception:
+            pass
+
+games = []
+seen = set()
+skip = {"Steamworks Shared", "Proton", "SteamLinuxRuntime"}
+for common in lib_paths:
+    try:
+        for entry in sorted(os.listdir(common)):
+            if any(entry.startswith(s) for s in skip):
+                continue
+            full = os.path.join(common, entry)
+            if os.path.isdir(full) and full not in seen:
+                seen.add(full)
+                games.append(full)
+    except Exception:
+        pass
+
+for g in games:
+    print(g)
+' 2>/dev/null || true
+}
+
 # Prompt interactively if target not provided
 if [[ -z "$TARGET_PATH" ]]; then
     # Check if current working directory looks like a game
@@ -195,7 +319,7 @@ if [[ -z "$TARGET_PATH" ]]; then
     if compgen -G "$CWD/*.exe" > /dev/null 2>&1 || [[ -d "$CWD/Binaries/Win64" ]] || [[ -d "$CWD/bin/x64" ]]; then
         echo -e "${BOLD}Current directory appears to be a game folder:${RESET}"
         echo "  $CWD"
-        read -r -p "Install GNU-Upscaler into this folder? [Y/n]: " reply
+        prompt_read "Install GNU-Upscaler into this folder? [Y/n]: " reply
         reply="${reply:-y}"
         if [[ "$reply" =~ ^[Yy]$ ]]; then
             TARGET_PATH="$CWD"
@@ -205,7 +329,22 @@ fi
 
 if [[ -z "$TARGET_PATH" ]]; then
     echo -e "${BOLD}GNU-Upscaler Installer${RESET}"
-    read -r -p "Enter path to game folder or executable: " TARGET_PATH
+    mapfile -t STEAM_GAMES < <(discover_steam_games)
+    if [[ ${#STEAM_GAMES[@]} -gt 0 ]]; then
+        echo -e "${CYAN}Detected Steam games:${RESET}"
+        for i in "${!STEAM_GAMES[@]}"; do
+            printf "  ${BOLD}[%d]${RESET} %s\n" "$((i + 1))" "$(basename "${STEAM_GAMES[$i]}")"
+        done
+        echo -e "  ${BOLD}[0]${RESET} Enter a custom path"
+        prompt_read "Select a game [0-${#STEAM_GAMES[@]}]: " selection
+        if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#STEAM_GAMES[@]} ]]; then
+            TARGET_PATH="${STEAM_GAMES[$((selection - 1))]}"
+        fi
+    fi
+fi
+
+if [[ -z "$TARGET_PATH" ]]; then
+    prompt_read "Enter path to game folder or executable: " TARGET_PATH
     if [[ -z "$TARGET_PATH" ]]; then
         log_error "No target path provided. Aborting."
         exit 1
@@ -255,8 +394,13 @@ do_uninstall() {
         rm -f "$BIN_DIR"/$dll 2>/dev/null || true
     done
 
-    # Remove OptiScaler directories & plugins
-    rm -rf "$BIN_DIR/OptiScaler" "$BIN_DIR/D3D12_OptiScaler" "$BIN_DIR/D3D12_Optiscaler" "$BIN_DIR/Licenses" "$BIN_DIR/plugins"
+    # Remove OptiScaler directories & OptiPatcher plugin (preserve unrelated user plugins)
+    rm -rf "$BIN_DIR/OptiScaler" "$BIN_DIR/D3D12_OptiScaler" "$BIN_DIR/D3D12_Optiscaler" "$BIN_DIR/Licenses"
+    if [[ -f "$BIN_DIR/plugins/OptiPatcher.asi" ]]; then
+        rm -f "$BIN_DIR/plugins/OptiPatcher.asi"
+        log_info "Removed plugin: OptiPatcher.asi"
+    fi
+    rmdir "$BIN_DIR/plugins" 2>/dev/null || true
 
     log_success "GNU-Upscaler has been completely removed from $BIN_DIR"
     exit 0
@@ -267,14 +411,14 @@ if [[ $UNINSTALL -eq 1 ]]; then
 fi
 
 # If already installed and no specific config flags were given, prompt for action
-if is_already_installed && [[ -z "$CONFIG_UPSCALER" && $CONFIG_FG -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
+if is_already_installed && [[ -z "$CONFIG_UPSCALER" && $CONFIG_FG -eq 0 && $CONFIG_GAQ -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
     echo ""
     log_warn "GNU-Upscaler is already installed in this directory."
     echo -e "Choose an action:"
     echo -e "  ${BOLD}[1]${RESET} Reinstall or update files (default)"
     echo -e "  ${BOLD}[2]${RESET} Uninstall GNU-Upscaler"
     echo -e "  ${BOLD}[3]${RESET} Cancel"
-    read -r -p "Enter choice [1-3] (default 1): " choice
+    prompt_read "Enter choice [1-3] (default 1): " choice
     choice="${choice:-1}"
 
     case "$choice" in
@@ -311,12 +455,12 @@ fetch_latest_build() {
         fi
     fi
 
-    # Parse asset URL and timestamp using python3
+    # Parse asset URL and timestamp using python3 via stdin
     local parse_out
-    parse_out="$(python3 -c "
+    parse_out="$(printf '%s' "$release_json" | python3 -c "
 import json, sys
 try:
-    d = json.loads('''$release_json''')
+    d = json.load(sys.stdin)
     for a in d.get('assets', []):
         if a['name'].endswith('.zip'):
             print(a['browser_download_url'])
@@ -462,10 +606,7 @@ ini_set() {
     local value="$3"
     python3 -c "
 import sys
-path = '$INI_TARGET'
-section = '$section'
-key = '$key'
-val = '$value'
+path, section, key, val = sys.argv[1:5]
 
 lines = []
 try:
@@ -496,7 +637,6 @@ for l in lines:
 if not sec_found:
     new_lines.append(f'\n[{section}]\n{key}={val}\n')
 elif not key_set:
-    # insert under section
     idx = -1
     for i, l in enumerate(new_lines):
         if l.strip() == f'[{section}]':
@@ -507,7 +647,7 @@ elif not key_set:
 
 with open(path, 'w', encoding='utf-8') as f:
     f.writelines(new_lines)
-" 2>/dev/null || true
+" "$INI_TARGET" "$section" "$key" "$value" 2>/dev/null || true
 }
 
 # Apply requested preset configurations
@@ -545,7 +685,27 @@ fi
 if [[ $CONFIG_FG -eq 1 ]]; then
     log_info "Configuring INI: Enabling Frame Generation"
     ini_set "FrameGen" "Enabled" "true"
-    ini_set "FrameGen" "FGOutput" "auto"
+    if [[ $CONFIG_XEFG -eq 1 ]]; then
+        log_info "Configuring INI: FGOutput = XeFG"
+        ini_set "FrameGen" "FGOutput" "xefg"
+    else
+        ini_set "FrameGen" "FGOutput" "auto"
+    fi
+
+    if [[ -n "$CONFIG_MFG" ]]; then
+        local_count=""
+        case "${CONFIG_MFG,,}" in
+            2x)  local_count="1" ;;
+            3x)  local_count="2" ;;
+            4x)  local_count="3" ;;
+            6x)  local_count="5" ;;
+            10x) local_count="9" ;;
+        esac
+        if [[ -n "$local_count" ]]; then
+            log_info "Configuring INI: XeFG InterpolationCount = ${local_count} (${CONFIG_MFG,,})"
+            ini_set "XeFG" "InterpolationCount" "$local_count"
+        fi
+    fi
 
     if [[ $CONFIG_OPTIFG -eq 1 ]]; then
         log_info "Configuring INI: Route = OptiFG (Universal upscaler framegen)"
@@ -555,6 +715,11 @@ if [[ $CONFIG_FG -eq 1 ]]; then
     else
         ini_set "FrameGen" "FGInput" "auto"
     fi
+fi
+
+if [[ $CONFIG_GAQ -eq 1 ]]; then
+    log_info "Configuring INI: Enabling GNU Adaptive Quality (GAQ Auto-DRS)"
+    ini_set "GAQ" "Enabled" "true"
 fi
 
 echo ""
