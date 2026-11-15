@@ -3,6 +3,7 @@
 #include "Scanner.h"
 #include <cstring>
 #include <cstdlib>
+#include <string>
 
 struct SectionRange
 {
@@ -173,7 +174,7 @@ uintptr_t scanner::GetAddress(const std::wstring_view moduleName, const std::str
                               uintptr_t startAddress)
 {
     std::wstring moduleNameOwned(moduleName);
-    auto module = GetModuleHandle(moduleNameOwned.c_str());
+    auto module = GetModuleHandleW(moduleNameOwned.c_str());
     return GetAddress(module, pattern, offset, startAddress);
 }
 
