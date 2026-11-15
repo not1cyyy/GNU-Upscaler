@@ -14,12 +14,25 @@
 class HudCopy_Dx12 : public Shader_Dx12, public HudCopy_Common
 {
   private:
+    struct alignas(256) TileHudCopyParams
+    {
+        float DiffThreshold = 0.02f;
+        uint32_t ScreenWidth = 0;
+        uint32_t ScreenHeight = 0;
+        uint32_t FrameIndex = 100;
+    };
+
     FrameDescriptorHeap _frameHeaps[HudCopy_NUM_OF_HEAPS];
 
     ID3D12Resource* _buffer = nullptr;
     ID3D12Resource* _srcBuffer = nullptr;
+    ID3D12Resource* _tileMaskBuffer = nullptr;
+    ID3D12PipelineState* _tilePipelineState = nullptr;
     UINT64 _asyncWidth = 0;
     UINT _asyncHeight = 0;
+    UINT64 _lastTileWidth = 0;
+    UINT _lastTileHeight = 0;
+    uint32_t _tileFrameIndex = 100;
 
     uint32_t InNumThreadsX = 16;
     uint32_t InNumThreadsY = 16;

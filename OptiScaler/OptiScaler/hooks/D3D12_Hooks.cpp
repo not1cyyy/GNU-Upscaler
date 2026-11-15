@@ -250,7 +250,13 @@ struct CommandListState
 };
 
 static std::shared_mutex s_cmdListStatesMutex;
+static std::atomic<bool> s_hasCmdListStates { false };
 static ankerl::unordered_dense::map<ID3D12GraphicsCommandList*, std::unique_ptr<CommandListState>> s_cmdListStates;
+
+// Per-thread 1-entry cache avoids shared_mutex + hash map lookup on consecutive draws on the same list.
+// Safe because s_cmdListStates entries hold unique_ptr and are never erased once inserted.
+static thread_local ID3D12GraphicsCommandList* t_cachedCmdList = nullptr;
+static thread_local CommandListState* t_cachedCmdListState = nullptr;
 
 static std::shared_mutex s_rootSigLayoutsMutex;
 static ankerl::unordered_dense::map<ID3D12RootSignature*, std::shared_ptr<const RootSigLayout>> s_rootSigLayouts;
@@ -300,11 +306,33 @@ static inline bool ShouldRecord(ID3D12GraphicsCommandList* commandList)
 
 static CommandListState* GetCmdListState(ID3D12GraphicsCommandList* commandList, bool create)
 {
+    if (commandList == nullptr)
+        return nullptr;
+
+    const bool fastPath = Config::Instance()->Dx12CmdListFastPath.value_or_default();
+
+    if (fastPath)
+    {
+        if (commandList == t_cachedCmdList)
+            return t_cachedCmdListState;
+
+        if (!create && !s_hasCmdListStates.load(std::memory_order_relaxed))
+            return nullptr;
+    }
+
     {
         std::shared_lock<std::shared_mutex> lock(s_cmdListStatesMutex);
         auto it = s_cmdListStates.find(commandList);
         if (it != s_cmdListStates.end())
-            return it->second.get();
+        {
+            CommandListState* found = it->second.get();
+            if (fastPath)
+            {
+                t_cachedCmdList = commandList;
+                t_cachedCmdListState = found;
+            }
+            return found;
+        }
     }
 
     if (!create)
@@ -314,6 +342,14 @@ static CommandListState* GetCmdListState(ID3D12GraphicsCommandList* commandList,
     auto& entry = s_cmdListStates[commandList];
     if (!entry)
         entry = std::make_unique<CommandListState>();
+
+    s_hasCmdListStates.store(true, std::memory_order_release);
+
+    if (fastPath)
+    {
+        t_cachedCmdList = commandList;
+        t_cachedCmdListState = entry.get();
+    }
 
     return entry.get();
 }
@@ -465,8 +501,10 @@ static void RecordDescriptorHeaps(ID3D12GraphicsCommandList* commandList, UINT N
         return;
 
     auto config = Config::Instance();
+    const bool trackHudfix = config->FGHudfixPersistentBindings.value_or_default() &&
+                             (!config->Dx12CmdListFastPath.value_or_default() || ResTrack_Dx12::IsBindingTrackingEnabled());
 
-    if (config->FGHudfixPersistentBindings.value_or_default())
+    if (trackHudfix)
         ResTrack_Dx12::OnSetDescriptorHeaps(commandList, NumDescriptorHeaps, ppDescriptorHeaps);
 
     if (!config->ExtendedStateRestore.value_or_default() || ppDescriptorHeaps == nullptr)
@@ -485,7 +523,11 @@ static void RecordRootSignature(ID3D12GraphicsCommandList* commandList, ID3D12Ro
     if (!ShouldRecord(commandList))
         return;
 
-    if (Config::Instance()->FGHudfixPersistentBindings.value_or_default())
+    auto config = Config::Instance();
+    const bool trackHudfix = config->FGHudfixPersistentBindings.value_or_default() &&
+                             (!config->Dx12CmdListFastPath.value_or_default() || ResTrack_Dx12::IsBindingTrackingEnabled());
+
+    if (trackHudfix)
     {
         if constexpr (P == Pipeline::Compute)
             ResTrack_Dx12::OnSetComputeRootSignature(commandList, pRootSignature);

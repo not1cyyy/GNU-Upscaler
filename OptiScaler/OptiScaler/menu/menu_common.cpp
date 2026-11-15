@@ -4228,6 +4228,17 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                 else
                     ImGui::TextColored(StatusWarn(), "(Potential FSR3 fallback)");
             }
+
+            float fsr4BudgetMs = config->Fsr4MaxGpuMs.value_or_default();
+            ImGui::SetNextItemWidth(150.0f * menuResScale);
+            if (ImGui::SliderFloat("FSR4 GPU Budget (ms)", &fsr4BudgetMs, 0.0f, 12.0f,
+                                   fsr4BudgetMs > 0.0f ? "%.1f ms" : "Off", ImGuiSliderFlags_AlwaysClamp))
+            {
+                config->Fsr4MaxGpuMs = fsr4BudgetMs;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                config->SaveIni();
+            ShowTooltip("Automatically steps down FSR 4 model/preset when average upscaler GPU pass exceeds this budget (0 = Off).");
         }
 
         if (majorFsrVersion >= 3)
@@ -5723,7 +5734,18 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
         bool paceOnSwapchain = config->FGXeFGPaceOnSwapchain.value_or(true);
         if (GnuUi::Checkbox("Pace on Swapchain", &paceOnSwapchain))
             config->FGXeFGPaceOnSwapchain = paceOnSwapchain;
-        GnuUi::Help("Synchronizes generated frames with the DXGI frame latency waitable object to prevent burst stutter");
+        GnuUi::Help("Relocated after Dispatch to reduce CPU stalls while keeping DXGI swapchain pacing");
+
+        if (paceOnSwapchain)
+        {
+            ImGui::SameLine(0.0f, 12.0f);
+            int waitMs = std::clamp(config->FGXeFGMaxWaitMs.value_or_default(), 0, 100);
+            ImGui::SetNextItemWidth(100.0f * menuResScale);
+            if (ImGui::SliderInt("##xefgWaitMs", &waitMs, 0, 20, "%d ms wait", ImGuiSliderFlags_AlwaysClamp))
+                config->FGXeFGMaxWaitMs = waitMs;
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                config->SaveIni();
+        }
 
         ImGui::SameLine(0.0f, 16.0f);
         if (GnuUi::Checkbox("Allow Dilated Motion Vectors", &allowDilatedMV))
@@ -6308,6 +6330,18 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                 ImGui::PopItemWidth();
 
                 ImGui::EndDisabled();
+
+                bool zeroCopy = config->FGZeroCopyHudless.value_or_default();
+                if (ImGui::Checkbox("Zero-Copy HUDless", &zeroCopy))
+                    config->FGZeroCopyHudless = zeroCopy;
+                ShowTooltip("Passes swapchain-sized matching-format HUDless buffers straight to FG without a full-screen GPU copy.");
+
+                ImGui::SameLine(0.0f, 16.0f);
+
+                bool tileSkip = config->FGHudCopyTileSkip.value_or_default();
+                if (ImGui::Checkbox("HudCopy Tile Skip", &tileSkip))
+                    config->FGHudCopyTileSkip = tileSkip;
+                ShowTooltip("Uses a 16x16 super-tile activity mask in HudCopy to skip non-HUD screen regions and identical writes.");
             }
 
             bool depthScale = config->FGEnableDepthScale.value_or_default();
@@ -7725,6 +7759,14 @@ void MenuCommon::RenderUpscaleRatioSettings(RenderMenuContext& ctx)
             ReInitUpscaler();
         }
 
+        float motionBoost = config->GaqMotionBoost.value_or_default();
+        ImGui::SetNextItemWidth(150.0f * menuResScale);
+        if (ImGui::SliderFloat("GAQ Motion Boost", &motionBoost, 0.0f, 0.6f, "+%.2fx", ImGuiSliderFlags_AlwaysClamp))
+            config->GaqMotionBoost = motionBoost;
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            config->SaveIni();
+        GnuUi::Help("Boosts upscale ratio smoothly during rapid camera/mouse turns and decays back when stationary.");
+
         float currentGaqRatio = GaqController::Instance().CurrentRatio();
         ImGui::TextDisabled("GAQ Live Scale: %.2fx (%.1f%% resolution)", currentGaqRatio, (1.0f / currentGaqRatio) * 100.0f);
         ImGui::SameLine(0.0f, 12.0f);
@@ -8351,6 +8393,18 @@ void MenuCommon::RenderAdvancedSettings(RenderMenuContext& ctx)
             ImGui::TableNextColumn();
             ConfigCheckbox("DRS Override Maximum", config->DrsMaxOverrideEnabled,
                            "Dynamic Resolution Scaling\nFix for games ignoring official DRS limits");
+
+            ImGui::TableNextColumn();
+            ConfigCheckbox("DX12 Async Compute", config->Dx12AsyncCompute,
+                           "Offloads Output Scaling, RCAS, and HudCopy compute passes onto a dedicated async compute queue");
+
+            ImGui::TableNextColumn();
+            ConfigCheckbox("DX12 Packed 32-bit Buffers", config->Dx12PackedBuffers,
+                           "Uses R11G11B10_FLOAT instead of RGBA16F for intermediate compute buffers to halve bandwidth");
+
+            ImGui::TableNextColumn();
+            ConfigCheckbox("DX12 CmdList Fast Path", config->Dx12CmdListFastPath,
+                           "Lock-free bypass and TLS command-list cache for D3D12 hooks when idle or recording repeatedly");
 
             ImGui::EndTable();
         }

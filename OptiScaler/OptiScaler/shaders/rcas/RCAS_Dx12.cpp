@@ -101,9 +101,11 @@ bool RCAS_Dx12::DispatchDepthAdaptive(ID3D12PipelineState* pipelineState, ID3D12
 bool RCAS_Dx12::CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InSource, D3D12_RESOURCE_STATES InState)
 {
     auto resourceFlags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const auto packedFormat = Shader_Dx12::SelectPackedIntermediateFormat(InDevice, InSource->GetDesc().Format);
 
     auto oldBuffer = _buffer;
-    auto result = Shader_Dx12::CreateBufferResource(InDevice, InSource, InState, &_buffer, resourceFlags);
+    auto result = Shader_Dx12::CreateBufferResource(InDevice, InSource, InState, &_buffer, resourceFlags, 0, 0,
+                                                    packedFormat);
 
     if (result && _buffer != oldBuffer)
     {

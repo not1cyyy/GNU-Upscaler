@@ -175,6 +175,30 @@ feature_version XeFG_Dx12::Version()
 
 HWND XeFG_Dx12::Hwnd() { return _hwnd; }
 
+void XeFG_Dx12::ConfigureSwapchainWaitable(IDXGISwapChain* sc)
+{
+    if (sc == nullptr)
+        return;
+
+    IDXGISwapChain2* sc2 = nullptr;
+    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc2))) && sc2 != nullptr)
+    {
+        DXGI_SWAP_CHAIN_DESC1 d1 {};
+        if (SUCCEEDED(sc2->GetDesc1(&d1)) && (d1.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
+        {
+            // Allow 2 frames in flight when non-blocking wait is configured so CPU dispatch & GPU FG can overlap
+            const bool nonBlockingWait = !Config::Instance()->FGXeFGPaceOnSwapchain.value_or(true) ||
+                                         Config::Instance()->FGXeFGMaxWaitMs.value_or_default() == 0;
+            const UINT maxLatency = nonBlockingWait ? 2 : 1;
+            sc2->SetMaximumFrameLatency(maxLatency);
+            _swapchainWaitable = sc2->GetFrameLatencyWaitableObject();
+            LOG_INFO("XeFG: configured latency {} and acquired swapchain waitable object {:X}", maxLatency,
+                     (size_t) _swapchainWaitable);
+        }
+        sc2->Release();
+    }
+}
+
 bool XeFG_Dx12::DestroySwapchainContext()
 {
     LOG_DEBUG("");
@@ -443,21 +467,7 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     _swapChain = *swapChain;
     _hwnd = hwnd;
 
-    if (*swapChain != nullptr)
-    {
-        IDXGISwapChain2* sc2 = nullptr;
-        if (SUCCEEDED((*swapChain)->QueryInterface(IID_PPV_ARGS(&sc2))) && sc2 != nullptr)
-        {
-            DXGI_SWAP_CHAIN_DESC1 d1 {};
-            if (SUCCEEDED(sc2->GetDesc1(&d1)) && (d1.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
-            {
-                sc2->SetMaximumFrameLatency(1);
-                _swapchainWaitable = sc2->GetFrameLatencyWaitableObject();
-                LOG_INFO("XeFG: configured latency 1 and acquired swapchain waitable object {:X}", (size_t) _swapchainWaitable);
-            }
-            sc2->Release();
-        }
-    }
+    ConfigureSwapchainWaitable(*swapChain);
 
     return true;
 }
@@ -616,21 +626,7 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
     _swapChain = *swapChain;
     _hwnd = hwnd;
 
-    if (*swapChain != nullptr)
-    {
-        IDXGISwapChain2* sc2 = nullptr;
-        if (SUCCEEDED((*swapChain)->QueryInterface(IID_PPV_ARGS(&sc2))) && sc2 != nullptr)
-        {
-            DXGI_SWAP_CHAIN_DESC1 d1 {};
-            if (SUCCEEDED(sc2->GetDesc1(&d1)) && (d1.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
-            {
-                sc2->SetMaximumFrameLatency(1);
-                _swapchainWaitable = sc2->GetFrameLatencyWaitableObject();
-                LOG_INFO("XeFG: configured latency 1 and acquired swapchain waitable object {:X}", (size_t) _swapchainWaitable);
-            }
-            sc2->Release();
-        }
-    }
+    ConfigureSwapchainWaitable(*swapChain);
 
     return true;
 }
@@ -1664,12 +1660,19 @@ bool XeFG_Dx12::Present()
 
     _fgFramePresentId++;
 
-    if (Config::Instance()->FGXeFGPaceOnSwapchain.value_or(true) && _swapchainWaitable != nullptr && IsActive() && !IsPaused())
+    const bool paceOnSwapchain = Config::Instance()->FGXeFGPaceOnSwapchain.value_or(true);
+    const DWORD waitMs =
+        static_cast<DWORD>(std::clamp(Config::Instance()->FGXeFGMaxWaitMs.value_or_default(), 0, 100));
+
+    // Dispatch XeFG interpolation to the GPU before draining waitable swapchain backpressure
+    const bool dispatched = Dispatch();
+
+    if (paceOnSwapchain && _swapchainWaitable != nullptr && IsActive() && !IsPaused())
     {
-        WaitForSingleObjectEx(_swapchainWaitable, 100, TRUE);
+        WaitForSingleObjectEx(_swapchainWaitable, waitMs, TRUE);
     }
 
-    return Dispatch();
+    return dispatched;
 }
 
 bool XeFG_Dx12::SetResource(Dx12Resource* inputResource)
@@ -1833,6 +1836,13 @@ bool XeFG_Dx12::SetResource(Dx12Resource* inputResource)
                 _depthInvert->SetBufferState(cmdList, copyState);
             }
         }
+    }
+
+    // Skip redundant full-screen HUDless resource copy when zero-copy is enabled
+    if (type == FG_ResourceType::HudlessColor && Config::Instance()->FGZeroCopyHudless.value_or_default() &&
+        !State::Instance().fgHudlessCompare && fResource->validity == FG_ResourceValidity::ValidButMakeCopy)
+    {
+        fResource->validity = FG_ResourceValidity::UntilPresent;
     }
 
     // We usually don't copy any resources for XeFG, the ones with this tag are the exception

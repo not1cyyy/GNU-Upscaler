@@ -742,6 +742,8 @@ class ResTrack_Dx12
     static void OnSetGraphicsRootSignature(ID3D12GraphicsCommandList* commandList, ID3D12RootSignature* rootSignature);
     static void OnSetComputeRootSignature(ID3D12GraphicsCommandList* commandList, ID3D12RootSignature* rootSignature);
 
+    static bool IsBindingTrackingEnabled() { return _bindingTrackingEnabled.load(std::memory_order_relaxed); }
+
     static void HookDevice(ID3D12Device* device);
     static void ReleaseHooks();
     static void ReleaseDeviceHooks();

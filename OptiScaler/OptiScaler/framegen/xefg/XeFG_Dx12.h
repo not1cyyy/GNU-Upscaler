@@ -44,6 +44,7 @@ class XeFG_Dx12 : public virtual IFGFeature_Dx12
 
     bool CreateSwapchainContext(ID3D12Device* device);
     bool DestroySwapchainContext();
+    void ConfigureSwapchainWaitable(IDXGISwapChain* sc);
     xefg_swapchain_d3d12_resource_data_t GetResourceData(FG_ResourceType type, int index = -1);
 
     bool Dispatch();

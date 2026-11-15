@@ -34,6 +34,7 @@ class Shader_Dx12
                                     D3D12_SHADER_BYTECODE byteCode);
     bool CreateComputePipeline(ID3D12Device* device, ID3D12PipelineState** pipelineState, const void* bytecode,
                                size_t bytecodeSize, const char* source);
+    static DXGI_FORMAT SelectPackedIntermediateFormat(ID3D12Device* InDevice, DXGI_FORMAT sourceFormat);
     static bool CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InResource, D3D12_RESOURCE_STATES InState,
                                      ID3D12Resource** OutResource, D3D12_RESOURCE_FLAGS ResourceFlags,
                                      uint64_t InWidth = 0, uint32_t InHeight = 0,

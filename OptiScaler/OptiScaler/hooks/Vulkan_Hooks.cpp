@@ -14,6 +14,7 @@
 #include <framegen/dlssg/DLSSG_Vk.h>
 #include <framegen/reprojection/Reprojection_Vk.h>
 #include <fsr4/FSR4DriverProviderVk.h>
+#include <fsr4/FSR4Models.h>
 
 #include <misc/FrameLimit.h>
 #include <misc/DeferredRelease.h>
@@ -891,6 +892,7 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
                 State::Instance().upscaleTimes.pop_front();
                 State::Instance().lastUpscalerGpuMs = upscalerTime;
                 State::Instance().frameTimeMutex.unlock();
+                FSR4Models::EvaluateGpuBudget(upscalerTime);
             }
         }
     }

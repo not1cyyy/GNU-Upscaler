@@ -478,6 +478,7 @@ class Config
     CustomOptional<float> GaqTargetFps { 60.0f };
     CustomOptional<float> GaqMinRatio { 1.3f };
     CustomOptional<float> GaqMaxRatio { 2.2f };
+    CustomOptional<float> GaqMotionBoost { 0.20f };
 
     // Quality Overrides
     CustomOptional<bool> QualityRatioOverrideEnabled { false };
@@ -543,11 +544,13 @@ class Config
     CustomOptional<Upscaler, SoftDefault> Dx12Upscaler { Upscaler::XeSS };
     CustomOptional<Upscaler, SoftDefault> VulkanUpscaler { Upscaler::FSR22 };
 
-    // Output Scaling
+    // Output Scaling & DX12 Compute/Buffer Fast Paths
     CustomOptional<bool> OutputScalingEnabled { false };
     CustomOptional<float> OutputScalingMultiplier { 1.5f };
     CustomOptional<Scaler> OutputScalingDownscaler { Scaler::FSR1 };
     CustomOptional<bool> Dx12AsyncCompute { true };
+    CustomOptional<bool, SoftDefault> Dx12PackedBuffers { true };
+    CustomOptional<bool, SoftDefault> Dx12CmdListFastPath { true };
 
     // FSR
     CustomOptional<bool> FsrDebugView { false };
@@ -586,6 +589,7 @@ class Config
     CustomOptional<FSR4Support> Fsr4GpuSupport { FSR4Support::None };
     CustomOptional<uint32_t, NoDefault> Fsr4Preset;
     CustomOptional<FSR4Model, NoDefault> Fsr4Model;
+    CustomOptional<float> Fsr4MaxGpuMs { 0.0f };
     CustomOptional<bool> Fsr4EnableWatermark { false };
     CustomOptional<bool, SoftDefault> Fsr4DoNotLoadAmdxc64 { false };
 
@@ -684,6 +688,8 @@ class Config
     CustomOptional<bool, NoDefault> FGHUDFixUIUnblend;
     CustomOptional<bool> FGImmediateCapture { false };
     CustomOptional<bool> FGHudfixPersistentBindings { true };
+    CustomOptional<bool, SoftDefault> FGZeroCopyHudless { false };
+    CustomOptional<bool, SoftDefault> FGHudCopyTileSkip { true };
     CustomOptional<bool> FGDontUseSwapchainBuffers { false };
     CustomOptional<bool> FGRelaxedResolutionCheck { false };
     CustomOptional<bool> FGHudfixDisableRTV { false };
@@ -740,6 +746,7 @@ class Config
     CustomOptional<bool, SoftDefault> FGXeFGForceBorderless { false };
     CustomOptional<int> FGXeFGMaxInterpolatedFrames { 5 };
     CustomOptional<bool> FGXeFGPaceOnSwapchain { true };
+    CustomOptional<int> FGXeFGMaxWaitMs { 0 };
     CustomOptional<bool> FGXeFGAllowDilatedMV { false };
     CustomOptional<float> FGXeFGMinBaseFps { 45.0f };
 

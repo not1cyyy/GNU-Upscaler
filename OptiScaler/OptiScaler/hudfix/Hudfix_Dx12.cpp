@@ -730,11 +730,24 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
         auto scWidth = s.currentSwapchainDesc.BufferDesc.Width;
         auto scHeight = s.currentSwapchainDesc.BufferDesc.Height;
 
+        const bool matchingFormat =
+            CompareResourceFormats(resource->format, s.currentSwapchainDesc.BufferDesc.Format);
+        const bool matchingSize = (resource->width == scWidth && resource->height == scHeight);
+        // Zero-copy aliases the HUDless resource directly when format & dimensions match cleanly
+        const bool zeroCopyHudless = Config::Instance()->FGZeroCopyHudless.value_or_default() &&
+                                     !Config::Instance()->FGImmediateCapture.value_or_default() &&
+                                     !s.fgHudlessCompare && !resource->extended && matchingFormat && matchingSize &&
+                                     state != D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE;
+
         // Make a copy of resource to capture current state
         if (!resource->extended)
         {
-            if (CreateBufferResource(s.currentD3D12Device, resource, D3D12_RESOURCE_STATE_COPY_DEST,
-                                     &_captureBuffer[fIndex]))
+            if (zeroCopyHudless)
+            {
+                LOG_DEBUG("Zero-copy HUDless capture: {:X}", (size_t) resource->buffer);
+            }
+            else if (CreateBufferResource(s.currentD3D12Device, resource, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          &_captureBuffer[fIndex]))
             {
                 LOG_DEBUG("Create a copy of resource: {:X}", (size_t) resource->buffer);
 
@@ -810,7 +823,7 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
         auto fg = s.currentFG;
 
         // needs conversion?
-        if (!CompareResourceFormats(resource->format, s.currentSwapchainDesc.BufferDesc.Format))
+        if (!matchingFormat)
         {
             if (_formatTransfer[fIndex] == nullptr ||
                 !_formatTransfer[fIndex]->IsFormatCompatible(s.currentSwapchainDesc.BufferDesc.Format))
@@ -896,19 +909,19 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
             // This will prevent resource tracker to check these operations
             // Will reset after FG dispatch
             _skipHudlessChecks.store(true, std::memory_order_release);
-            LOG_DEBUG("Using _captureBuffer");
+            LOG_DEBUG("{}", zeroCopyHudless ? "Using zero-copy HUDless resource" : "Using _captureBuffer");
 
             if (fg != nullptr)
             {
                 Dx12Resource setResource {};
                 setResource.type = FG_ResourceType::HudlessColor;
                 setResource.cmdList = cmdList;
-                setResource.resource = _captureBuffer[fIndex];
+                setResource.resource = zeroCopyHudless ? resource->buffer : _captureBuffer[fIndex];
                 setResource.left = 0;
                 setResource.top = 0;
                 setResource.width = s.currentSwapchainDesc.BufferDesc.Width;
                 setResource.height = s.currentSwapchainDesc.BufferDesc.Height;
-                setResource.state = D3D12_RESOURCE_STATE_COPY_DEST;
+                setResource.state = zeroCopyHudless ? state : D3D12_RESOURCE_STATE_COPY_DEST;
                 setResource.validity = FG_ResourceValidity::UntilPresent;
                 setResource.frameIndex = fg->GetIndexWillBeDispatched();
 
