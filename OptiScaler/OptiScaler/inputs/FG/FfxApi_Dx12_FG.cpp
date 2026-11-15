@@ -347,6 +347,13 @@ ffxReturnCode_t ffxCreateContext_Dx12FG(ffxContext* context, ffxCreateContextDes
     {
         auto cDesc = (ffxCreateContextDescFrameGenerationSwapChainNewDX12*) desc;
 
+        if (State::Instance().currentFG != nullptr && State::Instance().currentFGSwapchain != nullptr &&
+            State::Instance().currentFG->Hwnd() == cDesc->desc->OutputWindow)
+        {
+            LOG_INFO("Releasing existing FG swapchain before creating FSR-FG swapchain");
+            State::Instance().currentFG->ReleaseSwapchain(cDesc->desc->OutputWindow);
+        }
+
         if (State::Instance().currentWrappedSwapchain != nullptr &&
             State::Instance().currentSwapchainDesc.OutputWindow == cDesc->desc->OutputWindow)
         {
@@ -396,6 +403,13 @@ ffxReturnCode_t ffxCreateContext_Dx12FG(ffxContext* context, ffxCreateContextDes
             return FFX_API_RETURN_ERROR_PARAMETER;
 
         factory->Release();
+
+        if (State::Instance().currentFG != nullptr && State::Instance().currentFGSwapchain != nullptr &&
+            State::Instance().currentFG->Hwnd() == cDesc->hwnd)
+        {
+            LOG_INFO("Releasing existing FG swapchain before creating FSR-FG HWND swapchain");
+            State::Instance().currentFG->ReleaseSwapchain(cDesc->hwnd);
+        }
 
         if (State::Instance().currentWrappedSwapchain != nullptr &&
             State::Instance().currentSwapchainDesc.OutputWindow == cDesc->hwnd)

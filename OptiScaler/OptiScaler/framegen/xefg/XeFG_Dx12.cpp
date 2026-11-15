@@ -258,6 +258,12 @@ xefg_swapchain_d3d12_resource_data_t XeFG_Dx12::GetResourceData(FG_ResourceType 
 bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, DXGI_SWAP_CHAIN_DESC* desc,
                                         IDXGISwapChain** swapChain)
 {
+    if (_swapChainContext != nullptr)
+    {
+        LOG_WARN("Destroying stale XeFG swapchain context before recreating swapchain");
+        DestroySwapchainContext();
+    }
+
     if (_swapChainContext == nullptr)
     {
         LOG_DEBUG("Creating swapchain context for the first time");
@@ -460,6 +466,12 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
                                          DXGI_SWAP_CHAIN_DESC1* desc, DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
                                          IDXGISwapChain1** swapChain)
 {
+    if (_swapChainContext != nullptr)
+    {
+        LOG_WARN("Destroying stale XeFG swapchain context before recreating swapchain1");
+        DestroySwapchainContext();
+    }
+
     if (_swapChainContext == nullptr)
     {
         if (State::Instance().currentD3D12Device == nullptr)

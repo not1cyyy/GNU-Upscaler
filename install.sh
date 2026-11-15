@@ -26,6 +26,7 @@ CONFIG_OPTIFG=0
 CONFIG_GAQ=0
 CONFIG_XEFG=0
 CONFIG_MFG=""
+FETCH_EXTRAS=0
 
 SUPPORTED_PROXIES=("dxgi.dll" "winmm.dll" "version.dll" "d3d12.dll" "dbghelp.dll" "wininet.dll" "winhttp.dll")
 
@@ -66,6 +67,7 @@ ${BOLD}Options:${RESET}
   --xefg                    Set Frame Generation output to XeFG
   --mfg=<mult>              Enable XeFG Multi-Frame Generation (2x, 3x, 4x, 6x, 10x)
   --gaq                     Enable GNU Adaptive Quality (GAQ Auto-DRS)
+  --fetch-extras            Download latest FSR4 INT8/FP8 variants into custom/
   -u, --update              Force re-check and download of the latest CI build
   --uninstall               Remove GNU-Upscaler / OptiScaler from the target game
   -h, --help                Show this help message
@@ -181,6 +183,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gaq)
             CONFIG_GAQ=1
+            shift
+            ;;
+        --fetch-extras)
+            FETCH_EXTRAS=1
             shift
             ;;
         -*)
@@ -395,7 +401,7 @@ do_uninstall() {
     done
 
     # Remove OptiScaler directories & OptiPatcher plugin (preserve unrelated user plugins)
-    rm -rf "$BIN_DIR/OptiScaler" "$BIN_DIR/D3D12_OptiScaler" "$BIN_DIR/D3D12_Optiscaler" "$BIN_DIR/Licenses"
+    rm -rf "$BIN_DIR/OptiScaler" "$BIN_DIR/D3D12_OptiScaler" "$BIN_DIR/D3D12_Optiscaler" "$BIN_DIR/Licenses" "$BIN_DIR/custom"
     if [[ -f "$BIN_DIR/plugins/OptiPatcher.asi" ]]; then
         rm -f "$BIN_DIR/plugins/OptiPatcher.asi"
         log_info "Removed plugin: OptiPatcher.asi"
@@ -501,7 +507,7 @@ except Exception:
     local zip_file="${CACHE_ROOT}/download.zip"
     rm -f "$zip_file"
 
-    curl -sL --max-time 600 --fail --progress-bar -H "User-Agent: gnu-upscaler-installer" \
+    curl -L --max-time 600 --fail --progress-bar -H "User-Agent: gnu-upscaler-installer" \
          -o "$zip_file" "$asset_url"
 
     if [[ ! -f "$zip_file" ]] || [[ "$(stat -c%s "$zip_file" 2>/dev/null || stat -f%z "$zip_file" 2>/dev/null)" -lt 1048576 ]]; then
@@ -553,6 +559,91 @@ cp -f "$CACHE_DIR/OptiScaler.dll" "$BIN_DIR/OptiScaler.dll"
 if [[ -d "$CACHE_DIR/OptiScaler" ]]; then
     log_info "Copying backend directory: OptiScaler/ ..."
     cp -rf "$CACHE_DIR/OptiScaler" "$BIN_DIR/"
+fi
+
+# 2b. Copy custom providers directory (FSR4 variants, etc.) if present
+if [[ -d "$CACHE_DIR/custom" ]]; then
+    log_info "Copying custom upscaler providers (custom/)..."
+    cp -rf "$CACHE_DIR/custom" "$BIN_DIR/"
+fi
+
+fetch_extras_providers() {
+    log_info "Fetching latest FSR4 INT8 & FP8 variants from Optiscaler-Client..."
+    local custom_dir="$BIN_DIR/custom"
+    local tmp_extras="${CACHE_ROOT}/tmp_extras"
+    mkdir -p "$custom_dir" "$tmp_extras"
+
+    local repos=("Optiscaler-Client/OptiScaler-Extras:INT8" "Optiscaler-Client/OptiScaler-Extras-FP8:FP8")
+    for entry in "${repos[@]}"; do
+        local repo="${entry%%:*}"
+        local suffix="${entry##*:}"
+        local json
+        json="$(curl -sL --max-time 20 -H "User-Agent: gnu-upscaler-installer" \
+            "https://api.github.com/repos/${repo}/releases?per_page=20" || true)"
+        [[ -z "$json" ]] && continue
+
+        while IFS='|' read -r tag asset_name asset_url; do
+            [[ -z "$asset_url" ]] && continue
+            local safe_tag="${tag//[^a-zA-Z0-9._-]/_}"
+            local variant="${safe_tag}_${suffix}"
+            local target_ffx="$custom_dir/$variant/ffx"
+            if [[ -d "$target_ffx" ]] && compgen -G "$target_ffx/*.dll" > /dev/null 2>&1; then
+                continue
+            fi
+
+            local archive="$tmp_extras/$asset_name"
+            local extract_dir="$tmp_extras/$variant"
+            log_info "Downloading ${variant} (${asset_name})..."
+            if ! curl -L --max-time 120 --fail --progress-bar -H "User-Agent: gnu-upscaler-installer" -o "$archive" "$asset_url"; then
+                log_warn "Failed to download ${asset_name}"
+                continue
+            fi
+
+            mkdir -p "$extract_dir"
+            if [[ "$asset_name" == *.7z ]]; then
+                if command -v 7z >/dev/null 2>&1; then
+                    7z x -y "-o$extract_dir" "$archive" >/dev/null 2>&1 || true
+                elif command -v bsdtar >/dev/null 2>&1; then
+                    bsdtar -xf "$archive" -C "$extract_dir" 2>/dev/null || true
+                else
+                    log_warn "Skipping ${asset_name}: install 'p7zip' or 'libarchive-tools' (bsdtar) to extract .7z"
+                    continue
+                fi
+            else
+                if command -v bsdtar >/dev/null 2>&1; then
+                    bsdtar -xf "$archive" -C "$extract_dir" 2>/dev/null || true
+                elif command -v unzip >/dev/null 2>&1; then
+                    unzip -q -o "$archive" -d "$extract_dir" 2>/dev/null || true
+                fi
+            fi
+
+            local found_dlls
+            found_dlls="$(find "$extract_dir" -type f -iname "*.dll" 2>/dev/null || true)"
+            if [[ -n "$found_dlls" ]]; then
+                mkdir -p "$target_ffx"
+                while IFS= read -r dll_path; do
+                    cp -f "$dll_path" "$target_ffx/"
+                done <<< "$found_dlls"
+            fi
+        done < <(printf '%s' "$json" | python3 -c "
+import json, sys
+try:
+    for r in json.load(sys.stdin):
+        tag = r.get('tag_name', '')
+        for a in r.get('assets', []):
+            name = a.get('name', '')
+            if name.endswith(('.zip', '.7z')):
+                print(f\"{tag}|{name}|{a['browser_download_url']}\")
+                break
+except Exception:
+    pass
+" 2>/dev/null)
+    done
+    rm -rf "$tmp_extras"
+}
+
+if [[ $FETCH_EXTRAS -eq 1 ]]; then
+    fetch_extras_providers
 fi
 
 # 3. Copy plugins directory (OptiPatcher.asi, etc.)
