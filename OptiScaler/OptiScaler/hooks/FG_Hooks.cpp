@@ -1419,6 +1419,7 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
                     State::Instance().frameTimeMutex.lock();
                     State::Instance().upscaleTimes.push_back(upscalerTime);
                     State::Instance().upscaleTimes.pop_front();
+                    State::Instance().lastUpscalerGpuMs = upscalerTime;
                     State::Instance().frameTimeMutex.unlock();
                 }
             }

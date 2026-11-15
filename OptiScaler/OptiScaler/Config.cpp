@@ -611,6 +611,11 @@ bool Config::Reload(std::filesystem::path iniPath)
                 OutputScalingMultiplier.set_from_config(std::clamp(setting.value(), 0.5f, 3.0f));
         }
 
+        // DX12 Async Compute
+        {
+            Dx12AsyncCompute.set_from_config(readBool("DX12", "AsyncCompute"));
+        }
+
         // Init Flags
         {
             AutoExposure.set_from_config(readBool("InitFlags", "AutoExposure"));
@@ -1353,7 +1358,7 @@ bool Config::SaveIni()
         };
 
         SaveUpscaler("Dx11Upscaler", Instance()->Dx11Upscaler);
-        if (auto custom = Instance()->CustomUpscaler.value_or("");
+        if (auto custom = Instance()->CustomUpscaler.value_for_config().value_or("");
             !custom.empty() && (Instance()->Dx12Upscaler.value_for_config() == Upscaler::FFX ||
                                 Instance()->Dx12Upscaler.value_for_config() == Upscaler::DLSS))
             ini.SetValue("Upscalers", "Dx12Upscaler", custom.c_str());
@@ -1609,6 +1614,11 @@ bool Config::SaveIni()
         ini.SetValue("OutputScaling", "Multiplier",
                      GetFloatValue(Instance()->OutputScalingMultiplier.value_for_config()).c_str());
         ini.SetValue("OutputScaling", "Downscaler", GetIntValue(Instance()->OutputScalingDownscaler).c_str());
+    }
+
+    // DX12 Async Compute
+    {
+        ini.SetValue("DX12", "AsyncCompute", GetBoolValue(Instance()->Dx12AsyncCompute.value_for_config()).c_str());
     }
 
     // FSR common

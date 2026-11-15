@@ -137,8 +137,18 @@ void FrameLimit::sleep(bool fgActive)
 
             // Dynamic MFG only sees the low latency output's sleep, its "reachable fps" needs the
             // limiter's wait too, else it underestimates what the game can reach and mis-ratchets
-            InputCommon::add_sleep_ms((Util::GetTimestamp() - sleepStart) / 1e6);
+            const double sleptMs = (Util::GetTimestamp() - sleepStart) / 1e6;
+            InputCommon::add_sleep_ms(sleptMs);
+            State::Instance().lastLimiterSleepMs = sleptMs > 0.0 ? sleptMs : 0.0;
+        }
+        else
+        {
+            State::Instance().lastLimiterSleepMs = 0.0;
         }
         previous_frame_time = Util::GetTimestamp();
+    }
+    else
+    {
+        State::Instance().lastLimiterSleepMs = 0.0;
     }
 }

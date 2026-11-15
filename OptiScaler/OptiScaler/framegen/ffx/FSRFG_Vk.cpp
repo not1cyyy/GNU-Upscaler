@@ -998,7 +998,7 @@ ffxReturnCode_t FSRFG_Vk::DispatchCallback(ffxDispatchDescFrameGeneration* param
     auto& state = State::Instance();
     auto config = Config::Instance();
 
-    params->reset = !config->FGSkipReset.value_or_default() && _reset[fIndex] != 0;
+    params->reset = !config->FGSkipReset.value_or_default() && ((_reset[fIndex] != 0) || DetectCameraCut(fIndex));
 
     // Async needs consecutive frame ids unless resetting, they skip after pauses
     if (params->frameID != _lastDispatchedFrameId + 1 && !params->reset)

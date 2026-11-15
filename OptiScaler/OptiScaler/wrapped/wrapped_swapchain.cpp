@@ -508,6 +508,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                     State::Instance().frameTimeMutex.lock();
                     State::Instance().upscaleTimes.push_back(upscalerTime);
                     State::Instance().upscaleTimes.pop_front();
+                    State::Instance().lastUpscalerGpuMs = upscalerTime;
                     State::Instance().frameTimeMutex.unlock();
                 }
             }

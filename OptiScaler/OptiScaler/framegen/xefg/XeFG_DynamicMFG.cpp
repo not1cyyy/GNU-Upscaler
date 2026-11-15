@@ -51,6 +51,7 @@ XeFG_DynamicMFG::Result XeFG_DynamicMFG::Update(int targetCount, int framesToInt
             _capActive = false;
         }
         const double waitMs = sleepMs + presentWaitMs;
+        state.lastLimiterSleepMs = waitMs > 0.0 ? waitMs : 0.0;
         const int rounding = std::clamp(config->FGXeFGRoundingDMFG.value_or_default(), 0, 2);
         const int minCount = config->FGXeFGDynamicAllow1X.value_or_default() || targetCount == 1 ? 0 : 1;
 
@@ -127,7 +128,10 @@ XeFG_DynamicMFG::Result XeFG_DynamicMFG::Update(int targetCount, int framesToInt
                                                                : (state.presentFrameTime > 0.0 ? state.presentFrameTime : 0.0);
         const double currentBaseFps = baseFrameMs > 0.0 ? (1000.0 / baseFrameMs) : 60.0;
 
-        if (minBaseFps > 0.0f && currentBaseFps < minBaseFps)
+        const bool adfgClampedNow = minBaseFps > 0.0f && currentBaseFps < minBaseFps;
+        state.adfgClamped = adfgClampedNow;
+
+        if (adfgClampedNow)
         {
             // Safely clamp multiplier down to 2X (1 interpolated frame) to preserve low latency without shutting FG off
             if (count > 1)
@@ -140,11 +144,16 @@ XeFG_DynamicMFG::Result XeFG_DynamicMFG::Update(int targetCount, int framesToInt
         result.generationOff = false;
         result.count = std::max(count, 1);
     }
-    else if (_active)
+    else
     {
-        _count.Reset();
-        _cap.Reset();
-        _capActive = false;
+        state.adfgClamped = false;
+
+        if (_active)
+        {
+            _count.Reset();
+            _cap.Reset();
+            _capActive = false;
+        }
     }
 
     // The cap is set every frame Dynamic runs, also a new FG context mustn't inherit it

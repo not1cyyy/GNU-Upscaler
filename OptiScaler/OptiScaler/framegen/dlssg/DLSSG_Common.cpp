@@ -229,7 +229,7 @@ bool DLSSG_Common::SetConstants(int fIndex, uint32_t frameId, uint32_t mvWidth, 
     constData.mvecScale.y = _mvScaleY[fIndex] / (float) mvHeight;
 
     if (!Config::Instance()->FGSkipReset.value_or_default())
-        constData.reset = _reset[fIndex] != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        constData.reset = (_reset[fIndex] != 0 || DetectCameraCut(fIndex)) ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     else
         constData.reset = sl::Boolean::eFalse;
 

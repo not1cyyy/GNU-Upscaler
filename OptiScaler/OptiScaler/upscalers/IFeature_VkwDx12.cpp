@@ -1715,6 +1715,9 @@ bool IFeature_VkwDx12::CopyBackOutput(VkCommandBuffer InCmdBuffer)
     ID3D12CommandList* ppCommandLists[] = { Dx12CommandList[frame] };
     Dx12CommandQueue->ExecuteCommandLists(1, ppCommandLists);
 
+    if (dx12Feature != nullptr)
+        dx12Feature->DispatchPendingPostPassesAsync(Dx12CommandQueue);
+
     auto CancelAndDrainQueuedWait = [&]()
     {
         Vulkan_wDx12::CancelPendingSubmission(InCmdBuffer);
@@ -2308,7 +2311,9 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
         InParameters->Set("FSR.transparencyAndComposition", (void*) nullptr);
 
         LOG_DEBUG("Dispatch!!");
+        dx12Feature->SetDeferPostPasses(true);
         dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
+        dx12Feature->SetDeferPostPasses(false);
 
     } while (false);
 

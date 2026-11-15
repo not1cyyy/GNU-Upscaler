@@ -1005,7 +1005,7 @@ bool XeFG_Dx12::Dispatch()
     constData.motionVectorScaleY = _mvScaleY[fIndex];
 
     if (!Config::Instance()->FGSkipReset.value_or_default())
-        constData.resetHistory = _reset[fIndex];
+        constData.resetHistory = (_reset[fIndex] != 0) || DetectCameraCut(fIndex);
     else
         constData.resetHistory = false;
 
@@ -1230,6 +1230,10 @@ void XeFG_Dx12::ReleaseObjects()
         DeferredRelease::Release(_uiCommandList[i]);
         DeferredRelease::Release(_scCommandAllocator[i]);
         DeferredRelease::Release(_scCommandList[i]);
+        DeferredRelease::Release(_hudPostCommandAllocator[i]);
+        DeferredRelease::Release(_hudPostCommandList[i]);
+        _hudPostCommandAllocator[i] = nullptr;
+        _hudPostCommandList[i] = nullptr;
 
         // Reset command list state
         _scCommandListResetted[i] = false;
@@ -1243,6 +1247,7 @@ void XeFG_Dx12::ReleaseObjects()
 
     _renderUI.reset();
     _hudCopy.reset();
+    _asyncCompute.reset();
     _hudlessCompare.reset();
     _mvFlip.reset();
     _depthFlip.reset();
@@ -1376,7 +1381,37 @@ void XeFG_Dx12::CreateObjects(ID3D12Device* InDevice)
                     break;
                 }
             }
+
+            if (SUCCEEDED(InDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                         IID_PPV_ARGS(&_hudPostCommandAllocator[i]))))
+            {
+                if (CheckForRealObject(__FUNCTION__, _hudPostCommandAllocator[i], (IUnknown**) &allocator))
+                    _hudPostCommandAllocator[i] = allocator;
+
+                if (SUCCEEDED(InDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _hudPostCommandAllocator[i],
+                                                          NULL, IID_PPV_ARGS(&_hudPostCommandList[i]))))
+                {
+                    if (CheckForRealObject(__FUNCTION__, _hudPostCommandList[i], (IUnknown**) &cmdList))
+                        _hudPostCommandList[i] = cmdList;
+
+                    if (FAILED(_hudPostCommandList[i]->Close()))
+                    {
+                        DeferredRelease::Release(_hudPostCommandList[i]);
+                        DeferredRelease::Release(_hudPostCommandAllocator[i]);
+                        _hudPostCommandList[i] = nullptr;
+                        _hudPostCommandAllocator[i] = nullptr;
+                    }
+                }
+                else
+                {
+                    DeferredRelease::Release(_hudPostCommandAllocator[i]);
+                    _hudPostCommandAllocator[i] = nullptr;
+                }
+            }
         }
+
+        if (_asyncCompute == nullptr)
+            _asyncCompute = std::make_unique<AsyncCompute_Dx12>(InDevice);
 
     } while (false);
 }
@@ -1385,6 +1420,14 @@ bool XeFG_Dx12::Present()
 {
     auto fIndex = GetIndexWillBeDispatched();
     LOG_DEBUG("fIndex: {}", fIndex);
+
+    struct PendingAsyncHudCopy
+    {
+        ID3D12Resource* backBuffer = nullptr;
+        ID3D12Resource* hudless = nullptr;
+        D3D12_RESOURCE_STATES hudlessState = D3D12_RESOURCE_STATE_COMMON;
+        float threshold = 0.03f;
+    } pendingAsyncHudCopy;
 
     if (Config::Instance()->FGDrawUIOverFG.value_or_default())
     {
@@ -1434,12 +1477,28 @@ bool XeFG_Dx12::Present()
                     IDXGISwapChain3* sc3 = nullptr;
                     if (SUCCEEDED(_swapChain->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3 != nullptr)
                     {
-                        if (SUCCEEDED(sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backBuffer))) && backBuffer != nullptr)
+                        if (SUCCEEDED(sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backBuffer))) &&
+                            backBuffer != nullptr)
                         {
-                            auto commandList = GetSCCommandList(fIndex);
-                            hudCopy->Dispatch(commandList, hudless->GetResource(), backBuffer, hudless->state,
-                                              D3D12_RESOURCE_STATE_PRESENT, hudDetectionThreshold);
-                            backBuffer->Release();
+                            const bool canAsyncHudCopy =
+                                fIndex >= 0 && fIndex < BUFFER_COUNT && Config::Instance()->Dx12AsyncCompute.value_or_default() &&
+                                _gameCommandQueue != nullptr && _asyncCompute != nullptr && _asyncCompute->IsInit() &&
+                                _hudPostCommandAllocator[fIndex] != nullptr && _hudPostCommandList[fIndex] != nullptr;
+
+                            if (canAsyncHudCopy)
+                            {
+                                pendingAsyncHudCopy.backBuffer = backBuffer;
+                                pendingAsyncHudCopy.hudless = hudless->GetResource();
+                                pendingAsyncHudCopy.hudlessState = hudless->state;
+                                pendingAsyncHudCopy.threshold = hudDetectionThreshold;
+                            }
+                            else
+                            {
+                                auto commandList = GetSCCommandList(fIndex);
+                                hudCopy->Dispatch(commandList, hudless->GetResource(), backBuffer, hudless->state,
+                                                  D3D12_RESOURCE_STATE_PRESENT, hudDetectionThreshold);
+                                backBuffer->Release();
+                            }
                         }
                         sc3->Release();
                     }
@@ -1534,6 +1593,64 @@ bool XeFG_Dx12::Present()
 
             if (scReady)
                 _scAllocatorFenceValues[fIndex] = SignalSCFence();
+
+            if (pendingAsyncHudCopy.backBuffer != nullptr)
+            {
+                auto prepCmdList = GetSCCommandList(fIndex);
+                if (prepCmdList != nullptr && _hudCopy != nullptr)
+                {
+                    bool asyncDispatched = false;
+                    if (_hudCopy->PrepareAsyncDispatch(prepCmdList, pendingAsyncHudCopy.hudless,
+                                                       pendingAsyncHudCopy.backBuffer,
+                                                       pendingAsyncHudCopy.hudlessState,
+                                                       D3D12_RESOURCE_STATE_PRESENT) &&
+                        SUCCEEDED(prepCmdList->Close()))
+                    {
+                        _scCommandListResetted[fIndex] = false;
+                        ID3D12CommandList* prepList[] = { prepCmdList };
+                        _gameCommandQueue->ExecuteCommandLists(1, prepList);
+
+                        const bool computeOk = _asyncCompute->Dispatch(
+                            _gameCommandQueue,
+                            [&](ID3D12GraphicsCommandList* computeList) -> bool
+                            {
+                                return _hudCopy->DispatchAsyncCompute(computeList, pendingAsyncHudCopy.hudless,
+                                                                      pendingAsyncHudCopy.threshold);
+                            });
+
+                        if (computeOk && SUCCEEDED(_hudPostCommandAllocator[fIndex]->Reset()) &&
+                            SUCCEEDED(_hudPostCommandList[fIndex]->Reset(_hudPostCommandAllocator[fIndex], nullptr)))
+                        {
+                            _hudCopy->CompleteAsyncDispatch(_hudPostCommandList[fIndex], pendingAsyncHudCopy.hudless,
+                                                            pendingAsyncHudCopy.backBuffer,
+                                                            pendingAsyncHudCopy.hudlessState,
+                                                            D3D12_RESOURCE_STATE_PRESENT);
+                            if (SUCCEEDED(_hudPostCommandList[fIndex]->Close()))
+                            {
+                                ID3D12CommandList* postList[] = { _hudPostCommandList[fIndex] };
+                                _gameCommandQueue->ExecuteCommandLists(1, postList);
+                                asyncDispatched = true;
+                            }
+                        }
+
+                        _scAllocatorFenceValues[fIndex] = SignalSCFence();
+                    }
+
+                    if (!asyncDispatched && _scCommandListResetted[fIndex])
+                    {
+                        // PrepareAsyncDispatch failed before closing prepCmdList: run synchronous path cleanly
+                        _hudCopy->Dispatch(prepCmdList, pendingAsyncHudCopy.hudless, pendingAsyncHudCopy.backBuffer,
+                                           pendingAsyncHudCopy.hudlessState, D3D12_RESOURCE_STATE_PRESENT,
+                                           pendingAsyncHudCopy.threshold);
+                        SubmitSCCommandList(fIndex);
+                    }
+                }
+                pendingAsyncHudCopy.backBuffer->Release();
+            }
+        }
+        else if (pendingAsyncHudCopy.backBuffer != nullptr)
+        {
+            pendingAsyncHudCopy.backBuffer->Release();
         }
     }
 

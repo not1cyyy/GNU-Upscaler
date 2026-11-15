@@ -3,6 +3,7 @@
 #include <Config.h>
 #include <low_latency/input/input_common.h>
 #include <shaders/reproject/Reproject.h>
+#include <cmath>
 
 int IFGFeature::GetIndex() { return (_frameCount % BUFFER_COUNT); }
 
@@ -295,7 +296,11 @@ void IFGFeature::GetInterpolationPos(UINT& left, UINT& top, int index)
         top = 0;
 }
 
-void IFGFeature::ResetCounters() { _targetFrame = _frameCount; }
+void IFGFeature::ResetCounters()
+{
+    _targetFrame = _frameCount;
+    _hasLastCamera = false;
+}
 
 void IFGFeature::UpdateTarget()
 {
@@ -367,4 +372,62 @@ void IFGFeature::FilloutReprojectionData(FilloutData& data, int fIndex)
 
     data.mvScaleX = _mvScaleX[fIndex];
     data.mvScaleY = _mvScaleY[fIndex];
+}
+
+bool IFGFeature::DetectCameraCut(int fIndex)
+{
+    if (fIndex < 0 || fIndex >= BUFFER_COUNT)
+        return false;
+
+    const float* pos = _cameraPosition[fIndex];
+    const float* fwd = _cameraForward[fIndex];
+
+    for (int i = 0; i < 3; ++i)
+    {
+        if (!std::isfinite(pos[i]) || !std::isfinite(fwd[i]))
+            return false;
+    }
+
+    const float fwdLenSq = fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2];
+    if (fwdLenSq <= 1e-6f)
+        return false;
+
+    const float invLen = 1.0f / std::sqrt(fwdLenSq);
+    const float nx = fwd[0] * invLen;
+    const float ny = fwd[1] * invLen;
+    const float nz = fwd[2] * invLen;
+
+    bool cutDetected = false;
+    if (_hasLastCamera)
+    {
+        const float dx = pos[0] - _lastCameraPosition[0];
+        const float dy = pos[1] - _lastCameraPosition[1];
+        const float dz = pos[2] - _lastCameraPosition[2];
+        const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        // Normalize position delta to meters when engine provides viewSpaceToMetersFactor
+        const float meterFactor = _meterFactor[fIndex];
+        const float posThreshold = (meterFactor > 0.0001f) ? (25.0f / meterFactor) : 500.0f;
+
+        const float forwardDot =
+            nx * _lastCameraForward[0] + ny * _lastCameraForward[1] + nz * _lastCameraForward[2];
+
+        // Trigger optical-flow history reset on >25m teleport or >70 deg single-frame camera snap
+        if (dist > posThreshold || forwardDot < 0.342f)
+        {
+            cutDetected = true;
+            LOG_DEBUG("Auto camera-cut reset triggered (dist: {:.2f}, threshold: {:.2f}, dot: {:.3f})", dist,
+                      posThreshold, forwardDot);
+        }
+    }
+
+    _lastCameraPosition[0] = pos[0];
+    _lastCameraPosition[1] = pos[1];
+    _lastCameraPosition[2] = pos[2];
+    _lastCameraForward[0] = nx;
+    _lastCameraForward[1] = ny;
+    _lastCameraForward[2] = nz;
+    _hasLastCamera = true;
+
+    return cutDetected;
 }

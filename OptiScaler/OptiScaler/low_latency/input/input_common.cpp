@@ -633,10 +633,14 @@ InputResult InputCommon::sleep(const InputContext& inputContext, IUnknown* pDevi
     {
         const auto start = std::chrono::steady_clock::now();
         current_tech->sleep(frame_id);
-        last_sleep_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        const double sleepDurationMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        last_sleep_ms = sleepDurationMs;
+        last_output_sleep_ms = sleepDurationMs;
     }
     else
     {
+        last_output_sleep_ms = 0.0;
         return InputResult::NoReadyOutput;
     }
 

@@ -55,11 +55,104 @@ bool IFeature_Dx12::Init(ID3D12Device* InDevice, ID3D12GraphicsCommandList* InCo
         if (GetUpscalerType() != Upscaler::DLSS && GetUpscalerType() != Upscaler::DLSSD)
             Bias = std::make_unique<Bias_Dx12>("Bias", InDevice);
         Magnifier = std::make_unique<Magnifier_Dx12>("Magnifier", InDevice);
+        AsyncCompute = std::make_unique<AsyncCompute_Dx12>(InDevice);
 
         UpscalerTime = std::make_unique<GpuTime_Dx12>(InDevice);
     }
 
     return result;
+}
+
+RcasConstants IFeature_Dx12::BuildRcasConstants(NVSDK_NGX_Parameter* InParameters)
+{
+    RcasConstants rcasConstants {};
+
+    rcasConstants.Sharpness = _actualSharpness.value_or(_sharpness);
+    rcasConstants.DepthIsLinear = DepthLinear();
+    rcasConstants.DepthIsReversed = DepthInverted();
+    rcasConstants.IsHdr =
+        IsHdr() || State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+
+    _sharpness = _actualSharpness.value_or(_sharpness);
+    _actualSharpness.reset();
+
+    InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &rcasConstants.MvScaleX);
+    InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &rcasConstants.MvScaleY);
+
+    float nearPlane = 0.0f;
+    float farPlane = 0.0f;
+
+    // Passthrough camera near and far for DLSSD depth-adaptive sharpening
+    if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
+    {
+        rcasConstants.CameraNear = nearPlane;
+        rcasConstants.CameraFar = farPlane;
+    }
+    else
+    {
+        rcasConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+        rcasConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+    }
+
+    return rcasConstants;
+}
+
+bool IFeature_Dx12::ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const PendingAsyncPostPasses& passes)
+{
+    if (passes.runOutputScaler)
+    {
+        LOG_DEBUG("Scaling output...");
+        OutputScaler->SetBufferState(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        if (!OutputScaler->Dispatch(cmdList, passes.osInput, passes.osOutput))
+        {
+            Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
+            State::Instance().changeBackend[Handle()->Id] = true;
+            return false;
+        }
+    }
+
+    if (passes.runRcas)
+    {
+        RCAS->SetBufferState(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        if (!RCAS->Dispatch(cmdList, passes.rcasInput, passes.paramMotion, passes.rcasConstants, passes.rcasOutput,
+                            passes.paramDepth))
+        {
+            Config::Instance()->RcasEnabled.set_volatile_value(false);
+            return false;
+        }
+    }
+
+    if (passes.runMagnifier)
+    {
+        Magnifier->SetBufferState(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        if (!Magnifier->Dispatch(cmdList, passes.magInput, passes.magOutput))
+            return false;
+    }
+
+    return true;
+}
+
+bool IFeature_Dx12::DispatchPendingPostPassesAsync(ID3D12CommandQueue* directQueue)
+{
+    const PendingAsyncPostPasses passes = _pendingAsyncPasses;
+    _pendingAsyncPasses = {};
+
+    if (!passes.active)
+        return true;
+
+    if (AsyncCompute != nullptr && AsyncCompute->IsInit() && directQueue != nullptr &&
+        Config::Instance()->Dx12AsyncCompute.value_or_default())
+    {
+        return AsyncCompute->Dispatch(directQueue,
+                                      [&](ID3D12GraphicsCommandList* computeCmdList) -> bool
+                                      { return ExecutePostPassSet(computeCmdList, passes); });
+    }
+
+    return false;
 }
 
 bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
@@ -181,37 +274,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
 
                   RCAS->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-                  RcasConstants rcasConstants {};
-
-                  rcasConstants.Sharpness = _actualSharpness.value_or(_sharpness);
-                  rcasConstants.DepthIsLinear = DepthLinear();
-                  rcasConstants.DepthIsReversed = DepthInverted();
-                  rcasConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
-                                        State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
-
-                  // Restore value
-                  _sharpness = _actualSharpness.value_or(_sharpness);
-                  _actualSharpness.reset();
-
-                  InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &rcasConstants.MvScaleX);
-                  InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &rcasConstants.MvScaleY);
-
-                  float nearPlane = 0.0f;
-                  float farPlane = 0.0f;
-
-                  // We need camera near and far for DLSSD
-                  // We passthrough those values from the DLSSG params onto the upscaler's params
-                  if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
-                      InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
-                  {
-                      rcasConstants.CameraNear = nearPlane;
-                      rcasConstants.CameraFar = farPlane;
-                  }
-                  else
-                  {
-                      rcasConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
-                      rcasConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
-                  }
+                  RcasConstants rcasConstants = BuildRcasConstants(InParameters);
 
                   if (!RCAS->Dispatch(InCommandList, input, paramMotion, rcasConstants, output, paramDepth))
                   {
@@ -294,10 +357,61 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     if (hasSharpness)
         InParameters->Set(NVSDK_NGX_Parameter_Sharpness, originalSharpness);
 
+    _pendingAsyncPasses = {};
+
     if (!evalResult)
     {
         RestoreBarriers(InCommandList);
         return false;
+    }
+
+    const bool deferToAsyncQueue = _deferPostPasses && !pipeline.empty() && !outputBarrier.has_value() &&
+                                   (Config::Instance()->OverlayMenu.value_or_default() || _frameCount <= 30) &&
+                                   Config::Instance()->Dx12AsyncCompute.value_or_default() &&
+                                   AsyncCompute != nullptr && AsyncCompute->IsInit();
+
+    if (deferToAsyncQueue)
+    {
+        PendingAsyncPostPasses pending {};
+        pending.paramMotion = paramMotion;
+        pending.paramDepth = paramDepth;
+
+        for (auto& pass : pipeline)
+        {
+            if (!pass.inputBuffer || !pass.outputBuffer)
+                continue;
+
+            if (OutputScaler && pass.inputBuffer == OutputScaler->Buffer())
+            {
+                pending.runOutputScaler = true;
+                pending.osInput = pass.inputBuffer;
+                pending.osOutput = pass.outputBuffer;
+                pending.active = true;
+            }
+            else if (RCAS && pass.inputBuffer == RCAS->Buffer() && RCAS->CanRender() && paramMotion && paramOutput)
+            {
+                pending.runRcas = true;
+                pending.rcasInput = pass.inputBuffer;
+                pending.rcasOutput = pass.outputBuffer;
+                pending.rcasConstants = BuildRcasConstants(InParameters);
+                pending.active = true;
+            }
+            else if (Magnifier && pass.inputBuffer == Magnifier->Buffer() && Magnifier->CanRender() && paramMotion &&
+                     paramOutput)
+            {
+                pending.runMagnifier = true;
+                pending.magInput = pass.inputBuffer;
+                pending.magOutput = pass.outputBuffer;
+                pending.active = true;
+            }
+        }
+
+        if (pending.active)
+        {
+            _pendingAsyncPasses = pending;
+            RestoreBarriers(InCommandList);
+            return evalResult;
+        }
     }
 
     // Iterate FORWARDS to execute the shaders in the defined order
@@ -385,4 +499,5 @@ IFeature_Dx12::~IFeature_Dx12()
     OutputScaler.reset();
     RCAS.reset();
     Bias.reset();
+    AsyncCompute.reset();
 }

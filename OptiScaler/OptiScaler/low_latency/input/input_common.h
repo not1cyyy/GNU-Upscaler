@@ -84,6 +84,8 @@ class InputCommon
     inline static std::atomic_uint64_t xefg_frame_id = 0;
     // Time the output's last sleep took, for XeFG's Dynamic MFG (the frame time it doesn't need)
     inline static std::atomic<double> last_sleep_ms = 0.0;
+    // Non-accumulated single-frame output sleep snapshot for non-destructive readers (e.g. GAQ)
+    inline static std::atomic<double> last_output_sleep_ms = 0.0;
 
     static void mark_frame_generation(LowLatencyInput input)
     {
@@ -129,6 +131,8 @@ class InputCommon
 
     // The time the output slept since the last call, 0 if it didn't
     static double take_sleep_ms() { return last_sleep_ms.exchange(0.0); }
+    // Non-destructive read of the most recent low-latency output sleep duration in ms
+    static double peek_sleep_ms() { return last_output_sleep_ms.load(); }
     // Time slept outside the output's own sleep (FrameLimit::sleep), added onto it for Dynamic MFG
     static void add_sleep_ms(double ms) { last_sleep_ms.fetch_add(ms > 0.0 ? ms : 0.0); }
 

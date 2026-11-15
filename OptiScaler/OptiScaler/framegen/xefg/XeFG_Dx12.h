@@ -7,6 +7,7 @@
 
 #include "shaders/depth_invert/DI_Dx12.h"
 #include <shaders/hud_copy/HudCopy_Dx12.h>
+#include <shaders/AsyncCompute_Dx12.h>
 #include "XeFG_DynamicMFG.h"
 
 #include <xell.h>
@@ -35,6 +36,9 @@ class XeFG_Dx12 : public virtual IFGFeature_Dx12
 
     std::unique_ptr<DI_Dx12> _depthInvert;
     std::unique_ptr<HudCopy_Dx12> _hudCopy;
+    std::unique_ptr<AsyncCompute_Dx12> _asyncCompute;
+    ID3D12CommandAllocator* _hudPostCommandAllocator[BUFFER_COUNT] {};
+    ID3D12GraphicsCommandList* _hudPostCommandList[BUFFER_COUNT] {};
 
     static void xefgLogCallback(const char* message, xefg_swapchain_logging_level_t level, void* userData);
 

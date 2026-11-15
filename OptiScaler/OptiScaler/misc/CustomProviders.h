@@ -2,10 +2,13 @@
 
 #include "Config.h"
 
+#include <misc/IdentifyGpu.h>
 #include <plugins/PluginApi.h>
 #include <proxies/KernelBase_Proxy.h>
 #include <proxies/Ntdll_Proxy.h>
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 
 // Dlls in custom/<name>/<kind> of the Opti folder, each kind a folder has is an entry in the upscaler or FG list:
@@ -139,6 +142,126 @@ inline bool IsFfx(const std::string& name) { return Contains(Scan().ffx, name); 
 inline bool IsFfxVk(const std::string& name) { return Contains(Scan().ffxVk, name); }
 inline bool IsDlss(const std::string& name) { return Contains(Scan().dlss, name); }
 inline bool IsDlssg(const std::string& name) { return Contains(Scan().dlssg, name); }
+
+// Picks the best installed custom/ FFX (FSR 4) variant matching the active GPU's FP8/INT8 architecture
+// without overriding an explicit user-pinned CustomUpscaler or non-FFX Dx12Upscaler choice.
+inline void AutoSelectForGpu(const GpuInformation& gpu)
+{
+    auto cfg = Config::Instance();
+
+    // Respect explicit user-pinned custom folder or explicit non-FFX upscaler
+    if (cfg->CustomUpscaler.has_value())
+        return;
+
+    if (cfg->Dx12Upscaler.has_value() && cfg->Dx12Upscaler.value() != Upscaler::FFX)
+        return;
+
+    const bool ffxSelected = cfg->Dx12Upscaler.value_or_default() == Upscaler::FFX;
+    if (!ffxSelected && gpu.vendorId != VendorId::AMD)
+        return;
+
+    const auto& candidates = Scan().ffx;
+    if (candidates.empty())
+        return;
+
+    FSR4Support effectiveSupport =
+        gpu.realFsr4Support != FSR4Support::None ? gpu.realFsr4Support : gpu.fsr4Support;
+    if (effectiveSupport == FSR4Support::None)
+        effectiveSupport = cfg->Fsr4GpuSupport.value_or_default();
+
+    // Determine target tier when Fsr4GpuSupport/ASIC detection still hasn't resolved on AMD
+    if (effectiveSupport == FSR4Support::None && gpu.vendorId == VendorId::AMD)
+    {
+        if (gpu.amdHwGeneration >= device_info::HwGeneration::kGfx12)
+            effectiveSupport = FSR4Support::FP8;
+        else if (gpu.amdHwGeneration == device_info::HwGeneration::kGfx11)
+            effectiveSupport = FSR4Support::INT8;
+        else if (gpu.amdHwGeneration == device_info::HwGeneration::kGfx10_3)
+            effectiveSupport = FSR4Support::INT8_2;
+    }
+
+    if (effectiveSupport == FSR4Support::None)
+        return;
+
+    auto toLower = [](std::string s)
+    {
+        std::ranges::transform(s, s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+
+    const std::string* bestCandidate = nullptr;
+    int bestScore = 0;
+
+    for (const auto& name : candidates)
+    {
+        const std::string lower = toLower(name);
+        const bool isFp8 = lower.find("fp8") != std::string::npos;
+        const bool isInt8 = lower.find("int8") != std::string::npos;
+        const bool isLite = lower.find("lite") != std::string::npos;
+        const bool isLossy = lower.find("lossy") != std::string::npos;
+        const bool isExact = lower.find("exact") != std::string::npos;
+
+        int score = 0;
+        if (effectiveSupport == FSR4Support::FP8)
+        {
+            if (isFp8)
+                score += 100;
+            else if (isInt8)
+                score += 10;
+
+            if (isExact)
+                score += 20;
+        }
+        else if (effectiveSupport == FSR4Support::INT8Lite)
+        {
+            if (isFp8)
+                score -= 100;
+            else if (isInt8)
+                score += 100;
+            else
+                score += 40;
+
+            if (isLite)
+                score += 40;
+            if (isLossy)
+                score += 20;
+            if (isExact)
+                score += 10;
+        }
+        else
+        {
+            // INT8 / INT8_2 (RDNA 3 etc.)
+            if (isFp8)
+                score -= 100;
+            else if (isInt8)
+                score += 100;
+            else
+                score += 40;
+
+            if (isLossy)
+                score += 30;
+            else if (!isLite && !isExact)
+                score += 25;
+            if (isLite)
+                score += 15;
+            if (isExact)
+                score += 10;
+        }
+
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestCandidate = &name;
+        }
+    }
+
+    if (bestCandidate != nullptr)
+    {
+        cfg->CustomUpscaler.set_volatile_value(*bestCandidate);
+        cfg->Dx12Upscaler.set_volatile_value(Upscaler::FFX);
+        LOG_INFO("Auto-selected custom FSR4 provider '{}' for GPU '{}'", *bestCandidate, gpu.name);
+    }
+}
 
 // Dx12Upscaler from the ini as a custom folder's kind, a folder with both is used as FFX
 inline void ResolveDx12Upscaler()
