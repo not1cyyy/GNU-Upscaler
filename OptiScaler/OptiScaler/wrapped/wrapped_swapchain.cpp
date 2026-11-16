@@ -382,8 +382,12 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
             _lastFrameTime = now;
 
-            State::Instance().presentFrameTime = ftDelta;
-            FrameStats::Push(ftDelta, now);
+            // FGHooks::FGPresent already records base frame times when an FG swapchain wraps this swapchain
+            if (State::Instance().currentFGSwapchain == nullptr)
+            {
+                State::Instance().presentFrameTime = ftDelta;
+                FrameStats::Push(ftDelta, now);
+            }
 
             if (State::Instance().currentFG == nullptr)
                 State::Instance().lastFGFrameTime = ftDelta;
