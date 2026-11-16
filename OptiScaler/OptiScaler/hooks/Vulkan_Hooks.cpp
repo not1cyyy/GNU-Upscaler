@@ -1,4 +1,5 @@
 #include "pch.h"
+#include <misc/FrameStats.h>
 
 #include "Vulkan_Hooks.h"
 
@@ -948,7 +949,10 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
         auto now = Util::MillisecondsNow();
         state.lastFGFrameTime = lastPresentTime > 0.0 ? now - lastPresentTime : 0.0;
         if (state.lastFGFrameTime > 0.0)
+        {
             state.presentFrameTime = state.lastFGFrameTime;
+            FrameStats::Push(state.lastFGFrameTime, now);
+        }
         lastPresentTime = now;
 
         if (fg->IsActive() && !fg->IsPaused())

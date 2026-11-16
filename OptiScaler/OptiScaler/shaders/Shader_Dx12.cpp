@@ -2,6 +2,7 @@
 #include "Shader_Dx12.h"
 #include <d3dx/d3dx12.h>
 #include <misc/DeferredRelease.h>
+#include <State.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -110,6 +111,10 @@ bool Shader_Dx12::CreateComputePipeline(ID3D12Device* device, ID3D12PipelineStat
 DXGI_FORMAT Shader_Dx12::SelectPackedIntermediateFormat(ID3D12Device* InDevice, DXGI_FORMAT sourceFormat)
 {
     if (InDevice == nullptr || !Config::Instance()->Dx12PackedBuffers.value_or_default())
+        return DXGI_FORMAT_UNKNOWN;
+
+    // R11G11B10 has 6-bit mantissas and bands visibly on HDR10 output, keep full precision there
+    if (State::Instance().hdrOutputActive)
         return DXGI_FORMAT_UNKNOWN;
 
     // Only pack wide 64/128-bit HDR float intermediate targets down to 32-bit R11G11B10_FLOAT

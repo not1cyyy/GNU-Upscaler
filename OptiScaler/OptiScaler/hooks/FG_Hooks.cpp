@@ -1,4 +1,5 @@
 #include "pch.h"
+#include <misc/FrameStats.h>
 #include "FG_Hooks.h"
 #include <Config.h>
 
@@ -1370,7 +1371,10 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
         _lastFGFrameTime = now;
         state.lastFGFrameTime = ftDelta;
         if (ftDelta > 0.0)
+        {
             state.presentFrameTime = ftDelta;
+            FrameStats::Push(ftDelta, now);
+        }
 
         LOG_DEBUG("flags: {:X}, Frametime: {}", Flags, ftDelta);
 

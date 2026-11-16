@@ -1,4 +1,5 @@
 #include "pch.h"
+#include <misc/FrameStats.h>
 #include "menu_common.h"
 #include "gnu_ui/GnuUi.h"
 #include "input/ToggleGate.h"
@@ -7767,8 +7768,21 @@ void MenuCommon::RenderUpscaleRatioSettings(RenderMenuContext& ctx)
             config->SaveIni();
         GnuUi::Help("Boosts upscale ratio smoothly during rapid camera/mouse turns and decays back when stationary.");
 
+        {
+            const auto fs = FrameStats::Compute();
+            if (fs.samples >= 30)
+                ImGui::TextDisabled("Present FPS: avg %.1f | 1%% low %.1f | 0.1%% low %.1f (%zu frames)", fs.avgFps,
+                                    fs.low1Fps, fs.low01Fps, fs.samples);
+            else
+                ImGui::TextDisabled("Present FPS: collecting samples...");
+            ImGui::SameLine(0.0f, 12.0f);
+            if (GnuUi::Button("Reset##framestats"))
+                FrameStats::Reset();
+        }
         float currentGaqRatio = GaqController::Instance().CurrentRatio();
         ImGui::TextDisabled("GAQ Live Scale: %.2fx (%.1f%% resolution)", currentGaqRatio, (1.0f / currentGaqRatio) * 100.0f);
+        ImGui::TextDisabled("GAQ Active Frame: %.2f ms%s", State::Instance().lastActiveFrameMs,
+                            State::Instance().gaqCpuBound ? " | CPU-bound: resolution has no effect, holding minimum ratio" : "");
         ImGui::SameLine(0.0f, 12.0f);
         if (GnuUi::Button("Sync Scale##gaq"))
         {

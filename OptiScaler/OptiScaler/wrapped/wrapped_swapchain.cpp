@@ -4,6 +4,7 @@
 
 #include <Util.h>
 #include <Config.h>
+#include <misc/FrameStats.h>
 
 #include <nvapi/fakenvapi.h>
 #include <hooks/Reflex_Hooks.h>
@@ -382,6 +383,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             _lastFrameTime = now;
 
             State::Instance().presentFrameTime = ftDelta;
+            FrameStats::Push(ftDelta, now);
 
             if (State::Instance().currentFG == nullptr)
                 State::Instance().lastFGFrameTime = ftDelta;

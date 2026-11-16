@@ -401,6 +401,8 @@ class State
     double lastLimiterSleepMs = 0.0;
     double lastActiveFrameMs = 0.0;
     bool adfgClamped = false;
+    // Set by GAQ when render resolution changes did not change frame time (CPU-bound)
+    bool gaqCpuBound = false;
     std::atomic<int64_t> mouseMotionCounter { 0 };
     std::atomic<double> cameraAngularSpeed { 0.0 };
     std::mutex frameTimeMutex;

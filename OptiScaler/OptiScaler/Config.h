@@ -548,7 +548,7 @@ class Config
     CustomOptional<bool> OutputScalingEnabled { false };
     CustomOptional<float> OutputScalingMultiplier { 1.5f };
     CustomOptional<Scaler> OutputScalingDownscaler { Scaler::FSR1 };
-    CustomOptional<bool> Dx12AsyncCompute { true };
+    CustomOptional<bool> Dx12AsyncCompute { false };
     CustomOptional<bool, SoftDefault> Dx12PackedBuffers { true };
     CustomOptional<bool, SoftDefault> Dx12CmdListFastPath { true };
 
