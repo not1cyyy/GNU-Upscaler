@@ -18,7 +18,39 @@ class GaqController
         return instance;
     }
 
+    // Publishes the PID ratio in 0.05 steps with a minimum dwell between changes, so the upscaler is not
+    // asked to switch render resolution (and rebind/reallocate targets) every few frames.
     float Update(double nowMs)
+    {
+        const float raw = UpdateRaw(nowMs);
+
+        std::lock_guard<std::mutex> lock(_mutex);
+
+        if (!Config::Instance()->GaqEnabled.value_or_default())
+        {
+            _publishedRatio = 0.0f;
+            return raw;
+        }
+
+        constexpr float step = 0.05f;
+        constexpr double dwellMs = 500.0;
+        const float snapped = std::round(raw / step) * step;
+
+        if (_publishedRatio <= 0.0f)
+        {
+            _publishedRatio = snapped;
+            _lastPublishMs = nowMs;
+        }
+        else if (std::abs(raw - _publishedRatio) >= step * 1.5f && (nowMs - _lastPublishMs) >= dwellMs)
+        {
+            _publishedRatio = snapped;
+            _lastPublishMs = nowMs;
+        }
+
+        return _publishedRatio;
+    }
+
+    float UpdateRaw(double nowMs)
     {
         std::lock_guard<std::mutex> lock(_mutex);
 
@@ -36,6 +68,10 @@ class GaqController
             _lastTimeMs = 0.0;
             _emaActiveMs = 0.0;
             _emaUpscalerMs = 0.0;
+            _slowMs = 0.0;
+            _probeBaseRatio = 0.0f;
+            _cpuBound = false;
+            state.gaqCpuBound = false;
             return _currentRatio;
         }
 
@@ -112,6 +148,62 @@ class GaqController
             gainScale = 1.5f;
         }
 
+        // CPU-bound detection: lowering render resolution should cut frame time roughly in proportion to the
+        // pixel count (1/ratio^2). If the ratio went up and frame time barely moved, the game is CPU-bound and
+        // lower resolution only costs image quality, so GAQ returns to the minimum ratio and re-probes later.
+        _slowMs = _slowMs > 0.0 ? (0.05 * activeFrameMs + 0.95 * _slowMs) : activeFrameMs;
+        _probeAgeSec += dt;
+
+        if (_cpuBound)
+        {
+            _cpuBoundAgeSec += dt;
+            if (_cpuBoundAgeSec > 20.0f)
+            {
+                _cpuBound = false;
+                _probeBaseRatio = 0.0f;
+            }
+            else
+            {
+                _currentRatio = std::max(minRatio, _currentRatio - 0.5f * dt);
+                _integral = 0.0f;
+                _lastError = 0.0f;
+                _motionBoostOffset = 0.0f;
+                state.gaqCpuBound = true;
+                return _currentRatio;
+            }
+        }
+        state.gaqCpuBound = false;
+
+        if (_probeBaseRatio <= 0.0f || _currentRatio < _probeBaseRatio - 0.02f)
+        {
+            _probeBaseRatio = _currentRatio;
+            _probeBaseMs = _slowMs;
+            _probeAgeSec = 0.0f;
+        }
+        else if (_probeAgeSec >= 1.5f && _currentRatio - _probeBaseRatio >= 0.15f && _probeBaseMs > 0.0)
+        {
+            const float r0 = _probeBaseRatio;
+            const float r1 = _currentRatio;
+            const double expectedDrop = 1.0 - (r0 * r0) / (r1 * r1);
+            const double actualDrop = (_probeBaseMs - _slowMs) / _probeBaseMs;
+
+            if (actualDrop < expectedDrop * 0.3)
+            {
+                _cpuBound = true;
+                _cpuBoundAgeSec = 0.0f;
+            }
+
+            _probeBaseRatio = r1;
+            _probeBaseMs = _slowMs;
+            _probeAgeSec = 0.0f;
+        }
+        else if (_probeAgeSec > 6.0f)
+        {
+            _probeBaseRatio = _currentRatio;
+            _probeBaseMs = _slowMs;
+            _probeAgeSec = 0.0f;
+        }
+
         // Positive error means active frame time exceeded target -> increase ratio to reduce render pixels
         const float error = static_cast<float>(controlFrameMs) - targetFrameTime;
 
@@ -175,6 +267,8 @@ class GaqController
         auto* config = Config::Instance();
         const float minRatio = std::clamp(config->GaqMinRatio.value_or_default(), 1.0f, 3.0f);
         const float maxRatio = std::clamp(config->GaqMaxRatio.value_or_default(), minRatio, 4.0f);
+        if (_publishedRatio > 0.0f && config->GaqEnabled.value_or_default())
+            return std::clamp(_publishedRatio, minRatio, maxRatio);
         return std::clamp(_currentRatio + _motionBoostOffset, minRatio, maxRatio);
     }
 
@@ -188,4 +282,12 @@ class GaqController
     double _lastTimeMs = 0.0;
     double _emaActiveMs = 0.0;
     double _emaUpscalerMs = 0.0;
+    double _slowMs = 0.0;
+    float _publishedRatio = 0.0f;
+    double _lastPublishMs = 0.0;
+    double _probeBaseMs = 0.0;
+    float _probeBaseRatio = 0.0f;
+    float _probeAgeSec = 0.0f;
+    float _cpuBoundAgeSec = 0.0f;
+    bool _cpuBound = false;
 };
