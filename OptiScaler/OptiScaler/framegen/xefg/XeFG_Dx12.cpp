@@ -10,6 +10,7 @@
 
 #include <magic_enum.hpp>
 
+#include <array>
 #include <DirectXMath.h>
 
 using namespace DirectX;
@@ -279,6 +280,67 @@ xefg_swapchain_d3d12_resource_data_t XeFG_Dx12::GetResourceData(FG_ResourceType 
     return resourceParam;
 }
 
+static xefg_swapchain_result_t InitSwapchainWithScaledBuffers(
+    xefg_swapchain_handle_t context, HWND hwnd, DXGI_SWAP_CHAIN_DESC1& scDesc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fsDesc, ID3D12CommandQueue* queue, IDXGIFactory2* factory,
+    xefg_swapchain_d3d12_init_params_t& params, int& maxInterpolationCount)
+{
+    const UINT origBufferCount = std::max<UINT>(scDesc.BufferCount, 2u);
+    UINT scaledBufferCount = origBufferCount;
+
+    // Scale backbuffer count to hold a full multi-frame batch without starving the presenter thread
+    if (params.maxInterpolatedFrames > 1)
+        scaledBufferCount = std::clamp<UINT>(params.maxInterpolatedFrames + 2u, origBufferCount, 16u);
+
+    std::array<UINT, 3> candidates {};
+    size_t candidateCount = 0;
+    auto addCandidate = [&](UINT count)
+    {
+        for (size_t i = 0; i < candidateCount; ++i)
+        {
+            if (candidates[i] == count)
+                return;
+        }
+        candidates[candidateCount++] = count;
+    };
+
+    addCandidate(scaledBufferCount);
+    if (scaledBufferCount > 8u)
+        addCandidate(8u);
+    addCandidate(origBufferCount);
+
+    xefg_swapchain_result_t result = XEFG_SWAPCHAIN_RESULT_ERROR_UNKNOWN;
+    for (size_t i = 0; i < candidateCount; ++i)
+    {
+        scDesc.BufferCount = candidates[i];
+        result = XeFGProxy::D3D12InitFromSwapChainDesc()(context, hwnd, &scDesc, fsDesc, queue, factory, &params);
+        if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
+        {
+            if (scDesc.BufferCount != origBufferCount)
+            {
+                LOG_INFO("XeFG: scaled swapchain BufferCount {} -> {} for maxInterpolatedFrames={}", origBufferCount,
+                         scDesc.BufferCount, params.maxInterpolatedFrames);
+            }
+            return result;
+        }
+
+        LOG_WARN("D3D12InitFromSwapChainDesc failed with BufferCount={}, maxInterpolatedFrames={}: {} ({:X})",
+                 scDesc.BufferCount, params.maxInterpolatedFrames, magic_enum::enum_name(result), (UINT) result);
+    }
+
+    if (params.maxInterpolatedFrames > 1)
+    {
+        LOG_WARN("D3D12InitFromSwapChainDesc failed with maxInterpolatedFrames = {}, falling back to 1",
+                 params.maxInterpolatedFrames);
+        params.maxInterpolatedFrames = 1;
+        maxInterpolationCount = 1;
+        scDesc.BufferCount = origBufferCount;
+        result = XeFGProxy::D3D12InitFromSwapChainDesc()(context, hwnd, &scDesc, fsDesc, queue, factory, &params);
+    }
+
+    return result;
+}
+
 bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, DXGI_SWAP_CHAIN_DESC* desc,
                                         IDXGISwapChain** swapChain)
 {
@@ -430,18 +492,8 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
 #endif // !DONT_USE_XMX
 
-    xefg_swapchain_result_t result;
-    result = XeFGProxy::D3D12InitFromSwapChainDesc()(_swapChainContext, hwnd, &scDesc, &fsDesc, realQueue, factory12,
-                                                     &params);
-
-    if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS && params.maxInterpolatedFrames > 1)
-    {
-        LOG_WARN("D3D12InitFromSwapChainDesc failed with maxInterpolatedFrames = {}, falling back to 1", params.maxInterpolatedFrames);
-        params.maxInterpolatedFrames = 1;
-        _maxInterpolationCount = 1;
-        result = XeFGProxy::D3D12InitFromSwapChainDesc()(_swapChainContext, hwnd, &scDesc, &fsDesc, realQueue, factory12,
-                                                         &params);
-    }
+    const xefg_swapchain_result_t result = InitSwapchainWithScaledBuffers(
+        _swapChainContext, hwnd, scDesc, &fsDesc, realQueue, factory12, params, _maxInterpolationCount);
 
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
@@ -450,10 +502,10 @@ bool XeFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueu
     }
 
     LOG_INFO("XeFG swapchain created");
-    result = XeFGProxy::D3D12GetSwapChainPtr()(_swapChainContext, IID_PPV_ARGS(swapChain));
-    if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
+    const xefg_swapchain_result_t scPtrResult = XeFGProxy::D3D12GetSwapChainPtr()(_swapChainContext, IID_PPV_ARGS(swapChain));
+    if (scPtrResult != XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
-        LOG_ERROR("D3D12GetSwapChainPtr error: {} ({})", magic_enum::enum_name(result), (UINT) result);
+        LOG_ERROR("D3D12GetSwapChainPtr error: {} ({})", magic_enum::enum_name(scPtrResult), (UINT) scPtrResult);
         return false;
     }
 
@@ -548,8 +600,9 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
 
     params.maxInterpolatedFrames = _maxInterpolationCount > 0 ? _maxInterpolationCount : 1;
 
+    DXGI_SWAP_CHAIN_DESC1 scDesc = *desc;
     if (Config::Instance()->HDR.value_or(false) || Config::Instance()->UseHDR10.value_or_default())
-        desc->Format = Config::Instance()->UseHDR10.value_or_default() ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        scDesc.Format = Config::Instance()->UseHDR10.value_or_default() ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
 
     params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;
 
@@ -589,17 +642,8 @@ bool XeFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQue
 #ifndef DONT_USE_XMX
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
 #endif // !DONT_USE_XMX
-        result = XeFGProxy::D3D12InitFromSwapChainDesc()(_swapChainContext, hwnd, desc, pFullscreenDesc, realQueue,
-                                                         factory12, &params);
-
-        if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS && params.maxInterpolatedFrames > 1)
-        {
-            LOG_WARN("D3D12InitFromSwapChainDesc failed with maxInterpolatedFrames = {}, falling back to 1", params.maxInterpolatedFrames);
-            params.maxInterpolatedFrames = 1;
-            _maxInterpolationCount = 1;
-            result = XeFGProxy::D3D12InitFromSwapChainDesc()(_swapChainContext, hwnd, desc, pFullscreenDesc, realQueue,
-                                                             factory12, &params);
-        }
+        result = InitSwapchainWithScaledBuffers(
+            _swapChainContext, hwnd, scDesc, pFullscreenDesc, realQueue, factory12, params, _maxInterpolationCount);
     }
 
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
