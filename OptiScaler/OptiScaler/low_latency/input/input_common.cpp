@@ -288,10 +288,8 @@ LowLatencyMode InputCommon::xefg_output(LowLatencyMode configured)
 
 bool InputCommon::xefg_paced()
 {
-    // OptiScaler's XeFG only needs XeLL forced into low latency mode while frame generation is active
-    auto fg = State::Instance().currentFG;
-    return activeOutput == LowLatencyMode::XeLL && State::Instance().activeFgOutput == FGOutput::XeFG &&
-           fg != nullptr && fg->IsActive();
+    // OptiScaler's XeFG paces with XeLL and requires XeLL in low latency mode before SetEnabled(true) succeeds
+    return activeOutput == LowLatencyMode::XeLL && State::Instance().activeFgOutput == FGOutput::XeFG;
 }
 
 LowLatencyInput InputCommon::default_input()
