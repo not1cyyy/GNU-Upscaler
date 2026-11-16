@@ -20,6 +20,81 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 50
+
+      - name: Cache MSBuild Intermediate Files
+        id: msbuild-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            OptiScaler/OptiScaler/x64/Release
+            OptiPatcher/OptiPatcher/x64/Release
+          key: msbuild-x64-release-${{ hashFiles('**/*.vcxproj', '**/*.sln') }}-${{ github.sha }}
+          restore-keys: |
+            msbuild-x64-release-${{ hashFiles('**/*.vcxproj', '**/*.sln') }}-
+
+      - name: Sync Source Timestamps for Incremental MSBuild
+        shell: pwsh
+        run: |
+          $intDirs = @("OptiScaler/OptiScaler/x64/Release", "OptiPatcher/OptiPatcher/x64/Release")
+          $shaFile = "OptiScaler/OptiScaler/x64/Release/.cached_sha"
+          $cachedSha = if (Test-Path $shaFile) { (Get-Content $shaFile -Raw).Trim() } else { "" }
+          $hasValidBase = $false
+          if ($cachedSha -match '^[0-9a-f]{40}$') {
+              git cat-file -e "${cachedSha}^{commit}" 2>$null
+              $hasValidBase = ($LASTEXITCODE -eq 0)
+          }
+
+          if (-not $hasValidBase) {
+              Write-Host "No usable incremental cache base found; performing clean build."
+              foreach ($dir in $intDirs) {
+                  if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+              }
+              exit 0
+          }
+
+          $now = [DateTime]::UtcNow
+          $oldSourceTime = $now.AddHours(-2)
+          $pchTime = $now.AddMinutes(-90)
+          $objTime = $now.AddMinutes(-60)
+
+          # Set baseline timestamps: unchanged sources < PCH < OBJs/tlogs
+          foreach ($root in @("OptiScaler", "OptiPatcher")) {
+              if (Test-Path $root) {
+                  Get-ChildItem -Path $root -Recurse -File | ForEach-Object {
+                      if ($_.FullName -notmatch '\\x64\\Release\\') {
+                          $_.LastWriteTimeUtc = $oldSourceTime
+                      }
+                  }
+              }
+          }
+          foreach ($dir in $intDirs) {
+              if (Test-Path $dir) {
+                  Get-ChildItem -Path $dir -Recurse -File | ForEach-Object {
+                      if ($_.Extension -in @('.pch', '.ipch', '.idb')) {
+                          $_.LastWriteTimeUtc = $pchTime
+                      } else {
+                          $_.LastWriteTimeUtc = $objTime
+                      }
+                  }
+              }
+          }
+
+          # Touch files changed since the cached commit so MSBuild recompiles them and dependents
+          $changed = git diff --name-only "$cachedSha" HEAD
+          Write-Host "Cached base: $cachedSha -> HEAD ($($env:GITHUB_SHA))"
+          foreach ($rel in $changed) {
+              if (-not $rel) { continue }
+              Write-Host "Changed: $rel"
+              if (Test-Path -LiteralPath $rel -PathType Container) {
+                  # Submodule pointer updated: touch all files inside that submodule
+                  Get-ChildItem -LiteralPath $rel -Recurse -File | ForEach-Object {
+                      $_.LastWriteTimeUtc = $now
+                  }
+              } elseif (Test-Path -LiteralPath $rel -PathType Leaf) {
+                  (Get-Item -LiteralPath $rel).LastWriteTimeUtc = $now
+              }
+          }
 
       - name: Add 7-Zip to PATH
         shell: pwsh
@@ -40,6 +115,12 @@ jobs:
         shell: cmd
         run: |
           msbuild /m /p:Configuration=Release /p:Platform=x64 OptiPatcher.sln /verbosity:minimal
+
+      - name: Record Cached Commit SHA
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "OptiScaler/OptiScaler/x64/Release" | Out-Null
+          $env:GITHUB_SHA | Set-Content -Path "OptiScaler/OptiScaler/x64/Release/.cached_sha" -NoNewline -Encoding ASCII
 
       - name: Prepare Artifacts
         shell: pwsh

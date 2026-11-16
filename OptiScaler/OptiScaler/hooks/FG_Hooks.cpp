@@ -827,19 +827,6 @@ HRESULT FGHooks::hkGetFullscreenState(IDXGISwapChain* This, BOOL* pFullscreen, I
     return result;
 }
 
-static void PreserveXeFGBufferCount(IDXGISwapChain* swapchain, UINT& bufferCount)
-{
-    if (State::Instance().activeFgOutput != FGOutput::XeFG || swapchain == nullptr || bufferCount == 0)
-        return;
-
-    DXGI_SWAP_CHAIN_DESC desc {};
-    if (swapchain->GetDesc(&desc) == S_OK && desc.BufferCount > bufferCount)
-    {
-        LOG_DEBUG("XeFG: preserving scaled BufferCount {} (requested {})", desc.BufferCount, bufferCount);
-        bufferCount = desc.BufferCount;
-    }
-}
-
 HRESULT FGHooks::hkResizeBuffers(IDXGISwapChain* This, UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat,
                                  UINT SwapChainFlags)
 {
@@ -895,8 +882,6 @@ HRESULT FGHooks::hkResizeBuffers(IDXGISwapChain* This, UINT BufferCount, UINT Wi
         LOG_DEBUG("Keeping DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING for DLSSG");
         SwapChainFlags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     }
-
-    PreserveXeFGBufferCount(This, BufferCount);
 
     LOG_DEBUG("BufferCount: {}, Width: {}, Height: {}, NewFormat:{}, SwapChainFlags: {:X}", BufferCount, Width, Height,
               (UINT) NewFormat, SwapChainFlags);
@@ -1121,8 +1106,6 @@ HRESULT FGHooks::hkResizeBuffers1(IDXGISwapChain3* This, UINT BufferCount, UINT 
         LOG_DEBUG("Keeping DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING for DLSSG");
         SwapChainFlags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     }
-
-    PreserveXeFGBufferCount(This, BufferCount);
 
     LOG_DEBUG("BufferCount: {}, Width: {}, Height: {}, NewFormat:{}, SwapChainFlags: {:X}, Caller: {}", BufferCount,
               Width, Height, (UINT) Format, SwapChainFlags, Util::WhoIsTheCaller(_ReturnAddress()));
