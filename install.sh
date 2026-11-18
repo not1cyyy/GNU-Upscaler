@@ -249,9 +249,16 @@ resolve_game_bin_dir() {
         return 0
     fi
 
-    # 1. Unreal Engine check: <Game>/Binaries/Win64
-    local ue_bin
-    ue_bin="$(find "$target" -maxdepth 3 -type d -path "*/Binaries/Win64" 2>/dev/null | head -n 1 || true)"
+    # 1. Unreal Engine check: <Game>/Binaries/Win64 (supporting nested paths like Client/WindowsNoEditor/HT/Binaries/Win64)
+    local ue_bin=""
+    while IFS= read -r dir; do
+        if find "$dir" -maxdepth 1 -type f -iname "*.exe" \
+            -not -iname "*Crash*" -not -iname "*Helper*" -not -iname "ACE-*" 2>/dev/null | grep -q .; then
+            ue_bin="$dir"
+            break
+        fi
+        [[ -z "$ue_bin" ]] && ue_bin="$dir"
+    done < <(find "$target" -maxdepth 6 -type d -path "*/Binaries/Win64" -not -path "*/Engine/*" 2>/dev/null | sort)
     if [[ -n "$ue_bin" && -d "$ue_bin" ]]; then
         echo "$ue_bin"
         return 0
@@ -263,22 +270,27 @@ resolve_game_bin_dir() {
         return 0
     fi
 
-    # 3. Direct executable in the folder root
-    if compgen -G "$target/*.exe" > /dev/null 2>&1; then
-        echo "$target"
-        return 0
-    fi
-
-    # 4. Search for a Shipping .exe or main .exe up to depth 3
-    local found_exe
-    found_exe="$(find "$target" -maxdepth 3 -type f -name "*Shipping.exe" -not -path "*/Engine/*" 2>/dev/null | head -n 1 || true)"
+    # 3. Search for a game .exe in deeper subdirectories before falling back to a root launcher .exe
+    local found_exe=""
+    found_exe="$(find "$target" -maxdepth 6 -type f \( -iname "*Win64-Shipping.exe" -o -iname "*Shipping.exe" \) \
+        -not -path "*/Engine/*" -not -path "*/AntiCheatExpert/*" 2>/dev/null | head -n 1 || true)"
     if [[ -z "$found_exe" ]]; then
-        found_exe="$(find "$target" -maxdepth 3 -type f -name "*.exe" \
-            -not -path "*/Engine/*" -not -name "*CrashReport*" -not -name "*DirectX*" 2>/dev/null | head -n 1 || true)"
+        found_exe="$(find "$target" -mindepth 2 -maxdepth 6 -type f -iname "*.exe" \
+            -not -path "*/Engine/*" -not -path "*/AntiCheatExpert/*" -not -path "*/_Redist/*" \
+            -not -iname "*Crash*" -not -iname "*DirectX*" -not -iname "*Launcher*" \
+            -not -iname "*Update*" -not -iname "*Browser*" -not -iname "*WebBooster*" \
+            -not -iname "*Helper*" -not -iname "*unins*" -not -iname "*setup*" \
+            -not -iname "*vc_redist*" 2>/dev/null | head -n 1 || true)"
     fi
 
     if [[ -n "$found_exe" ]]; then
         dirname "$found_exe"
+        return 0
+    fi
+
+    # 4. Direct executable in the folder root
+    if compgen -G "$target/*.exe" > /dev/null 2>&1; then
+        echo "$target"
         return 0
     fi
 
@@ -332,7 +344,8 @@ for g in games:
 if [[ -z "$TARGET_PATH" ]]; then
     # Check if current working directory looks like a game
     CWD="$(pwd)"
-    if compgen -G "$CWD/*.exe" > /dev/null 2>&1 || [[ -d "$CWD/Binaries/Win64" ]] || [[ -d "$CWD/bin/x64" ]]; then
+    if compgen -G "$CWD/*.exe" > /dev/null 2>&1 || [[ -d "$CWD/Binaries/Win64" ]] || [[ -d "$CWD/bin/x64" ]] || \
+       find "$CWD" -maxdepth 6 -type d -path "*/Binaries/Win64" -not -path "*/Engine/*" 2>/dev/null | grep -q .; then
         echo -e "${BOLD}Current directory appears to be a game folder:${RESET}"
         echo "  $CWD"
         prompt_read "Install GNU-Upscaler into this folder? [Y/n]: " reply
