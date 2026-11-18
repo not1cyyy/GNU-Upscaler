@@ -970,6 +970,36 @@ class Keybind
     }
 };
 
+static void ApplyUpscalerSelection(API api, Upscaler target)
+{
+    auto config = Config::Instance();
+    auto& state = State::Instance();
+
+    if (target == Upscaler::XeSS)
+    {
+        config->DisableReactiveMask.reset();
+        config->DlssReactiveMaskBias.reset();
+    }
+
+    if (!state.changeBackend.empty())
+    {
+        state.newBackend = target;
+        MARK_ALL_BACKENDS_CHANGED();
+    }
+    else
+    {
+        if (api == DX11)
+            config->Dx11Upscaler = target;
+        else if (api == DX12)
+            config->Dx12Upscaler = target;
+        else
+            config->VulkanUpscaler = target;
+
+        state.newBackend = Upscaler::Reset;
+        config->SaveIni();
+    }
+}
+
 Upscaler MenuCommon::GetBackendCode(const API api)
 {
     if (auto feature = State::Instance().currentFeature)
@@ -980,7 +1010,14 @@ Upscaler MenuCommon::GetBackendCode(const API api)
     if (api == DX11)
         upscaler = Config::Instance()->Dx11Upscaler.value_or_default();
     else if (api == DX12)
-        upscaler = Config::Instance()->Dx12Upscaler.value_or_default();
+    {
+        if (Config::Instance()->Dx12Upscaler.has_value())
+            upscaler = Config::Instance()->Dx12Upscaler.value();
+        else if (IdentifyGpu::getPrimaryGpu().fsr4Support != FSR4Support::None)
+            upscaler = Upscaler::FFX;
+        else
+            upscaler = Config::Instance()->Dx12Upscaler.value_or_default();
+    }
     else
         upscaler = Config::Instance()->VulkanUpscaler.value_or_default();
 
@@ -1251,7 +1288,7 @@ void MenuCommon::RenderUpscalerCombo(const API api, Upscaler currentUpscaler, co
             State::Instance().newBackend = entry.upscaler;
 
             // Regular and custom entries share an upscaler type, which the backend change check compares,
-            // so a switch between them is marked here
+            // so a switch between them is applied directly here
             if (auto customSetting = CustomUpscalerSetting(api);
                 !selected && (entry.upscaler == Upscaler::FFX || entry.upscaler == Upscaler::DLSS) &&
                 customSetting != nullptr && entry.custom != customSetting->value_or(""))
@@ -1261,7 +1298,7 @@ void MenuCommon::RenderUpscalerCombo(const API api, Upscaler currentUpscaler, co
                 else
                     *customSetting = entry.custom;
 
-                MARK_ALL_BACKENDS_CHANGED();
+                ApplyUpscalerSelection(api, entry.upscaler);
             }
         }
 
@@ -3894,20 +3931,12 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
     {
         ImGui::SameLine();
         const bool hasPendingChange = state.newBackend != Upscaler::Reset && state.newBackend != currentBackend;
-        if (GnuUi::Button("Apply Upscaler", ImVec2(0.0f, 0.0f), hasPendingChange))
-        {
-            if (hasPendingChange)
-            {
-                if (state.newBackend == Upscaler::XeSS)
-                {
-                    config->DisableReactiveMask.reset();
-                    config->DlssReactiveMaskBias.reset();
-                }
-
-                MARK_ALL_BACKENDS_CHANGED();
-            }
-        }
-        GnuUi::Help("Applies the newly selected upscaler backend");
+        ImGui::BeginDisabled(!hasPendingChange);
+        if (GnuUi::Button("Apply Upscaler", ImVec2(0.0f, 0.0f), hasPendingChange) && hasPendingChange)
+            ApplyUpscalerSelection(state.api, state.newBackend);
+        ImGui::EndDisabled();
+        GnuUi::Help(hasPendingChange ? "Applies the newly selected upscaler backend"
+                                     : "Select a different target upscaler above first");
 
         if (hasPendingChange)
         {
@@ -4071,8 +4100,7 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                         ffxIndex != n)
                     {
                         upscalerIndex = n;
-                        state.newBackend = currentBackend;
-                        MARK_ALL_BACKENDS_CHANGED();
+                        ApplyUpscalerSelection(state.api, currentBackend);
                     }
                 }
 

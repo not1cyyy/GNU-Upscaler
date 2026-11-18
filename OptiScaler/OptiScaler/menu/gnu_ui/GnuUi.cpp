@@ -299,8 +299,8 @@ bool Button(const char* label, const ImVec2& size, bool selected)
     {
         const ImVec4 fill = MenuCommon::ThemeColor(MenuColor::Selected);
         ImGui::PushStyleColor(ImGuiCol_Button, fill);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, fill);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, MenuCommon::ThemeColor(MenuColor::CheckOn));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, MenuCommon::ThemeColor(MenuColor::CheckOn));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, MenuCommon::ThemeColor(MenuColor::Fill));
         colors += 3;
     }
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
