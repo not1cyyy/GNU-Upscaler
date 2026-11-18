@@ -101,6 +101,54 @@ jobs:
         run: |
           "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Append
 
+      - name: Cache Intel XeSS Runtime DLLs
+        uses: actions/cache@v4
+        with:
+          path: OptiScaler/external/xess/bin
+          key: xess-sdk-bin-v3.0.2-v1
+
+      - name: Fetch Intel XeSS Runtime DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $binDir = "OptiScaler\external\xess\bin"
+          New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+
+          $xessDlls = [ordered]@{
+              "libxess_fg.dll"   = "ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27"
+              "libxell.dll"      = "d2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7"
+              "libxess.dll"      = "251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7"
+              "libxess_dx11.dll" = "c7cfe86f0c9d94e4fb3696d3cd5035e2bbb6a8b1b0572f8b7395a4cdfd0c625e"
+          }
+
+          foreach ($entry in $xessDlls.GetEnumerator()) {
+              $dllName = $entry.Key
+              $expectedHash = $entry.Value.ToUpperInvariant()
+              $dst = Join-Path $binDir $dllName
+
+              if (Test-Path $dst) {
+                  $actualHash = (Get-FileHash -Path $dst -Algorithm SHA256).Hash.ToUpperInvariant()
+                  if ($actualHash -eq $expectedHash) {
+                      Write-Host "$dllName verified from cache ($actualHash)"
+                      continue
+                  }
+                  Write-Warning "$dllName hash mismatch ($actualHash != $expectedHash); re-downloading"
+                  Remove-Item -Path $dst -Force
+              }
+
+              $url = "https://raw.githubusercontent.com/intel/xess/v3.0.2/bin/$dllName"
+              Write-Host "Downloading $dllName from $url..."
+              Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+
+              $actualHash = (Get-FileHash -Path $dst -Algorithm SHA256).Hash.ToUpperInvariant()
+              if ($actualHash -ne $expectedHash) {
+                  Remove-Item -Path $dst -Force -ErrorAction SilentlyContinue
+                  throw "$dllName SHA-256 verification failed: expected $expectedHash, got $actualHash"
+              }
+              Write-Host "$dllName downloaded and verified ($actualHash)"
+          }
+
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
@@ -159,7 +207,7 @@ jobs:
               if (Test-Path $src) {
                   Copy-Item -Path $src -Destination ".\dist\$xessDll" -Force
               } else {
-                  Write-Warning "$xessDll not found at $src"
+                  throw "Required Intel XeSS runtime DLL not found at $src"
               }
           }
           
