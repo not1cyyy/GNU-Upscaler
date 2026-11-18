@@ -2165,17 +2165,46 @@ static void CheckForPatch()
     }
 
     // Ratchet & Clank: Rift Apart (Nixxes)
-    // DLSS check is vendor locked, but DLSSG and Reflex already work with Streamline spoofing
+    // DLSS/Reflex checks are vendor locked, and Nixxes disables Streamline when WINELOADER is set (Wine/Proton)
     else if (exeName == "riftapart.exe")
     {
-        std::string_view pattern("FF 92 98 00 00 00 45 33 E4 83 F8 03");
-        auto patchAddress = (void*) scanner::GetAddress(exeModule, pattern, 9);
+        std::vector<BYTE> cmpPatch = { 0x39, 0xC0, 0x90 }; // cmp eax, eax; nop
 
-        if (patchAddress != nullptr)
+        // Unlock DLSS vendor check (legacy + v1.727.0.0 layouts)
+        void* dlssPatchAddress = (void*) scanner::GetAddress(
+            exeModule, std::string_view("FF 92 98 00 00 00 45 33 E4 83 F8 03"), 9);
+        if (dlssPatchAddress == nullptr)
         {
-            std::vector<BYTE> patch = { 0x39, 0xC0, 0x90 };
-            patcher::PatchAddress(patchAddress, &patch);
+            dlssPatchAddress = (void*) scanner::GetAddress(
+                exeModule, std::string_view("FF 92 98 00 00 00 83 F8 03 0F 85 ? ? ? 00 4C 89 A4 24 10 02 00 00"), 6);
+        }
+        if (dlssPatchAddress != nullptr)
+        {
+            patcher::PatchAddress(dlssPatchAddress, &cmpPatch);
             _patchResult = true;
+        }
+
+        // Unlock Reflex vendor check (required when enabling DLSS-G)
+        if (void* reflexPatchAddress = (void*) scanner::GetAddress(
+                exeModule, std::string_view("FF 92 98 00 00 00 83 F8 03 0F 85 ? ? 00 00 E8 ? ? FB FF"), 6);
+            reflexPatchAddress != nullptr)
+        {
+            patcher::PatchAddress(reflexPatchAddress, &cmpPatch);
+        }
+
+        // Bypass WINELOADER Streamline disable check on Wine/Proton
+        if (auto wineCheckAddr = scanner::GetAddress(
+                exeModule, std::string_view("48 8D 0D ? ? ? ? FF 15 ? ? ? ? 48 85 C0 0F 85 ? ? 00 00"), 0);
+            wineCheckAddr != 0)
+        {
+            const auto* code = reinterpret_cast<const BYTE*>(wineCheckAddr);
+            const auto disp = *reinterpret_cast<const int32_t*>(code + 3);
+            const auto* envName = reinterpret_cast<const char*>(wineCheckAddr + 7 + disp);
+            if (std::string_view(envName) == "WINELOADER")
+            {
+                std::vector<BYTE> nopJne(6, 0x90);
+                patcher::PatchAddress(reinterpret_cast<void*>(wineCheckAddr + 16), &nopJne);
+            }
         }
     }
 
