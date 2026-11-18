@@ -1000,6 +1000,7 @@ void HookFSR2ExeInputs()
         return;
     }
 
+    std::scoped_lock lock(Util::DetourTransactionMutex());
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
@@ -1296,86 +1297,117 @@ void HookFSR2Inputs(HMODULE module)
 {
     LOG_INFO("Trying to hook FSR2 methods");
 
-    if (module != nullptr)
+    if (module == nullptr)
+        return;
+
+    std::scoped_lock lock(Util::DetourTransactionMutex());
+
+    static HMODULE _hookedModule = nullptr;
+    if (module == _hookedModule)
+        return;
+
+    bool attached = false;
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+
+    if (o_ffxFsr2ContextCreate_Dx12 == nullptr)
     {
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
+        o_ffxFsr2ContextCreate_Dx12 =
+            (PFN_ffxFsr2ContextCreate) KernelBaseProxy::GetProcAddress_()(module, "ffxFsr2ContextCreate");
 
-        if (o_ffxFsr2ContextCreate_Dx12 == nullptr)
+        if (o_ffxFsr2ContextCreate_Dx12 != nullptr)
         {
-            o_ffxFsr2ContextCreate_Dx12 =
-                (PFN_ffxFsr2ContextCreate) KernelBaseProxy::GetProcAddress_()(module, "ffxFsr2ContextCreate");
-
-            if (o_ffxFsr2ContextCreate_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr2ContextCreate_Dx12, ffxFsr2ContextCreate_Dx12);
-
-            LOG_DEBUG("ffxFsr2ContextCreate_Dx12: {:X}", (size_t) o_ffxFsr2ContextCreate_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr2ContextCreate_Dx12, ffxFsr2ContextCreate_Dx12);
+            attached = true;
         }
 
-        if (o_ffxFsr2ContextDispatch_Dx12 == nullptr)
+        LOG_DEBUG("ffxFsr2ContextCreate_Dx12: {:X}", (size_t) o_ffxFsr2ContextCreate_Dx12);
+    }
+
+    if (o_ffxFsr2ContextDispatch_Dx12 == nullptr)
+    {
+        o_ffxFsr2ContextDispatch_Dx12 =
+            (PFN_ffxFsr2ContextDispatch) KernelBaseProxy::GetProcAddress_()(module, "ffxFsr2ContextDispatch");
+
+        if (o_ffxFsr2ContextDispatch_Dx12 != nullptr)
         {
-            o_ffxFsr2ContextDispatch_Dx12 =
-                (PFN_ffxFsr2ContextDispatch) KernelBaseProxy::GetProcAddress_()(module, "ffxFsr2ContextDispatch");
-
-            if (o_ffxFsr2ContextDispatch_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr2ContextDispatch_Dx12, ffxFsr2ContextDispatch_Dx12);
-
-            LOG_DEBUG("ffxFsr2ContextDispatch_Dx12: {:X}", (size_t) o_ffxFsr2ContextDispatch_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr2ContextDispatch_Dx12, ffxFsr2ContextDispatch_Dx12);
+            attached = true;
         }
 
-        if (o_ffxFsr2ContextDestroy_Dx12 == nullptr)
+        LOG_DEBUG("ffxFsr2ContextDispatch_Dx12: {:X}", (size_t) o_ffxFsr2ContextDispatch_Dx12);
+    }
+
+    if (o_ffxFsr2ContextDestroy_Dx12 == nullptr)
+    {
+        o_ffxFsr2ContextDestroy_Dx12 =
+            (PFN_ffxFsr2ContextDestroy) KernelBaseProxy::GetProcAddress_()(module, "ffxFsr2ContextDestroy");
+
+        if (o_ffxFsr2ContextDestroy_Dx12 != nullptr)
         {
-            o_ffxFsr2ContextDestroy_Dx12 =
-                (PFN_ffxFsr2ContextDestroy) KernelBaseProxy::GetProcAddress_()(module, "ffxFsr2ContextDestroy");
-
-            if (o_ffxFsr2ContextDestroy_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr2ContextDestroy_Dx12, ffxFsr2ContextDestroy_Dx12);
-
-            LOG_DEBUG("ffxFsr2ContextDestroy_Dx12: {:X}", (size_t) o_ffxFsr2ContextDestroy_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr2ContextDestroy_Dx12, ffxFsr2ContextDestroy_Dx12);
+            attached = true;
         }
 
-        if (o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12 == nullptr)
+        LOG_DEBUG("ffxFsr2ContextDestroy_Dx12: {:X}", (size_t) o_ffxFsr2ContextDestroy_Dx12);
+    }
+
+    if (o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12 == nullptr)
+    {
+        o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12 = (PFN_ffxFsr2GetUpscaleRatioFromQualityMode)
+            KernelBaseProxy::GetProcAddress_()(module, "ffxFsr2GetUpscaleRatioFromQualityMode");
+
+        if (o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12 != nullptr)
         {
-            o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12 =
-                (PFN_ffxFsr2GetUpscaleRatioFromQualityMode) KernelBaseProxy::GetProcAddress_()(
-                    module, "ffxFsr2GetUpscaleRatioFromQualityMode");
-
-            if (o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12,
-                             ffxFsr2GetUpscaleRatioFromQualityMode_Dx12);
-
-            LOG_DEBUG("ffxFsr2GetUpscaleRatioFromQualityMode_Dx12: {:X}",
-                      (size_t) o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12,
+                         ffxFsr2GetUpscaleRatioFromQualityMode_Dx12);
+            attached = true;
         }
 
-        if (o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12 == nullptr)
+        LOG_DEBUG("ffxFsr2GetUpscaleRatioFromQualityMode_Dx12: {:X}",
+                  (size_t) o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12);
+    }
+
+    if (o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12 == nullptr)
+    {
+        o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12 = (PFN_ffxFsr2GetRenderResolutionFromQualityMode)
+            KernelBaseProxy::GetProcAddress_()(module, "ffxFsr2GetRenderResolutionFromQualityMode");
+
+        if (o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12 != nullptr)
         {
-            o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12 =
-                (PFN_ffxFsr2GetRenderResolutionFromQualityMode) KernelBaseProxy::GetProcAddress_()(
-                    module, "ffxFsr2GetRenderResolutionFromQualityMode");
-
-            if (o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12,
-                             ffxFsr2GetRenderResolutionFromQualityMode_Dx12);
-
-            LOG_DEBUG("ffxFsr2GetRenderResolutionFromQualityMode_Dx12: {:X}",
-                      (size_t) o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12,
+                         ffxFsr2GetRenderResolutionFromQualityMode_Dx12);
+            attached = true;
         }
 
-        auto detourResult = DetourTransactionCommit();
-        if (detourResult != NO_ERROR)
+        LOG_DEBUG("ffxFsr2GetRenderResolutionFromQualityMode_Dx12: {:X}",
+                  (size_t) o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12);
+    }
+
+    auto detourResult = DetourTransactionCommit();
+    if (detourResult != NO_ERROR)
+    {
+        LOG_ERROR("Failed to install FSR2 hooks: {:X}", detourResult);
+        o_ffxFsr2ContextCreate_Dx12 = nullptr;
+        o_ffxFsr2ContextDispatch_Dx12 = nullptr;
+        o_ffxFsr2ContextDestroy_Dx12 = nullptr;
+        o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12 = nullptr;
+        o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12 = nullptr;
+    }
+    else
+    {
+        if (attached)
         {
-            LOG_ERROR("Failed to install FSR2 hooks: {:X}", detourResult);
-            o_ffxFsr2ContextCreate_Dx12 = nullptr;
-            o_ffxFsr2ContextDispatch_Dx12 = nullptr;
-            o_ffxFsr2ContextDestroy_Dx12 = nullptr;
-            o_ffxFsr2GetUpscaleRatioFromQualityMode_Dx12 = nullptr;
-            o_ffxFsr2GetRenderResolutionFromQualityMode_Dx12 = nullptr;
+            _hookedModule = module;
+
+            // Pin the dll so FreeLibrary probes cannot unmap detoured exports and leave stale pointers
+            HMODULE pinned = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                               (LPCWSTR) module, &pinned);
         }
-        else
-        {
-            State::Instance().fsrHooks = o_ffxFsr2ContextCreate_Dx12 != nullptr;
-        }
+
+        State::Instance().fsrHooks = o_ffxFsr2ContextCreate_Dx12 != nullptr;
     }
 }
 

@@ -676,6 +676,7 @@ void HookFSR3ExeInputs()
 {
     LOG_INFO("Trying to hook FSR3 methods");
 
+    std::scoped_lock lock(Util::DetourTransactionMutex());
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
@@ -853,89 +854,119 @@ void HookFSR3Inputs(HMODULE module)
 {
     LOG_INFO("Trying to hook FSR3 methods");
 
-    if (module != nullptr)
+    if (module == nullptr)
+        return;
+
+    std::scoped_lock lock(Util::DetourTransactionMutex());
+
+    static HMODULE _hookedModule = nullptr;
+    if (module == _hookedModule)
+        return;
+
+    bool attached = false;
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+
+    if (o_ffxFsr3UpscalerContextCreate_Dx12 == nullptr)
     {
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
+        o_ffxFsr3UpscalerContextCreate_Dx12 =
+            (PFN_ffxFsr3UpscalerContextCreate) KernelBaseProxy::GetProcAddress_()(module, "ffxFsr3UpscalerContextCreate");
 
-        if (o_ffxFsr3UpscalerContextCreate_Dx12 == nullptr)
+        if (o_ffxFsr3UpscalerContextCreate_Dx12 != nullptr)
         {
-            o_ffxFsr3UpscalerContextCreate_Dx12 = (PFN_ffxFsr3UpscalerContextCreate) KernelBaseProxy::GetProcAddress_()(
-                module, "ffxFsr3UpscalerContextCreate");
-
-            if (o_ffxFsr3UpscalerContextCreate_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr3UpscalerContextCreate_Dx12, ffxFsr3ContextCreate_Dx12);
-
-            LOG_DEBUG("ffxFsr3UpscalerContextCreate_Dx12: {:X}", (size_t) o_ffxFsr3UpscalerContextCreate_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr3UpscalerContextCreate_Dx12, ffxFsr3ContextCreate_Dx12);
+            attached = true;
         }
 
-        if (o_ffxFsr3UpscalerContextDispatch_Dx12 == nullptr)
+        LOG_DEBUG("ffxFsr3UpscalerContextCreate_Dx12: {:X}", (size_t) o_ffxFsr3UpscalerContextCreate_Dx12);
+    }
+
+    if (o_ffxFsr3UpscalerContextDispatch_Dx12 == nullptr)
+    {
+        o_ffxFsr3UpscalerContextDispatch_Dx12 = (PFN_ffxFsr3UpscalerContextDispatch)
+            KernelBaseProxy::GetProcAddress_()(module, "ffxFsr3UpscalerContextDispatch");
+
+        if (o_ffxFsr3UpscalerContextDispatch_Dx12 != nullptr)
         {
-            o_ffxFsr3UpscalerContextDispatch_Dx12 =
-                (PFN_ffxFsr3UpscalerContextDispatch) KernelBaseProxy::GetProcAddress_()(
-                    module, "ffxFsr3UpscalerContextDispatch");
-
-            if (o_ffxFsr3UpscalerContextDispatch_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr3UpscalerContextDispatch_Dx12, ffxFsr3ContextDispatch_Dx12);
-
-            LOG_DEBUG("ffxFsr3UpscalerContextDispatch_Dx12: {:X}", (size_t) o_ffxFsr3UpscalerContextDispatch_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr3UpscalerContextDispatch_Dx12, ffxFsr3ContextDispatch_Dx12);
+            attached = true;
         }
 
-        if (o_ffxFsr3UpscalerContextDestroy_Dx12 == nullptr)
+        LOG_DEBUG("ffxFsr3UpscalerContextDispatch_Dx12: {:X}", (size_t) o_ffxFsr3UpscalerContextDispatch_Dx12);
+    }
+
+    if (o_ffxFsr3UpscalerContextDestroy_Dx12 == nullptr)
+    {
+        o_ffxFsr3UpscalerContextDestroy_Dx12 = (PFN_ffxFsr3UpscalerContextDestroy)
+            KernelBaseProxy::GetProcAddress_()(module, "ffxFsr3UpscalerContextDestroy");
+
+        if (o_ffxFsr3UpscalerContextDestroy_Dx12 != nullptr)
         {
-            o_ffxFsr3UpscalerContextDestroy_Dx12 =
-                (PFN_ffxFsr3UpscalerContextDestroy) KernelBaseProxy::GetProcAddress_()(module,
-                                                                                       "ffxFsr3UpscalerContextDestroy");
-
-            if (o_ffxFsr3UpscalerContextDestroy_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr3UpscalerContextDestroy_Dx12, ffxFsr3ContextDestroy_Dx12);
-
-            LOG_DEBUG("ffxFsr3UpscalerContextDestroy_Dx12: {:X}", (size_t) o_ffxFsr3UpscalerContextDestroy_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr3UpscalerContextDestroy_Dx12, ffxFsr3ContextDestroy_Dx12);
+            attached = true;
         }
 
-        if (o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12 == nullptr)
+        LOG_DEBUG("ffxFsr3UpscalerContextDestroy_Dx12: {:X}", (size_t) o_ffxFsr3UpscalerContextDestroy_Dx12);
+    }
+
+    if (o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12 == nullptr)
+    {
+        o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12 = (PFN_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode)
+            KernelBaseProxy::GetProcAddress_()(module, "ffxFsr3UpscalerGetUpscaleRatioFromQualityMode");
+
+        if (o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12 != nullptr)
         {
-            o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12 =
-                (PFN_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode) KernelBaseProxy::GetProcAddress_()(
-                    module, "ffxFsr3UpscalerGetUpscaleRatioFromQualityMode");
-
-            if (o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12,
-                             ffxFsr3GetUpscaleRatioFromQualityMode_Dx12);
-
-            LOG_DEBUG("ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12: {:X}",
-                      (size_t) o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12,
+                         ffxFsr3GetUpscaleRatioFromQualityMode_Dx12);
+            attached = true;
         }
 
-        if (o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12 == nullptr)
+        LOG_DEBUG("ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12: {:X}",
+                  (size_t) o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12);
+    }
+
+    if (o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12 == nullptr)
+    {
+        o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12 =
+            (PFN_ffxFsr3UpscalerGetRenderResolutionFromQualityMode) KernelBaseProxy::GetProcAddress_()(
+                module, "ffxFsr3UpscalerGetRenderResolutionFromQualityMode");
+
+        if (o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12 != nullptr)
         {
-            o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12 =
-                (PFN_ffxFsr3UpscalerGetRenderResolutionFromQualityMode) KernelBaseProxy::GetProcAddress_()(
-                    module, "ffxFsr3UpscalerGetRenderResolutionFromQualityMode");
-
-            if (o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12 != nullptr)
-                DetourAttach(&(PVOID&) o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12,
-                             ffxFsr3GetRenderResolutionFromQualityMode_Dx12);
-
-            LOG_DEBUG("ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12: {:X}",
-                      (size_t) o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12);
+            DetourAttach(&(PVOID&) o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12,
+                         ffxFsr3GetRenderResolutionFromQualityMode_Dx12);
+            attached = true;
         }
 
-        auto detourResult = DetourTransactionCommit();
-        if (detourResult != NO_ERROR)
+        LOG_DEBUG("ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12: {:X}",
+                  (size_t) o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12);
+    }
+
+    auto detourResult = DetourTransactionCommit();
+    if (detourResult != NO_ERROR)
+    {
+        LOG_ERROR("DetourTransactionCommit failed: {:X}", detourResult);
+        o_ffxFSR3GetInterfaceDX12 = nullptr;
+        o_ffxFsr3UpscalerContextCreate_Dx12 = nullptr;
+        o_ffxFsr3UpscalerContextDispatch_Dx12 = nullptr;
+        o_ffxFsr3UpscalerContextDestroy_Dx12 = nullptr;
+        o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12 = nullptr;
+        o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12 = nullptr;
+    }
+    else
+    {
+        if (attached)
         {
-            LOG_ERROR("DetourTransactionCommit failed: {:X}", detourResult);
-            o_ffxFSR3GetInterfaceDX12 = nullptr;
-            o_ffxFsr3UpscalerContextCreate_Dx12 = nullptr;
-            o_ffxFsr3UpscalerContextDispatch_Dx12 = nullptr;
-            o_ffxFsr3UpscalerContextDestroy_Dx12 = nullptr;
-            o_ffxFsr3UpscalerGetUpscaleRatioFromQualityMode_Dx12 = nullptr;
-            o_ffxFsr3UpscalerGetRenderResolutionFromQualityMode_Dx12 = nullptr;
+            _hookedModule = module;
+
+            // Pin the dll so FreeLibrary probes cannot unmap detoured exports and leave stale pointers
+            HMODULE pinned = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                               (LPCWSTR) module, &pinned);
         }
-        else
-        {
-            State::Instance().fsrHooks = o_ffxFsr3UpscalerContextCreate_Dx12 != nullptr;
-        }
+
+        State::Instance().fsrHooks = o_ffxFsr3UpscalerContextCreate_Dx12 != nullptr;
     }
 }
 
