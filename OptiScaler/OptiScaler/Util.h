@@ -2,6 +2,7 @@
 #include "SysUtils.h"
 
 #include <filesystem>
+#include <mutex>
 
 #include <dxgi1_6.h>
 #include <d3d11.h>
@@ -70,6 +71,7 @@ std::map<Luid, std::filesystem::path> GetDriverStore();
 uint64_t GetTimestamp();
 
 void SetFlagEnvVar(const wchar_t* name, bool enabled);
+std::mutex& DetourTransactionMutex();
 
 template <typename T> void DelayedDestroy(std::unique_ptr<T> ptr)
 {

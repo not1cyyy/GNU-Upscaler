@@ -2,6 +2,7 @@
 #include "input_system_internal.h"
 
 #include <Config.h>
+#include <Util.h>
 #include <include/imgui/imgui.h>
 
 namespace OptiInput
@@ -58,11 +59,7 @@ DirectInputDeviceRelease_t o_DirectInputDeviceRelease = nullptr;
 
 thread_local int bypassHookDepth = 0;
 
-std::mutex& GetDetourTransactionMutex()
-{
-    static std::mutex mutex;
-    return mutex;
-}
+std::mutex& GetDetourTransactionMutex() { return Util::DetourTransactionMutex(); }
 
 bool ShouldApplyBlockingPolicyLocked() { return bypassHookDepth == 0 && _state.MenuVisible && _state.Focused; }
 
