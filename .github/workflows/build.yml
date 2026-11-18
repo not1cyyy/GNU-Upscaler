@@ -105,7 +105,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: OptiScaler/external/xess/bin
-          key: xess-sdk-bin-v3.0.2-v1
+          key: xess-fg-bin-v3.0.2-v2
 
       - name: Fetch Intel XeSS Runtime DLLs
         shell: pwsh
@@ -116,11 +116,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 
           $xessDlls = [ordered]@{
-              "libxess_fg.dll"   = "ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27"
-              "libxell.dll"      = "d2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7"
-              "libxess.dll"      = "251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7"
-              "libxess_dx11.dll" = "c7cfe86f0c9d94e4fb3696d3cd5035e2bbb6a8b1b0572f8b7395a4cdfd0c625e"
+              "libxess_fg.dll" = "ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27"
+              "libxell.dll"    = "d2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7"
           }
+
+          # Remove any extra DLLs so MSBuild post-build only bundles XeFG + XeLL
+          Get-ChildItem -Path $binDir -Filter "*.dll" -File | Where-Object { -not $xessDlls.Contains($_.Name) } | Remove-Item -Force
 
           foreach ($entry in $xessDlls.GetEnumerator()) {
               $dllName = $entry.Key
@@ -201,13 +202,16 @@ jobs:
               Copy-Item -Path $backendDir.FullName -Destination ".\dist\OptiScaler" -Recurse -Force
           }
 
-          # Copy XeSS / XeFG / XeLL runtime DLLs
-          foreach ($xessDll in @("libxess_fg.dll", "libxell.dll", "libxess.dll", "libxess_dx11.dll")) {
-              $src = ".\OptiScaler\external\xess\bin\$xessDll"
-              if (Test-Path $src) {
-                  Copy-Item -Path $src -Destination ".\dist\$xessDll" -Force
-              } else {
-                  throw "Required Intel XeSS runtime DLL not found at $src"
+          # Ensure XeFG / XeLL runtime DLLs exist once under .\dist\OptiScaler\
+          New-Item -ItemType Directory -Force -Path ".\dist\OptiScaler" | Out-Null
+          foreach ($xessDll in @("libxess_fg.dll", "libxell.dll")) {
+              $dst = ".\dist\OptiScaler\$xessDll"
+              if (-not (Test-Path $dst)) {
+                  $src = ".\OptiScaler\external\xess\bin\$xessDll"
+                  if (-not (Test-Path $src)) {
+                      throw "Required Intel XeSS runtime DLL not found at $src"
+                  }
+                  Copy-Item -Path $src -Destination $dst -Force
               }
           }
           
