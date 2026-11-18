@@ -1045,6 +1045,9 @@ struct CmdListHookConfig
     }
 };
 
+static std::mutex s_earlyHookMutex;
+static bool s_earlyHooksInstalled = false;
+
 void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
 {
     if (commandList == nullptr)
@@ -1058,54 +1061,69 @@ void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
 
     s_lateHooksInstalled = true;
 
-    LoadCmdListHooks(*(PVOID**) commandList, true);
+    ID3D12GraphicsCommandList* realCL = nullptr;
+    if (!Util::CheckForRealObject(__FUNCTION__, commandList, (IUnknown**) &realCL))
+        realCL = commandList;
+
+    LoadCmdListHooks(*(PVOID**) realCL, true);
 
     const auto c = CmdListHookConfig::Get();
     const bool computeArgs = c.extended && c.restoreCompute;
     const bool graphicsArgs = c.extended && c.restoreGraphics;
 
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
+    LONG detourResult = NO_ERROR;
+    {
+        std::scoped_lock detourLock(Util::DetourTransactionMutex());
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
 
-    // Common
-    AttachIf(c.restoreCompute || c.restoreGraphics, s_Reset.o_lateHook, hkResetLate);
-    AttachIf(c.restoreCompute || c.restoreGraphics, s_Close.o_lateHook, hkCloseLate);
-    AttachIf(c.extended, s_SetPipelineState.o_lateHook, hkSetPipelineStateLate);
-    AttachIf(c.hookDescriptorHeaps, s_SetDescriptorHeaps.o_lateHook, hkSetDescriptorHeapsLate);
+        // Common
+        AttachIf(c.restoreCompute || c.restoreGraphics, s_Reset.o_lateHook, hkResetLate);
+        AttachIf(c.restoreCompute || c.restoreGraphics, s_Close.o_lateHook, hkCloseLate);
+        AttachIf(c.extended, s_SetPipelineState.o_lateHook, hkSetPipelineStateLate);
+        AttachIf(c.hookDescriptorHeaps, s_SetDescriptorHeaps.o_lateHook, hkSetDescriptorHeapsLate);
 
-    // Compute
-    AttachIf(c.restoreCompute, s_SetComputeRootSignature.o_lateHook, hkSetComputeRootSignatureLate);
-    AttachIf(computeArgs, s_SetComputeRootDescriptorTable.o_lateHook, hkSetComputeRootDescriptorTableLate);
-    AttachIf(computeArgs, s_SetComputeRoot32BitConstant.o_lateHook, hkSetComputeRoot32BitConstantLate);
-    AttachIf(computeArgs, s_SetComputeRoot32BitConstants.o_lateHook, hkSetComputeRoot32BitConstantsLate);
-    AttachIf(computeArgs, s_SetComputeRootConstantBufferView.o_lateHook, hkSetComputeRootConstantBufferViewLate);
-    AttachIf(computeArgs, s_SetComputeRootShaderResourceView.o_lateHook, hkSetComputeRootShaderResourceViewLate);
-    AttachIf(computeArgs, s_SetComputeRootUnorderedAccessView.o_lateHook, hkSetComputeRootUnorderedAccessViewLate);
+        // Compute
+        AttachIf(c.restoreCompute, s_SetComputeRootSignature.o_lateHook, hkSetComputeRootSignatureLate);
+        AttachIf(computeArgs, s_SetComputeRootDescriptorTable.o_lateHook, hkSetComputeRootDescriptorTableLate);
+        AttachIf(computeArgs, s_SetComputeRoot32BitConstant.o_lateHook, hkSetComputeRoot32BitConstantLate);
+        AttachIf(computeArgs, s_SetComputeRoot32BitConstants.o_lateHook, hkSetComputeRoot32BitConstantsLate);
+        AttachIf(computeArgs, s_SetComputeRootConstantBufferView.o_lateHook, hkSetComputeRootConstantBufferViewLate);
+        AttachIf(computeArgs, s_SetComputeRootShaderResourceView.o_lateHook, hkSetComputeRootShaderResourceViewLate);
+        AttachIf(computeArgs, s_SetComputeRootUnorderedAccessView.o_lateHook, hkSetComputeRootUnorderedAccessViewLate);
 
-    // Graphics
-    AttachIf(c.restoreGraphics, s_SetGraphicsRootSignature.o_lateHook, hkSetGraphicsRootSignatureLate);
-    AttachIf(graphicsArgs, s_SetGraphicsRootDescriptorTable.o_lateHook, hkSetGraphicsRootDescriptorTableLate);
-    AttachIf(graphicsArgs, s_SetGraphicsRoot32BitConstant.o_lateHook, hkSetGraphicsRoot32BitConstantLate);
-    AttachIf(graphicsArgs, s_SetGraphicsRoot32BitConstants.o_lateHook, hkSetGraphicsRoot32BitConstantsLate);
-    AttachIf(graphicsArgs, s_SetGraphicsRootConstantBufferView.o_lateHook, hkSetGraphicsRootConstantBufferViewLate);
-    AttachIf(graphicsArgs, s_SetGraphicsRootShaderResourceView.o_lateHook, hkSetGraphicsRootShaderResourceViewLate);
-    AttachIf(graphicsArgs, s_SetGraphicsRootUnorderedAccessView.o_lateHook, hkSetGraphicsRootUnorderedAccessViewLate);
+        // Graphics
+        AttachIf(c.restoreGraphics, s_SetGraphicsRootSignature.o_lateHook, hkSetGraphicsRootSignatureLate);
+        AttachIf(graphicsArgs, s_SetGraphicsRootDescriptorTable.o_lateHook, hkSetGraphicsRootDescriptorTableLate);
+        AttachIf(graphicsArgs, s_SetGraphicsRoot32BitConstant.o_lateHook, hkSetGraphicsRoot32BitConstantLate);
+        AttachIf(graphicsArgs, s_SetGraphicsRoot32BitConstants.o_lateHook, hkSetGraphicsRoot32BitConstantsLate);
+        AttachIf(graphicsArgs, s_SetGraphicsRootConstantBufferView.o_lateHook, hkSetGraphicsRootConstantBufferViewLate);
+        AttachIf(graphicsArgs, s_SetGraphicsRootShaderResourceView.o_lateHook, hkSetGraphicsRootShaderResourceViewLate);
+        AttachIf(graphicsArgs, s_SetGraphicsRootUnorderedAccessView.o_lateHook, hkSetGraphicsRootUnorderedAccessViewLate);
 
-    if (DetourTransactionCommit() == NO_ERROR)
+        detourResult = DetourTransactionCommit();
+    }
+
+    if (detourResult == NO_ERROR)
     {
         LOG_DEBUG("Hooked command list functions Late");
     }
     else
     {
         ForEachCmdListHook([](auto& hook) { hook.o_lateHook = nullptr; });
-        LOG_WARN("Hooking command list functions Late failed");
+        LOG_WARN("Hooking command list functions Late failed: {:X}", detourResult);
     }
 }
 
 static void HookToCommandList(ID3D12Device* InDevice)
 {
-    if (s_SetComputeRootSignature.o_earlyHook != nullptr || s_SetGraphicsRootSignature.o_earlyHook != nullptr)
+    std::lock_guard<std::mutex> lock(s_earlyHookMutex);
+
+    if (s_earlyHooksInstalled || s_SetComputeRootSignature.o_earlyHook != nullptr ||
+        s_SetGraphicsRootSignature.o_earlyHook != nullptr)
+    {
         return;
+    }
 
     ID3D12GraphicsCommandList* commandList = nullptr;
     ID3D12CommandAllocator* commandAllocator = nullptr;
@@ -1116,49 +1134,63 @@ static void HookToCommandList(ID3D12Device* InDevice)
     if (InDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator, nullptr,
                                     IID_PPV_ARGS(&commandList)) == S_OK)
     {
-        LoadCmdListHooks(*(PVOID**) commandList, false);
+        ID3D12GraphicsCommandList* realCL = nullptr;
+        if (!Util::CheckForRealObject(__FUNCTION__, commandList, (IUnknown**) &realCL))
+            realCL = commandList;
+
+        LoadCmdListHooks(*(PVOID**) realCL, false);
 
         const auto c = CmdListHookConfig::Get();
         const bool computeArgs = c.extended && c.restoreCompute;
         const bool graphicsArgs = c.extended && c.restoreGraphics;
 
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-
-        // Common
-        AttachIf(c.restoreCompute || c.restoreGraphics, s_Reset.o_earlyHook, hkReset);
-        AttachIf(c.restoreCompute || c.restoreGraphics, s_Close.o_earlyHook, hkClose);
-        AttachIf(c.extended, s_SetPipelineState.o_earlyHook, hkSetPipelineState);
-        AttachIf(c.hookDescriptorHeaps, s_SetDescriptorHeaps.o_earlyHook, hkSetDescriptorHeaps);
-
-        // Signatures are always hooked, ResTrack uses them too
-        AttachIf(true, s_SetComputeRootSignature.o_earlyHook, hkSetComputeRootSignature);
-        AttachIf(true, s_SetGraphicsRootSignature.o_earlyHook, hkSetGraphicsRootSignature);
-
-        // Compute
-        AttachIf(computeArgs, s_SetComputeRootDescriptorTable.o_earlyHook, hkSetComputeRootDescriptorTable);
-        AttachIf(computeArgs, s_SetComputeRoot32BitConstant.o_earlyHook, hkSetComputeRoot32BitConstant);
-        AttachIf(computeArgs, s_SetComputeRoot32BitConstants.o_earlyHook, hkSetComputeRoot32BitConstants);
-        AttachIf(computeArgs, s_SetComputeRootConstantBufferView.o_earlyHook, hkSetComputeRootConstantBufferView);
-        AttachIf(computeArgs, s_SetComputeRootShaderResourceView.o_earlyHook, hkSetComputeRootShaderResourceView);
-        AttachIf(computeArgs, s_SetComputeRootUnorderedAccessView.o_earlyHook, hkSetComputeRootUnorderedAccessView);
-
-        // Graphics
-        AttachIf(graphicsArgs, s_SetGraphicsRootDescriptorTable.o_earlyHook, hkSetGraphicsRootDescriptorTable);
-        AttachIf(graphicsArgs, s_SetGraphicsRoot32BitConstant.o_earlyHook, hkSetGraphicsRoot32BitConstant);
-        AttachIf(graphicsArgs, s_SetGraphicsRoot32BitConstants.o_earlyHook, hkSetGraphicsRoot32BitConstants);
-        AttachIf(graphicsArgs, s_SetGraphicsRootConstantBufferView.o_earlyHook, hkSetGraphicsRootConstantBufferView);
-        AttachIf(graphicsArgs, s_SetGraphicsRootShaderResourceView.o_earlyHook, hkSetGraphicsRootShaderResourceView);
-        AttachIf(graphicsArgs, s_SetGraphicsRootUnorderedAccessView.o_earlyHook, hkSetGraphicsRootUnorderedAccessView);
-
-        if (DetourTransactionCommit() == NO_ERROR)
+        LONG detourResult = NO_ERROR;
         {
+            std::scoped_lock detourLock(Util::DetourTransactionMutex());
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
+
+            // Common
+            AttachIf(c.restoreCompute || c.restoreGraphics, s_Reset.o_earlyHook, hkReset);
+            AttachIf(c.restoreCompute || c.restoreGraphics, s_Close.o_earlyHook, hkClose);
+            AttachIf(c.extended, s_SetPipelineState.o_earlyHook, hkSetPipelineState);
+            AttachIf(c.hookDescriptorHeaps, s_SetDescriptorHeaps.o_earlyHook, hkSetDescriptorHeaps);
+
+            // Signatures are always hooked, ResTrack uses them too
+            AttachIf(true, s_SetComputeRootSignature.o_earlyHook, hkSetComputeRootSignature);
+            AttachIf(true, s_SetGraphicsRootSignature.o_earlyHook, hkSetGraphicsRootSignature);
+
+            // Compute
+            AttachIf(computeArgs, s_SetComputeRootDescriptorTable.o_earlyHook, hkSetComputeRootDescriptorTable);
+            AttachIf(computeArgs, s_SetComputeRoot32BitConstant.o_earlyHook, hkSetComputeRoot32BitConstant);
+            AttachIf(computeArgs, s_SetComputeRoot32BitConstants.o_earlyHook, hkSetComputeRoot32BitConstants);
+            AttachIf(computeArgs, s_SetComputeRootConstantBufferView.o_earlyHook, hkSetComputeRootConstantBufferView);
+            AttachIf(computeArgs, s_SetComputeRootShaderResourceView.o_earlyHook, hkSetComputeRootShaderResourceView);
+            AttachIf(computeArgs, s_SetComputeRootUnorderedAccessView.o_earlyHook, hkSetComputeRootUnorderedAccessView);
+
+            // Graphics
+            AttachIf(graphicsArgs, s_SetGraphicsRootDescriptorTable.o_earlyHook, hkSetGraphicsRootDescriptorTable);
+            AttachIf(graphicsArgs, s_SetGraphicsRoot32BitConstant.o_earlyHook, hkSetGraphicsRoot32BitConstant);
+            AttachIf(graphicsArgs, s_SetGraphicsRoot32BitConstants.o_earlyHook, hkSetGraphicsRoot32BitConstants);
+            AttachIf(graphicsArgs, s_SetGraphicsRootConstantBufferView.o_earlyHook,
+                     hkSetGraphicsRootConstantBufferView);
+            AttachIf(graphicsArgs, s_SetGraphicsRootShaderResourceView.o_earlyHook,
+                     hkSetGraphicsRootShaderResourceView);
+            AttachIf(graphicsArgs, s_SetGraphicsRootUnorderedAccessView.o_earlyHook,
+                     hkSetGraphicsRootUnorderedAccessView);
+
+            detourResult = DetourTransactionCommit();
+        }
+
+        if (detourResult == NO_ERROR)
+        {
+            s_earlyHooksInstalled = true;
             LOG_DEBUG("Hooked command list functions");
         }
         else
         {
             ForEachCmdListHook([](auto& hook) { hook.o_earlyHook = nullptr; });
-            LOG_WARN("Hooking command list functions failed");
+            LOG_WARN("Hooking command list functions failed: {:X}", detourResult);
         }
 
         commandList->Close();
@@ -1797,11 +1829,14 @@ static void HookD3D12DeviceRelease(ID3D12Device* device)
         _d3d12DeviceReleaseTargets[i] = target;
         o_D3D12DeviceRelease[i] = (PFN_Release) target;
 
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-        DetourAttach(&(PVOID&) o_D3D12DeviceRelease[i], (PVOID) hkD3D12DeviceReleases[i]);
-
-        auto detourResult = DetourTransactionCommit();
+        LONG detourResult = NO_ERROR;
+        {
+            std::scoped_lock detourLock(Util::DetourTransactionMutex());
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
+            DetourAttach(&(PVOID&) o_D3D12DeviceRelease[i], (PVOID) hkD3D12DeviceReleases[i]);
+            detourResult = DetourTransactionCommit();
+        }
         if (detourResult != NO_ERROR)
         {
             LOG_ERROR("Failed to detour ID3D12Device::Release, error: {:X}", detourResult);
@@ -1835,16 +1870,20 @@ static void UnhookD3D12DeviceRelease()
 {
     std::scoped_lock lock(_d3d12DeviceReleaseMutex);
 
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
-
-    for (size_t i = 0; i < std::size(o_D3D12DeviceRelease); i++)
+    LONG detourResult = NO_ERROR;
     {
-        if (o_D3D12DeviceRelease[i] != nullptr)
-            DetourDetach(&(PVOID&) o_D3D12DeviceRelease[i], (PVOID) hkD3D12DeviceReleases[i]);
-    }
+        std::scoped_lock detourLock(Util::DetourTransactionMutex());
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
 
-    auto detourResult = DetourTransactionCommit();
+        for (size_t i = 0; i < std::size(o_D3D12DeviceRelease); i++)
+        {
+            if (o_D3D12DeviceRelease[i] != nullptr)
+                DetourDetach(&(PVOID&) o_D3D12DeviceRelease[i], (PVOID) hkD3D12DeviceReleases[i]);
+        }
+
+        detourResult = DetourTransactionCommit();
+    }
     if (detourResult != NO_ERROR)
     {
         LOG_ERROR("Failed to unhook ID3D12Device::Release, error: {:X}", detourResult);
@@ -2383,10 +2422,14 @@ static HRESULT hkD3D12GetInterface(REFCLSID rclsid, REFIID riid, void** ppvDebug
         {
             LOG_DEBUG("Detouring ID3D12DeviceFactory::CreateDevice");
 
-            DetourTransactionBegin();
-            DetourUpdateThread(GetCurrentThread());
-            DetourAttach(&(PVOID&) o_CreateDevice, hkCreateDevice);
-            auto detourResult = DetourTransactionCommit();
+            LONG detourResult = NO_ERROR;
+            {
+                std::scoped_lock detourLock(Util::DetourTransactionMutex());
+                DetourTransactionBegin();
+                DetourUpdateThread(GetCurrentThread());
+                DetourAttach(&(PVOID&) o_CreateDevice, hkCreateDevice);
+                detourResult = DetourTransactionCommit();
+            }
             if (detourResult != NO_ERROR)
             {
                 LOG_ERROR("Failed to detour ID3D12DeviceFactory::CreateDevice, error: {:X}", detourResult);
@@ -2403,140 +2446,155 @@ static void HookToDevice(ID3D12Device* InDevice)
     if (InDevice == nullptr)
         return;
 
-    // Later devices can have another Release, it tracks the current d3d12 device too
-    static ID3D12Device* lastReleaseDevice = nullptr;
-    if (InDevice != lastReleaseDevice)
     {
-        lastReleaseDevice = InDevice;
+        static std::mutex s_hookToDeviceMutex;
+        std::lock_guard<std::mutex> deviceHookLock(s_hookToDeviceMutex);
 
-        ID3D12Device* realDevice = nullptr;
-        Util::CheckForRealObject(__FUNCTION__, InDevice, (IUnknown**) &realDevice);
-        HookD3D12DeviceRelease(realDevice != nullptr ? realDevice : InDevice);
-    }
-
-    if (o_CreateSampler != nullptr)
-        return;
-
-    LOG_DEBUG("Dx12");
-
-    // Get the vtable pointer
-    PVOID* pVTable = *(PVOID**) InDevice;
-
-    ID3D12Device* realDevice = nullptr;
-    if (Util::CheckForRealObject(__FUNCTION__, InDevice, (IUnknown**) &realDevice))
-        pVTable = *(PVOID**) realDevice;
-
-    // hudless
-    o_CreateSampler = (PFN_CreateSampler) pVTable[22];
-    o_CreateComputePipelineState = (PFN_CreateComputePipelineState) pVTable[11];
-    o_CheckFeatureSupport = (PFN_CheckFeatureSupport) pVTable[13];
-    o_CreateRootSignature = (PFN_CreateRootSignature) pVTable[16];
-    o_GetResourceAllocationInfo = (PFN_GetResourceAllocationInfo) pVTable[25];
-    o_CreateCommittedResource = (PFN_CreateCommittedResource) pVTable[27];
-    o_CreatePlacedResource = (PFN_CreatePlacedResource) pVTable[29];
-
-    ID3D12Device1* device12_1 = nullptr;
-    if (realDevice)
-        realDevice->QueryInterface(IID_PPV_ARGS(&device12_1));
-    else
-        InDevice->QueryInterface(IID_PPV_ARGS(&device12_1));
-
-    if (device12_1 /*&& isAMD*/)
-    {
-        PVOID* pVTable = *(PVOID**) device12_1;
-        o_SetResidencyPriority = (PFN_SetResidencyPriority) pVTable[46];
-        device12_1->Release();
-    }
-
-    // Older runtimes don't have the slot
-    ID3D12Device11* device11 = nullptr;
-    if ((realDevice != nullptr ? realDevice : InDevice)->QueryInterface(IID_PPV_ARGS(&device11)) == S_OK)
-    {
-        o_CreateSampler2 = (PFN_CreateSampler2) (*(PVOID**) device11)[79];
-        device11->Release();
-    }
-
-    // Apply the detour
-    if (o_CreateSampler != nullptr)
-    {
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-
-        if (o_CreateSampler != nullptr)
-            DetourAttach(&(PVOID&) o_CreateSampler, hkCreateSampler);
-
-        if (o_CreateSampler2 != nullptr)
-            DetourAttach(&(PVOID&) o_CreateSampler2, hkCreateSampler2);
-
-        if (o_CreateRootSignature != nullptr)
-            DetourAttach(&(PVOID&) o_CreateRootSignature, hkCreateRootSignature);
-
-        if (o_CreateComputePipelineState != nullptr)
-            DetourAttach(&(PVOID&) o_CreateComputePipelineState, hkCreateComputePipelineState);
-
-        // HACK: see reason in hkSetResidencyPriority
-        if (o_SetResidencyPriority != nullptr)
-            DetourAttach(&(PVOID&) o_SetResidencyPriority, hkSetResidencyPriority);
-
-        if (Config::Instance()->UESpoofIntelAtomics64.value_or_default())
+        // Later devices can have another Release, it tracks the current d3d12 device too
+        static ID3D12Device* lastReleaseDevice = nullptr;
+        if (InDevice != lastReleaseDevice)
         {
-            LOG_DEBUG("UE spoofing for Intel Atomics64 enabled, applying detours");
+            lastReleaseDevice = InDevice;
 
-            if (o_CheckFeatureSupport != nullptr)
-                DetourAttach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
-
-            if (o_CreateCommittedResource != nullptr)
-                DetourAttach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
-
-            if (o_CreatePlacedResource != nullptr)
-                DetourAttach(&(PVOID&) o_CreatePlacedResource, hkCreatePlacedResource);
-
-            if (o_GetResourceAllocationInfo != nullptr)
-                DetourAttach(&(PVOID&) o_GetResourceAllocationInfo, hkGetResourceAllocationInfo);
+            ID3D12Device* realDevice = nullptr;
+            Util::CheckForRealObject(__FUNCTION__, InDevice, (IUnknown**) &realDevice);
+            HookD3D12DeviceRelease(realDevice != nullptr ? realDevice : InDevice);
         }
 
-        auto detourResult = DetourTransactionCommit();
-        if (detourResult != NO_ERROR)
+        if (o_CreateSampler == nullptr)
         {
-            LOG_ERROR("Failed to detour ID3D12Device methods, error: {:X}", detourResult);
-            o_CreateSampler = nullptr;
-            o_CreateSampler2 = nullptr;
-            o_CheckFeatureSupport = nullptr;
-            o_CreateRootSignature = nullptr;
-            o_CreateComputePipelineState = nullptr;
-            o_CreateCommittedResource = nullptr;
-            o_CreatePlacedResource = nullptr;
-            o_GetResourceAllocationInfo = nullptr;
-        }
-    }
+            LOG_DEBUG("Dx12");
 
-    HookToCommandList(InDevice);
+            // Get the vtable pointer
+            PVOID* pVTable = *(PVOID**) InDevice;
 
-    if (State::Instance().activeFgInput == FGInput::Upscaler &&
-        !Config::Instance()->FGDisableHUDFix.value_or_default() &&
-        State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
-    {
-        ResTrack_Dx12::HookDevice(InDevice);
-    }
-    else if (Config::Instance()->ForceHDR.value_or_default() && o_CreateShaderResourceView == nullptr)
-    {
-        // ResTrack forces these itself
-        o_CreateShaderResourceView = (PFN_CreateShaderResourceView) pVTable[18];
-        o_CreateUnorderedAccessView = (PFN_CreateUnorderedAccessView) pVTable[19];
-        o_CreateRenderTargetView = (PFN_CreateRenderTargetView) pVTable[20];
+            ID3D12Device* realDevice = nullptr;
+            if (Util::CheckForRealObject(__FUNCTION__, InDevice, (IUnknown**) &realDevice))
+                pVTable = *(PVOID**) realDevice;
 
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-        DetourAttach(&(PVOID&) o_CreateShaderResourceView, hkCreateShaderResourceView);
-        DetourAttach(&(PVOID&) o_CreateUnorderedAccessView, hkCreateUnorderedAccessView);
-        DetourAttach(&(PVOID&) o_CreateRenderTargetView, hkCreateRenderTargetView);
+            // hudless
+            o_CreateSampler = (PFN_CreateSampler) pVTable[22];
+            o_CreateComputePipelineState = (PFN_CreateComputePipelineState) pVTable[11];
+            o_CheckFeatureSupport = (PFN_CheckFeatureSupport) pVTable[13];
+            o_CreateRootSignature = (PFN_CreateRootSignature) pVTable[16];
+            o_GetResourceAllocationInfo = (PFN_GetResourceAllocationInfo) pVTable[25];
+            o_CreateCommittedResource = (PFN_CreateCommittedResource) pVTable[27];
+            o_CreatePlacedResource = (PFN_CreatePlacedResource) pVTable[29];
 
-        if (DetourTransactionCommit() != NO_ERROR)
-        {
-            LOG_ERROR("Failed to detour view creation for ForceHDR");
-            o_CreateShaderResourceView = nullptr;
-            o_CreateUnorderedAccessView = nullptr;
-            o_CreateRenderTargetView = nullptr;
+            ID3D12Device1* device12_1 = nullptr;
+            if (realDevice)
+                realDevice->QueryInterface(IID_PPV_ARGS(&device12_1));
+            else
+                InDevice->QueryInterface(IID_PPV_ARGS(&device12_1));
+
+            if (device12_1 /*&& isAMD*/)
+            {
+                PVOID* pVTable = *(PVOID**) device12_1;
+                o_SetResidencyPriority = (PFN_SetResidencyPriority) pVTable[46];
+                device12_1->Release();
+            }
+
+            // Older runtimes don't have the slot
+            ID3D12Device11* device11 = nullptr;
+            if ((realDevice != nullptr ? realDevice : InDevice)->QueryInterface(IID_PPV_ARGS(&device11)) == S_OK)
+            {
+                o_CreateSampler2 = (PFN_CreateSampler2) (*(PVOID**) device11)[79];
+                device11->Release();
+            }
+
+            // Apply the detour
+            if (o_CreateSampler != nullptr)
+            {
+                LONG detourResult = NO_ERROR;
+                {
+                    std::scoped_lock detourLock(Util::DetourTransactionMutex());
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+
+                    if (o_CreateSampler != nullptr)
+                        DetourAttach(&(PVOID&) o_CreateSampler, hkCreateSampler);
+
+                    if (o_CreateSampler2 != nullptr)
+                        DetourAttach(&(PVOID&) o_CreateSampler2, hkCreateSampler2);
+
+                    if (o_CreateRootSignature != nullptr)
+                        DetourAttach(&(PVOID&) o_CreateRootSignature, hkCreateRootSignature);
+
+                    if (o_CreateComputePipelineState != nullptr)
+                        DetourAttach(&(PVOID&) o_CreateComputePipelineState, hkCreateComputePipelineState);
+
+                    // HACK: see reason in hkSetResidencyPriority
+                    if (o_SetResidencyPriority != nullptr)
+                        DetourAttach(&(PVOID&) o_SetResidencyPriority, hkSetResidencyPriority);
+
+                    if (Config::Instance()->UESpoofIntelAtomics64.value_or_default())
+                    {
+                        LOG_DEBUG("UE spoofing for Intel Atomics64 enabled, applying detours");
+
+                        if (o_CheckFeatureSupport != nullptr)
+                            DetourAttach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
+
+                        if (o_CreateCommittedResource != nullptr)
+                            DetourAttach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
+
+                        if (o_CreatePlacedResource != nullptr)
+                            DetourAttach(&(PVOID&) o_CreatePlacedResource, hkCreatePlacedResource);
+
+                        if (o_GetResourceAllocationInfo != nullptr)
+                            DetourAttach(&(PVOID&) o_GetResourceAllocationInfo, hkGetResourceAllocationInfo);
+                    }
+
+                    detourResult = DetourTransactionCommit();
+                }
+
+                if (detourResult != NO_ERROR)
+                {
+                    LOG_ERROR("Failed to detour ID3D12Device methods, error: {:X}", detourResult);
+                    o_CreateSampler = nullptr;
+                    o_CreateSampler2 = nullptr;
+                    o_CheckFeatureSupport = nullptr;
+                    o_CreateRootSignature = nullptr;
+                    o_CreateComputePipelineState = nullptr;
+                    o_CreateCommittedResource = nullptr;
+                    o_CreatePlacedResource = nullptr;
+                    o_GetResourceAllocationInfo = nullptr;
+                }
+            }
+
+            HookToCommandList(InDevice);
+
+            if (State::Instance().activeFgInput == FGInput::Upscaler &&
+                !Config::Instance()->FGDisableHUDFix.value_or_default() &&
+                State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
+            {
+                ResTrack_Dx12::HookDevice(InDevice);
+            }
+            else if (Config::Instance()->ForceHDR.value_or_default() && o_CreateShaderResourceView == nullptr)
+            {
+                // ResTrack forces these itself
+                o_CreateShaderResourceView = (PFN_CreateShaderResourceView) pVTable[18];
+                o_CreateUnorderedAccessView = (PFN_CreateUnorderedAccessView) pVTable[19];
+                o_CreateRenderTargetView = (PFN_CreateRenderTargetView) pVTable[20];
+
+                LONG detourResult = NO_ERROR;
+                {
+                    std::scoped_lock detourLock(Util::DetourTransactionMutex());
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourAttach(&(PVOID&) o_CreateShaderResourceView, hkCreateShaderResourceView);
+                    DetourAttach(&(PVOID&) o_CreateUnorderedAccessView, hkCreateUnorderedAccessView);
+                    DetourAttach(&(PVOID&) o_CreateRenderTargetView, hkCreateRenderTargetView);
+                    detourResult = DetourTransactionCommit();
+                }
+
+                if (detourResult != NO_ERROR)
+                {
+                    LOG_ERROR("Failed to detour view creation for ForceHDR");
+                    o_CreateShaderResourceView = nullptr;
+                    o_CreateUnorderedAccessView = nullptr;
+                    o_CreateRenderTargetView = nullptr;
+                }
+            }
         }
     }
 
@@ -2551,34 +2609,38 @@ static void UnhookDevice()
 {
     LOG_FUNC();
 
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
+    LONG detourResult = NO_ERROR;
+    {
+        std::scoped_lock detourLock(Util::DetourTransactionMutex());
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
 
-    if (o_CreateSampler != nullptr)
-        DetourDetach(&(PVOID&) o_CreateSampler, hkCreateSampler);
+        if (o_CreateSampler != nullptr)
+            DetourDetach(&(PVOID&) o_CreateSampler, hkCreateSampler);
 
-    if (o_CreateSampler2 != nullptr)
-        DetourDetach(&(PVOID&) o_CreateSampler2, hkCreateSampler2);
+        if (o_CreateSampler2 != nullptr)
+            DetourDetach(&(PVOID&) o_CreateSampler2, hkCreateSampler2);
 
-    if (o_CreateComputePipelineState != nullptr)
-        DetourDetach(&(PVOID&) o_CreateComputePipelineState, hkCreateComputePipelineState);
+        if (o_CreateComputePipelineState != nullptr)
+            DetourDetach(&(PVOID&) o_CreateComputePipelineState, hkCreateComputePipelineState);
 
-    if (o_CreateRootSignature != nullptr)
-        DetourDetach(&(PVOID&) o_CreateRootSignature, hkCreateRootSignature);
+        if (o_CreateRootSignature != nullptr)
+            DetourDetach(&(PVOID&) o_CreateRootSignature, hkCreateRootSignature);
 
-    if (o_CheckFeatureSupport != nullptr)
-        DetourDetach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
+        if (o_CheckFeatureSupport != nullptr)
+            DetourDetach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
 
-    if (o_CreateCommittedResource != nullptr)
-        DetourDetach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
+        if (o_CreateCommittedResource != nullptr)
+            DetourDetach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
 
-    if (o_CreatePlacedResource != nullptr)
-        DetourDetach(&(PVOID&) o_CreatePlacedResource, hkCreatePlacedResource);
+        if (o_CreatePlacedResource != nullptr)
+            DetourDetach(&(PVOID&) o_CreatePlacedResource, hkCreatePlacedResource);
 
-    if (o_GetResourceAllocationInfo != nullptr)
-        DetourDetach(&(PVOID&) o_GetResourceAllocationInfo, hkGetResourceAllocationInfo);
+        if (o_GetResourceAllocationInfo != nullptr)
+            DetourDetach(&(PVOID&) o_GetResourceAllocationInfo, hkGetResourceAllocationInfo);
 
-    auto detourResult = DetourTransactionCommit();
+        detourResult = DetourTransactionCommit();
+    }
     if (detourResult != NO_ERROR)
     {
         LOG_ERROR("Failed to unhook ID3D12Device methods, error: {:X}", detourResult);
@@ -2628,10 +2690,14 @@ void D3D12Hooks::HookAgility(HMODULE module)
 
     if (o_D3D12GetInterface != nullptr)
     {
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-        DetourAttach(&(PVOID&) o_D3D12GetInterface, hkD3D12GetInterface);
-        auto detourResult = DetourTransactionCommit();
+        LONG detourResult = NO_ERROR;
+        {
+            std::scoped_lock detourLock(Util::DetourTransactionMutex());
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
+            DetourAttach(&(PVOID&) o_D3D12GetInterface, hkD3D12GetInterface);
+            detourResult = DetourTransactionCommit();
+        }
         if (detourResult != NO_ERROR)
         {
             LOG_ERROR("Failed to detour D3D12GetInterface, error: {:X}", detourResult);
@@ -2645,31 +2711,35 @@ void D3D12Hooks::Unhook()
     if (o_D3D12CreateDevice == nullptr)
         return;
 
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
+    LONG detourResult = NO_ERROR;
+    {
+        std::scoped_lock detourLock(Util::DetourTransactionMutex());
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
 
-    if (o_CreateSampler != nullptr)
-        DetourDetach(&(PVOID&) o_CreateSampler, hkCreateSampler);
+        if (o_CreateSampler != nullptr)
+            DetourDetach(&(PVOID&) o_CreateSampler, hkCreateSampler);
 
-    if (o_CreateSampler2 != nullptr)
-        DetourDetach(&(PVOID&) o_CreateSampler2, hkCreateSampler2);
+        if (o_CreateSampler2 != nullptr)
+            DetourDetach(&(PVOID&) o_CreateSampler2, hkCreateSampler2);
 
-    if (o_CreateComputePipelineState != nullptr)
-        DetourDetach(&(PVOID&) o_CreateComputePipelineState, hkCreateComputePipelineState);
+        if (o_CreateComputePipelineState != nullptr)
+            DetourDetach(&(PVOID&) o_CreateComputePipelineState, hkCreateComputePipelineState);
 
-    if (o_CheckFeatureSupport != nullptr)
-        DetourDetach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
+        if (o_CheckFeatureSupport != nullptr)
+            DetourDetach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
 
-    if (o_CreateCommittedResource != nullptr)
-        DetourDetach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
+        if (o_CreateCommittedResource != nullptr)
+            DetourDetach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
 
-    if (o_CreatePlacedResource != nullptr)
-        DetourDetach(&(PVOID&) o_CreatePlacedResource, hkCreatePlacedResource);
+        if (o_CreatePlacedResource != nullptr)
+            DetourDetach(&(PVOID&) o_CreatePlacedResource, hkCreatePlacedResource);
 
-    if (o_GetResourceAllocationInfo != nullptr)
-        DetourDetach(&(PVOID&) o_GetResourceAllocationInfo, hkGetResourceAllocationInfo);
+        if (o_GetResourceAllocationInfo != nullptr)
+            DetourDetach(&(PVOID&) o_GetResourceAllocationInfo, hkGetResourceAllocationInfo);
 
-    auto detourResult = DetourTransactionCommit();
+        detourResult = DetourTransactionCommit();
+    }
     if (detourResult != NO_ERROR)
     {
         LOG_ERROR("Failed to unhook ID3D12Device methods, error: {:X}", detourResult);

@@ -1144,3 +1144,9 @@ void Util::SetFlagEnvVar(const wchar_t* name, bool enabled)
             ucrtPutenv(name, crtValue);
     }
 }
+
+std::mutex& Util::DetourTransactionMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}

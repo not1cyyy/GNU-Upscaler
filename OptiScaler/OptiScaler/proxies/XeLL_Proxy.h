@@ -62,12 +62,16 @@ static void RedirectAllExports(HMODULE hOld, HMODULE hNew)
         return;
     }
 
-    DetourTransactionBegin();
-    DetourUpdateThread(GetCurrentThread());
+    LONG detourResult = NO_ERROR;
+    {
+        std::scoped_lock detourLock(Util::DetourTransactionMutex());
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
 
-    DetourEnumerateExports(hOld, hNew, ExportCallback);
+        DetourEnumerateExports(hOld, hNew, ExportCallback);
 
-    auto detourResult = DetourTransactionCommit();
+        detourResult = DetourTransactionCommit();
+    }
     if (detourResult != NO_ERROR)
         LOG_ERROR("Failed to commit detours: {:X}", detourResult);
 }
@@ -262,18 +266,22 @@ class XeLLProxy
             return;
         }
 
-        DetourTransactionBegin();
-        DetourUpdateThread(GetCurrentThread());
-
-        for (auto& entry : _realEntries)
+        LONG result = NO_ERROR;
         {
-            auto ours = (PVOID) KernelBaseProxy::GetProcAddress_()(dllModule, entry.name);
+            std::scoped_lock detourLock(Util::DetourTransactionMutex());
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
 
-            if (*entry.real != nullptr && ours != nullptr)
-                DetourAttach(entry.real, ours);
+            for (auto& entry : _realEntries)
+            {
+                auto ours = (PVOID) KernelBaseProxy::GetProcAddress_()(dllModule, entry.name);
+
+                if (*entry.real != nullptr && ours != nullptr)
+                    DetourAttach(entry.real, ours);
+            }
+
+            result = DetourTransactionCommit();
         }
-
-        auto result = DetourTransactionCommit();
 
         if (result == NO_ERROR)
             LOG_INFO("{} is the real XeLL, its calls go to the XeLL input", path);
