@@ -5654,13 +5654,15 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                                 (State::Instance().gameQuirks & GameQuirk::ForceFGRenderSizeMVs) ||
                                 ignoreChecks || allowDilatedMV;
 
-        if (!correctMVs || state.realExclusiveFullscreen)
+        if (!correctMVs || (!ignoreChecks && state.realExclusiveFullscreen))
         {
             config->FGEnabled.set_volatile_value(false);
             config->FGXeFGDebugView.reset();
         }
 
-        const bool restartNeeded = config->FGXeFGDepthInverted.value_or_default() != fgOutput->IsInvertedDepth() ||
+        const bool expectedDepthInverted =
+            config->FGXeFGDepthInverted.value_or(State::Instance().gameEngine == GameEngineType::Unreal);
+        const bool restartNeeded = expectedDepthInverted != fgOutput->IsInvertedDepth() ||
                                    config->FGXeFGJitteredMV.value_or_default() != fgOutput->IsJitteredMVs() ||
                                    config->FGXeFGHighResMV.value_or_default() == fgOutput->IsLowResMV();
 
