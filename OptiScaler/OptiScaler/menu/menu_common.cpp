@@ -7228,7 +7228,10 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
         if (syncStats.simStartActive)
             currentMethod.append(syncStats.earlyAcquireActive ? " + EarlyAcquire" : " + Waitable");
         if (syncStats.fgSubframePacingActive && syncStats.fgSubframeMultiplier > 0)
-            currentMethod.append(std::format(" + XeFG {}x Subframe", syncStats.fgSubframeMultiplier));
+        {
+            currentMethod.append(std::format(" + XeFG {}x Subframe [{}]", syncStats.fgSubframeMultiplier,
+                                             syncStats.fgSubframeViaVulkan ? "Vk" : "DXGI"));
+        }
         if (syncStats.vblankLocked && syncStats.detectedRefreshHz > 0.0)
             currentMethod.append(std::format(" + VBlank PLL ({:.1f} Hz)", syncStats.detectedRefreshHz));
         if (syncStats.gamescopeLimiterDetected)

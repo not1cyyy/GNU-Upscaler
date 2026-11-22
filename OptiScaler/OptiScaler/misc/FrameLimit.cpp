@@ -217,6 +217,8 @@ std::atomic<bool> g_fgSubframeActive { false };
 std::atomic<int32_t> g_fgCarryOutputsAtomic { 0 };
 std::atomic<uint64_t> g_fgCurrentTargetQpcNs { 0 };
 std::atomic<uint64_t> g_fgLastScheduledDisplayNs { 0 };
+std::atomic<uint64_t> g_lastFgVkOutputNs { 0 };
+std::atomic<bool> g_fgSubViaVulkan { false };
 
 uint32_t ActiveSubframeMultiplier()
 {
@@ -878,8 +880,20 @@ void FrameLimit::onFgGamePresentStatus(uint32_t actualFramesPresented)
     g_fgSub.lastBatchFrames = actualFramesPresented;
 }
 
-void FrameLimit::onFgOutputPresent()
+void FrameLimit::onFgOutputPresent(bool fromVulkan)
 {
+    if (fromVulkan)
+    {
+        g_lastFgVkOutputNs.store(Util::GetTimestamp(), std::memory_order_relaxed);
+    }
+    else
+    {
+        const uint64_t lastVk = g_lastFgVkOutputNs.load(std::memory_order_relaxed);
+        const uint64_t nowCheck = Util::GetTimestamp();
+        if (lastVk > 0 && nowCheck >= lastVk && (nowCheck - lastVk) < 2'000'000'000ULL)
+            return;
+    }
+
     const uint32_t mult = ActiveSubframeMultiplier();
     if (mult == 0)
     {
@@ -891,17 +905,39 @@ void FrameLimit::onFgOutputPresent()
         return;
     }
 
+    g_fgSubViaVulkan.store(fromVulkan, std::memory_order_relaxed);
     g_fgSeenOutputPresent.store(true, std::memory_order_relaxed);
     g_fgSubframeActive.store(true, std::memory_order_relaxed);
 
+    const DWORD curTid = GetCurrentThreadId();
     const DWORD gameTid = g_fgGameThreadId.load(std::memory_order_relaxed);
-    if (gameTid == 0 || GetCurrentThreadId() == gameTid)
+    if (gameTid == 0 || curTid == gameTid)
     {
+        if (gameTid != 0)
+        {
+            static bool s_loggedSameThread = false;
+            if (!s_loggedSameThread)
+            {
+                LOG_WARN("XeFG {}x sub-frame pacing skipped: {} output runs on gameTid={}", mult,
+                         fromVulkan ? "Vulkan" : "DXGI", gameTid);
+                s_loggedSameThread = true;
+            }
+        }
         // Never block the game's DX12 simulation/present thread
         std::scoped_lock lock(g_fgSubMutex);
         RecordSubframeEdgeLocked(Util::GetTimestamp());
         g_fgOutputsThisWindow.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
+
+    static uint32_t s_loggedMult = 0;
+    static bool s_loggedViaVk = false;
+    if (s_loggedMult != mult || s_loggedViaVk != fromVulkan)
+    {
+        LOG_INFO("XeFG {}x sub-frame pacing active via {} (gameTid={}, outTid={})", mult,
+                 fromVulkan ? "Vulkan" : "DXGI", gameTid, curTid);
+        s_loggedMult = mult;
+        s_loggedViaVk = fromVulkan;
     }
 
     uint64_t wakeDeadlineNs = 0;
@@ -1478,6 +1514,7 @@ FrameLimit::SyncStats FrameLimit::getStats()
         std::scoped_lock lock(g_fgSubMutex);
         const uint32_t liveMult = ActiveSubframeMultiplier();
         stats.fgSubframePacingActive = liveMult > 0 && g_fgSubframeActive.load(std::memory_order_relaxed);
+        stats.fgSubframeViaVulkan = g_fgSubViaVulkan.load(std::memory_order_relaxed);
         stats.fgSubframeMultiplier = liveMult > 0 ? liveMult : g_fgSub.activeMult;
         stats.lastSubframeIntervalUs = g_fgSub.lastSubIntervalNs / 1000ULL;
     }

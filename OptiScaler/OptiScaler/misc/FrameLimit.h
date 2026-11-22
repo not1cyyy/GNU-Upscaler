@@ -22,6 +22,7 @@ class FrameLimit
         bool earlyAcquireActive = false;
         bool gamescopeLimiterDetected = false;
         bool fgSubframePacingActive = false;
+        bool fgSubframeViaVulkan = false;
         int activeMaxInFlight = 0;
         uint32_t fgSubframeMultiplier = 0;
         uint64_t lastCpuWorkUs = 0;
@@ -42,7 +43,7 @@ class FrameLimit
 
     static void onFgGamePresentStart(uint32_t frameMultiplier);
     static void onFgGamePresentStatus(uint32_t actualFramesPresented);
-    static void onFgOutputPresent();
+    static void onFgOutputPresent(bool fromVulkan = false);
     static bool isSubframePacingActive();
 
     static void prePresent(bool fgActive);

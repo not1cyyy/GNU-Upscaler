@@ -972,6 +972,14 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     const bool dxgiPacingActive = dxgiBacked && FrameLimit::hasRecentDxgiPresent();
     const bool limitActive =
         !dx12FgActive && !dxgiPacingActive && !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
+
+    // Pace DX12 XeFG output frames right at the Vulkan submit boundary (downstream of VKD3D-Proton's async thread)
+    if (dxgiBacked && localPresentInfo.swapchainCount == 1)
+    {
+        if (dx12FgActive || FrameLimit::isSubframePacingActive())
+            FrameLimit::onFgOutputPresent(true);
+    }
+
     const bool trackFrameSync =
         !fgPresent &&
         (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0 ||
