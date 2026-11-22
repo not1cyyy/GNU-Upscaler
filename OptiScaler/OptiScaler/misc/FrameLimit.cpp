@@ -57,7 +57,7 @@ inline int TimerSleep(int64_t hundredNs)
 
     static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!timer)
-        timer = CreateWaitableTimerW(nullptr, nullptr, nullptr);
+        timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
 
     if (!timer)
         return 1;
