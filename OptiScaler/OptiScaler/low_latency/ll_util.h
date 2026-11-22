@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SysUtils.h"
+#include <misc/FrameLimit.h>
 #include <nvapi.h>
 #include <string>
 #include <map>
@@ -56,54 +57,8 @@ void tonvss(NvAPI_ShortString nvss, std::string str);
     if (std::string(it->func) == #method)                                                                              \
         return fakenvapi::idToFuncMapping.insert({ id, (void*) nvapi_calls::method }).first->second;
 
-// https://learn.microsoft.com/en-us/windows/win32/sync/using-waitable-timer-objects
-inline int timer_sleep(int64_t hundred_ns)
-{
-    static HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    LARGE_INTEGER due_time;
-
-    due_time.QuadPart = -hundred_ns;
-
-    if (!timer)
-        return 1;
-
-    if (!SetWaitableTimerEx(timer, &due_time, 0, NULL, NULL, NULL, 0))
-        return 2;
-
-    if (WaitForSingleObject(timer, INFINITE) != WAIT_OBJECT_0)
-        return 3;
-
-    return 0;
-};
-
-inline int busywait_sleep(int64_t ns)
-{
-    auto current_time = Util::GetTimestamp();
-    auto wait_until = current_time + ns;
-    while (current_time < wait_until)
-    {
-        current_time = Util::GetTimestamp();
-    }
-    return 0;
-}
-
-inline int eepy(int64_t ns)
-{
-    constexpr int64_t busywait_threshold = 2'000'000; // 2ms
-
-    int status;
-
-    auto current_time = Util::GetTimestamp();
-    if (ns <= busywait_threshold)
-        status = busywait_sleep(ns);
-    else
-        status = timer_sleep((ns - busywait_threshold) / 100);
-
-    if (int64_t sleep_deviation = ns - (Util::GetTimestamp() - current_time); sleep_deviation > 0 && !status)
-        status = busywait_sleep(sleep_deviation);
-
-    return status;
-}
+// Shared high-resolution NtDelayExecution + 250us pause sleep implemented in FrameLimit
+inline int eepy(int64_t ns) { return FrameLimit::sleepDurationNs(ns); }
 
 // function taken from jp7677's dxvk-nvapi project licensed under MIT
 inline std::string from_error_nr(const int16_t error_nr)

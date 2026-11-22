@@ -500,7 +500,9 @@ HRESULT STDMETHODCALLTYPE ReprojectionDXGISwapChain::GetMaximumFrameLatency(UINT
 
 HANDLE STDMETHODCALLTYPE ReprojectionDXGISwapChain::GetFrameLatencyWaitableObject(void)
 {
-    return _real2->GetFrameLatencyWaitableObject();
+    HANDLE handle = _real2->GetFrameLatencyWaitableObject();
+    FrameLimit::registerWaitableHandle(handle);
+    return handle;
 }
 
 HRESULT STDMETHODCALLTYPE ReprojectionDXGISwapChain::SetMatrixTransform(const DXGI_MATRIX_3X2_F* pMatrix)

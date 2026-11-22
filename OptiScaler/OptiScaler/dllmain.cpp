@@ -8,6 +8,7 @@
 #include "DllNames.h"
 #include "BuildInfo.h"
 #include "misc/GameConfigs.h"
+#include "misc/VulkanFrameSync.h"
 #include "plugins/PluginApi.h"
 
 #include "proxies/Dxgi_Proxy.h"
@@ -2234,6 +2235,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
     case DLL_PROCESS_DETACH:
         State::Instance().isShuttingDown = true;
+        VulkanFrameSync::Shutdown(lpReserved == nullptr);
 
         // Unhooking and cleaning stuff causing issues during shutdown.
         // Disabled for now to check if it cause any issues

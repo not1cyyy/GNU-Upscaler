@@ -978,6 +978,26 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetDevice(REFIID riid, void** 
     return _real->GetDevice(riid, ppDevice);
 }
 
+static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT syncInterval, uint64_t submitNs)
+{
+    if (swapChain == nullptr || State::Instance().isRunningOnLinux)
+        return;
+
+    DXGI_FRAME_STATISTICS stats {};
+    if (SUCCEEDED(swapChain->GetFrameStatistics(&stats)) && stats.SyncQPCTime.QuadPart > 0)
+    {
+        static UINT lastSyncCount = 0;
+        if (stats.SyncRefreshCount != lastSyncCount)
+        {
+            lastSyncCount = stats.SyncRefreshCount;
+            const uint64_t syncNs = Util::QpcToNs(stats.SyncQPCTime.QuadPart);
+            const int hz = Util::GetActiveRefreshRate(hwnd);
+            const uint64_t refreshNs = hz > 0 ? (1'000'000'000ULL / static_cast<uint64_t>(hz)) : 0ULL;
+            FrameLimit::recordScanoutTimestamp(submitNs, syncNs, refreshNs, 0, syncInterval > 0, false);
+        }
+    }
+}
+
 //
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UINT Flags)
 {
@@ -993,13 +1013,25 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
         auto isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr;
+        const bool shouldLimit = isCurrent && !State::Instance().reflexLimitsFps &&
+                                 State::Instance().activeFgOutput == FGOutput::NoFG &&
+                                 !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !FrameLimit::hasRecentVulkanPresent() &&
+                                 !InputCommon::can_limit_fps();
+
+        if (shouldLimit)
+            FrameLimit::prePresent(false);
+
+        const uint64_t submitNs =
+            (shouldLimit && !State::Instance().isRunningOnLinux) ? Util::GetTimestamp() : 0ULL;
         result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp, isCurrent);
+
+        if (shouldLimit && !State::Instance().isRunningOnLinux && SUCCEEDED(result))
+            RecordDxgiFrameStats(_real, _handle, SyncInterval, submitNs);
 
         // When Reflex can't be used to limit, sleep in present
         // DXVK's DXGI presents through Vulkan where the limiter already sleeps
-        if (isCurrent && !State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
-            !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !InputCommon::can_limit_fps())
-            FrameLimit::sleep(false);
+        if (shouldLimit)
+            FrameLimit::postPresent(false);
     }
     else
     {
@@ -1308,13 +1340,25 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
         auto isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr;
+        const bool shouldLimit = isCurrent && !State::Instance().reflexLimitsFps &&
+                                 State::Instance().activeFgOutput == FGOutput::NoFG &&
+                                 !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !FrameLimit::hasRecentVulkanPresent() &&
+                                 !InputCommon::can_limit_fps();
+
+        if (shouldLimit)
+            FrameLimit::prePresent(false);
+
+        const uint64_t submitNs =
+            (shouldLimit && !State::Instance().isRunningOnLinux) ? Util::GetTimestamp() : 0ULL;
         result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp, isCurrent);
+
+        if (shouldLimit && !State::Instance().isRunningOnLinux && SUCCEEDED(result))
+            RecordDxgiFrameStats(_real1, _handle, SyncInterval, submitNs);
 
         // When Reflex can't be used to limit, sleep in present
         // DXVK's DXGI presents through Vulkan where the limiter already sleeps
-        if (isCurrent && !State::Instance().reflexLimitsFps && State::Instance().activeFgOutput == FGOutput::NoFG &&
-            !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !InputCommon::can_limit_fps())
-            FrameLimit::sleep(false);
+        if (shouldLimit)
+            FrameLimit::postPresent(false);
     }
     else
     {
@@ -1377,7 +1421,9 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetMaximumFrameLatency(UINT* p
 
 HANDLE STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetFrameLatencyWaitableObject(void)
 {
-    return _real2->GetFrameLatencyWaitableObject();
+    HANDLE handle = _real2->GetFrameLatencyWaitableObject();
+    FrameLimit::registerWaitableHandle(handle);
+    return handle;
 }
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetMatrixTransform(const DXGI_MATRIX_3X2_F* pMatrix)

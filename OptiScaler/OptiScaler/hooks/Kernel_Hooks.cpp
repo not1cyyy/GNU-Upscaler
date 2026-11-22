@@ -10,6 +10,7 @@
 #include <Config.h>
 
 #include <cwctype>
+#include <misc/FrameLimit.h>
 #include <misc/IdentifyGpu.h>
 #include <fsr4/FSR4DriverProvider.h>
 
@@ -499,4 +500,18 @@ BOOL KernelHooks::hk_K32_FreeLibrary(HMODULE lpLibrary)
     LibraryLoadHooks::AfterFreeLibrary(lpLibrary);
 
     return freeResult;
+}
+
+VALIDATE_HOOK(hk_KB_WaitForSingleObjectEx, KernelBaseProxy::PFN_WaitForSingleObjectEx)
+DWORD WINAPI KernelHooks::hk_KB_WaitForSingleObjectEx(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertable)
+{
+    const DWORD result = o_KB_WaitForSingleObjectEx(hHandle, dwMilliseconds, bAlertable);
+
+    if (result == WAIT_OBJECT_0 && dwMilliseconds > 0 && !State::Instance().isShuttingDown &&
+        FrameLimit::isTrackedWaitable(hHandle) && Util::GetCallerModule(_ReturnAddress()) != dllModule)
+    {
+        FrameLimit::onSimulationStart();
+    }
+
+    return result;
 }

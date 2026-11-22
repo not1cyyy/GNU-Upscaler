@@ -6,6 +6,7 @@
 #include "input/KeyPressLatch.h"
 #include "PresentRateMeter.h"
 #include <inputs/FG/XeFG_Inputs_Dx12.h>
+#include <misc/FrameLimit.h>
 #include <misc/GaqController.h>
 
 #include "input/input_system.h"
@@ -7209,13 +7210,65 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
         }
         else
         {
-            currentMethod = "Fallback";
+            switch (FrameLimit::currentMode())
+            {
+            case FrameLimit::Mode::FrontEdgeJit:
+                currentMethod = "Front-Edge JIT";
+                break;
+            case FrameLimit::Mode::FrontEdgeSync:
+                currentMethod = "Front-Edge Sync";
+                break;
+            case FrameLimit::Mode::BackEdge:
+                currentMethod = "Back-Edge";
+                break;
+            }
         }
+
+        const auto syncStats = FrameLimit::getStats();
+        if (syncStats.simStartActive)
+            currentMethod.append(syncStats.earlyAcquireActive ? " + EarlyAcquire" : " + Waitable");
+        if (syncStats.vblankLocked && syncStats.detectedRefreshHz > 0.0)
+            currentMethod.append(std::format(" + VBlank PLL ({:.1f} Hz)", syncStats.detectedRefreshHz));
+        if (syncStats.gamescopeLimiterDetected)
+            currentMethod.append(" [Gamescope]");
 
         if (state.rtssReflexInjection)
             currentMethod.append(" (RTSS)");
 
         ImGui::Text("Current method: %s", currentMethod.c_str());
+
+        if (syncStats.displayTimingActive || syncStats.presentWaitActive || syncStats.vblankLocked)
+        {
+            const std::string marginText =
+                syncStats.lastPresentMarginUs > 0
+                    ? std::format(" | Margin: {:.2f} ms", syncStats.lastPresentMarginUs / 1000.0)
+                    : "";
+            const std::string inFlightText =
+                syncStats.activeMaxInFlight > 0 ? std::format(" | InFlight: {}", syncStats.activeMaxInFlight) : "";
+            const char* syncSource = syncStats.displayTimingScheduleActive ? "DisplayTiming (Scheduled)"
+                                     : syncStats.displayTimingActive       ? "DisplayTiming"
+                                     : syncStats.presentWaitActive         ? "PresentWait"
+                                                                           : "DXGI Sync";
+            ImGui::Text("Sync: %s%s%s%s | CPU: %.2f ms | GPU: %.2f ms", syncSource,
+                        syncStats.vblankLocked ? " (Locked)" : " (Async/VRR)", marginText.c_str(),
+                        inFlightText.c_str(), syncStats.lastCpuWorkUs / 1000.0, syncStats.lastGpuWorkUs / 1000.0);
+        }
+
+        if (FrameLimit::targetFps() > 0.0f)
+        {
+            float pacerHistory[120] {};
+            int count = 0;
+            float minMs = 0.0f;
+            float maxMs = 0.0f;
+            FrameLimit::getRecentFrameTimes(pacerHistory, 120, count, minMs, maxMs);
+            if (count > 2)
+            {
+                const float pad = std::max(0.25f, (maxMs - minMs) * 0.15f);
+                const std::string overlay = std::format("{:.2f} - {:.2f} ms", minMs, maxMs);
+                ImGui::PlotLines("##PacerFrametime", pacerHistory, count, 0, overlay.c_str(),
+                                 std::max(0.0f, minMs - pad), maxMs + pad, ImVec2(0.0f, 38.0f * menuResScale));
+            }
+        }
 
         if (activeOutput == LowLatencyMode::AntiLag2)
             ShowTooltip("FSR Anti-Lag 2.0 is the new name for AntiLag 2\nDon't ask me why");
@@ -7245,6 +7298,43 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
         {
             _limitFps = 0.0f;
             config->FramerateLimit = _limitFps;
+        }
+
+        {
+            const char* modeItems[] = { "Front-Edge JIT (Low Latency)", "Front-Edge Sync (Pre-Present)",
+                                        "Back-Edge (Post-Present)" };
+            int limitMode = std::clamp(config->FramerateLimitMode.value_or_default(), 0, 2);
+            if (ImGui::Combo("Pacing Mode", &limitMode, modeItems, IM_ARRAYSIZE(modeItems)))
+                config->FramerateLimitMode = limitMode;
+            ShowTooltip("Front-Edge JIT: Sleeps after present minus measured CPU work, then trims pre-present\n"
+                        "Front-Edge Sync: RTSS-style wait right before Present aligned to VBlank\n"
+                        "Back-Edge: Drift-free post-present sleep");
+
+            const char* inFlightItems[] = { "Off", "Auto (2)", "1 (Strict)", "2 (Balanced)", "3", "4" };
+            const int inFlightValues[] = { -1, 0, 1, 2, 3, 4 };
+            int rawInFlight = config->FramerateLimitMaxInFlight.value_or_default();
+            int inFlightIdx = 1;
+            for (int i = 0; i < IM_ARRAYSIZE(inFlightValues); ++i)
+            {
+                if (inFlightValues[i] == rawInFlight)
+                {
+                    inFlightIdx = i;
+                    break;
+                }
+            }
+            if (ImGui::Combo("Max In-Flight Presents", &inFlightIdx, inFlightItems, IM_ARRAYSIZE(inFlightItems)))
+                config->FramerateLimitMaxInFlight = inFlightValues[inFlightIdx];
+            ShowTooltip("Uses VK_KHR_present_wait to prevent swapchain queue buildup (Linux/Vulkan/DXVK/VKD3D)");
+
+            float syncMargin = config->FramerateLimitSyncMarginMs.value_or_default();
+            if (ImGui::SliderFloat("VBlank Margin (ms)", &syncMargin, 0.0f, 3.0f, "%.2f"))
+                config->FramerateLimitSyncMarginMs = syncMargin;
+            ShowTooltip("Lead time ahead of detected VBlank edge when VBlank phase lock is active");
+
+            bool dtSchedule = config->FramerateLimitDisplayTimingSchedule.value_or_default();
+            if (ImGui::Checkbox("Compositor DesiredPresentTime", &dtSchedule))
+                config->FramerateLimitDisplayTimingSchedule = dtSchedule;
+            ShowTooltip("Schedules VK_GOOGLE_display_timing desiredPresentTime when clock offset is calibrated");
         }
 
         ImGui::Spacing();

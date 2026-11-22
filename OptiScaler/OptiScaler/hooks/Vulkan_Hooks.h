@@ -71,6 +71,7 @@ class VulkanHooks
     // The driver's swapchain function behind OptiScaler's hook, below hooks others put on the same function.
     // vkQueuePresentKHR's also times the presented frames for the menu. nullptr when it isn't hooked.
     static PFN_vkVoidFunction OriginalSwapchainFunction(const char* pName);
+    static PFN_vkWaitForPresentKHR OriginalWaitForPresentKHR();
 
     static void Hook(HMODULE vulkan1);
     static void Unhook();

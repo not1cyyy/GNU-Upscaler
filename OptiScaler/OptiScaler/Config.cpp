@@ -290,6 +290,11 @@ bool Config::Reload(std::filesystem::path iniPath)
         // Framerate
         {
             FramerateLimit.set_from_config(readFloat("Framerate", "FramerateLimit"));
+            FramerateLimitMode.set_from_config(readInt("Framerate", "FramerateLimitMode"));
+            FramerateLimitMaxInFlight.set_from_config(readInt("Framerate", "FramerateLimitMaxInFlight"));
+            FramerateLimitSyncMarginMs.set_from_config(readFloat("Framerate", "FramerateLimitSyncMarginMs"));
+            FramerateLimitDisplayTimingSchedule.set_from_config(
+                readBool("Framerate", "FramerateLimitDisplayTimingSchedule"));
         }
 
         // FSR Common
@@ -1620,6 +1625,14 @@ bool Config::SaveIni()
     {
         ini.SetValue("Framerate", "FramerateLimit",
                      GetFloatValue(Instance()->FramerateLimit.value_for_config()).c_str());
+        ini.SetValue("Framerate", "FramerateLimitMode",
+                     GetIntValue(Instance()->FramerateLimitMode.value_for_config()).c_str());
+        ini.SetValue("Framerate", "FramerateLimitMaxInFlight",
+                     GetIntValue(Instance()->FramerateLimitMaxInFlight.value_for_config()).c_str());
+        ini.SetValue("Framerate", "FramerateLimitSyncMarginMs",
+                     GetFloatValue(Instance()->FramerateLimitSyncMarginMs.value_for_config()).c_str());
+        ini.SetValue("Framerate", "FramerateLimitDisplayTimingSchedule",
+                     GetBoolValue(Instance()->FramerateLimitDisplayTimingSchedule.value_for_config()).c_str());
     }
 
     // Output Scaling

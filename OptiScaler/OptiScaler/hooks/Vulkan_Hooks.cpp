@@ -18,6 +18,7 @@
 #include <fsr4/FSR4Models.h>
 
 #include <misc/FrameLimit.h>
+#include <misc/VulkanFrameSync.h>
 #include <misc/DeferredRelease.h>
 #include "Reflex_Hooks.h"
 
@@ -672,6 +673,8 @@ static void hkvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAll
         std::erase_if(_passThroughSwapchains, [device](const auto& entry) { return entry.first == device; });
     }
 
+    VulkanFrameSync::OnDeviceDestroyed(device);
+
     o_vkDestroyDevice(device, pAllocator);
 }
 
@@ -736,6 +739,7 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 
     VkResult result;
     bool timelineSemaphoresEnabled = false;
+    VulkanFrameSync::PreparedDeviceCreate preparedFrameSync {};
     {
         VulkanDeviceFeatureState deviceFeatures(&localCreateInfo, getPhysicalDeviceFeatures2);
         VulkanDeviceFeatureState* featureState = nullptr;
@@ -745,6 +749,12 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
 
         VulkanSpoofing::hkvkCreateDevice(physicalDevice, &localCreateInfo, pAllocator, pDevice, featureState,
                                          requestedApiVersion);
+
+        if (!State::Instance().vulkanSkipHooks)
+        {
+            VulkanFrameSync::PrepareDeviceExtensions(physicalDevice, physicalDeviceInstance, o_vkGetInstanceProcAddr,
+                                                     getPhysicalDeviceFeatures2, &localCreateInfo, preparedFrameSync);
+        }
 
         timelineSemaphoresEnabled = TimelineSemaphoresEnabled(&localCreateInfo);
 
@@ -776,14 +786,26 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
         Hudfix_Vk::HookDevice(*pDevice);
     }
 
+    if (result == VK_SUCCESS && !State::Instance().vulkanSkipHooks &&
+        (Config::Instance()->OverlayMenu.value_or_default() ||
+         Config::Instance()->FramerateLimit.value_or_default() > 0.0f ||
+         Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0))
+    {
+        HookDevice(*pDevice);
+    }
+
+    if (result == VK_SUCCESS && !State::Instance().vulkanSkipHooks)
+    {
+        const auto getDevProc = o_vkGetDeviceProcAddr != nullptr ? o_vkGetDeviceProcAddr : vkGetDeviceProcAddr;
+        VulkanFrameSync::OnDeviceCreated(*pDevice, preparedFrameSync.caps, getDevProc, o_WaitForPresentKHR);
+    }
+
     if (result == VK_SUCCESS && Config::Instance()->OverlayMenu.value_or_default())
     {
         if (!State::Instance().vulkanSkipHooks)
         {
             // Disabled to prevent unnecessary object release
             // MenuOverlayVk::DestroyVulkanObjects(false);
-
-            HookDevice(*pDevice);
 
             if (!State::Instance().creatingD3DDevice)
             {
@@ -959,9 +981,24 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
             fg->Present();
     }
 
+    FrameLimit::markVulkanPresent();
+
+    const bool fgActive = fgPresent && fg->IsActive() && !fg->IsPaused();
+    const bool limitActive = !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
+    const bool trackFrameSync =
+        !fgPresent && (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0);
+
+    VulkanFrameSync::PresentScope frameSyncScope {};
+    if (trackFrameSync)
+        VulkanFrameSync::PreparePresent(&localPresentInfo, fgPresent, frameSyncScope);
+
+    if (limitActive)
+        FrameLimit::prePresent(fgActive);
+
     // original call
     ScopedVulkanCreatingSC scopedVulkanCreatingSC {};
     VkResult result;
+    const uint64_t submitNs = (trackFrameSync || State::Instance().isGamescopeActive) ? Util::GetTimestamp() : 0ULL;
 
     if (fgPresent)
     {
@@ -971,15 +1008,20 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     else
     {
         result = o_QueuePresentKHR(queue, &localPresentInfo);
+        if (State::Instance().isGamescopeActive && submitNs > 0)
+            FrameLimit::recordPresentDuration(Util::GetTimestamp() - submitNs);
     }
+
+    if (trackFrameSync)
+        VulkanFrameSync::PostPresent(frameSyncScope, result, submitNs);
 
     // dxvk/vkd3d-proton's are counted by the DXGI swapchain
     if (!dxgiBacked)
         DeferredRelease::Process();
 
     // The limit counts presented frames, the FG output presents its generated frames from the game's present
-    if (!State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps())
-        FrameLimit::sleep(fgPresent && fg->IsActive() && !fg->IsPaused());
+    if (limitActive)
+        FrameLimit::postPresent(fgActive);
 
     LOG_FUNC_RESULT(result);
     return result;
@@ -1133,9 +1175,9 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
     }
 
     VkResult result = VK_SUCCESS;
+    bool fgSwapchain = false;
     {
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
-        bool fgSwapchain = false;
         auto fg = State::Instance().currentVkFG;
 
         if (fg != nullptr && pCreateInfo != nullptr && !dxgiBacked && !State::Instance().vulkanSkipHooks)
@@ -1165,6 +1207,12 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
     if (result == VK_SUCCESS && lowLatencySwapchain)
         VulkanHooks::SetLowLatencySwapchain(*pSwapchain);
 
+    if (result == VK_SUCCESS && !fgSwapchain && device != VK_NULL_HANDLE && pCreateInfo != nullptr &&
+        *pSwapchain != VK_NULL_HANDLE && !State::Instance().vulkanSkipHooks)
+    {
+        VulkanFrameSync::OnSwapchainCreated(device, *pSwapchain, pCreateInfo->presentMode, pCreateInfo->oldSwapchain);
+    }
+
     if (result == VK_SUCCESS && device != VK_NULL_HANDLE && pCreateInfo != nullptr && *pSwapchain != VK_NULL_HANDLE &&
         !State::Instance().vulkanSkipHooks && !dxgiBacked)
     {
@@ -1179,9 +1227,12 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
 
         _gameSwapchain = *pSwapchain;
 
-        auto hwnd = VulkanHooks::SurfaceWindow(pCreateInfo->surface);
-        MenuOverlayVk::CreateSwapchain(device, _PD, _instance, hwnd != nullptr ? hwnd : _hwnd, pCreateInfo, pAllocator,
-                                       pSwapchain);
+        if (Config::Instance()->OverlayMenu.value_or_default())
+        {
+            auto hwnd = VulkanHooks::SurfaceWindow(pCreateInfo->surface);
+            MenuOverlayVk::CreateSwapchain(device, _PD, _instance, hwnd != nullptr ? hwnd : _hwnd, pCreateInfo,
+                                           pAllocator, pSwapchain);
+        }
     }
 
     LOG_FUNC_RESULT(result);
@@ -1201,6 +1252,7 @@ static void hkvkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, c
 
     if (swapchain != VK_NULL_HANDLE)
     {
+        VulkanFrameSync::OnSwapchainDestroyed(device, swapchain);
         VulkanHooks::ForgetLowLatencySwapchain(swapchain);
         MenuOverlayVk::DestroySwapchain(device, swapchain);
     }
@@ -1263,7 +1315,15 @@ static VkResult hkvkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchai
         return fg->AcquireNextImage(device, swapchain, timeout, semaphore, fence, pImageIndex);
     }
 
-    return o_AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+    const bool trackAcquire = !FromFGOutput(_ReturnAddress()) && !IsPassThroughSwapchain(device, swapchain) &&
+                              (State::Instance().isGamescopeActive || FrameLimit::isLimitingActive());
+    const uint64_t acquireStart = trackAcquire ? Util::GetTimestamp() : 0ULL;
+
+    const VkResult result = o_AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+    if (trackAcquire && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR))
+        FrameLimit::onVulkanAcquire(Util::GetTimestamp() - acquireStart);
+
+    return result;
 }
 
 // RDR2 acquires with this one, the FG output's swapchain only has the plain acquire. The device mask is for device
@@ -1284,7 +1344,16 @@ static VkResult hkvkAcquireNextImage2KHR(VkDevice device, const VkAcquireNextIma
                                     pAcquireInfo->fence, pImageIndex);
     }
 
-    return o_AcquireNextImage2KHR(device, pAcquireInfo, pImageIndex);
+    const bool trackAcquire = pAcquireInfo != nullptr && !FromFGOutput(_ReturnAddress()) &&
+                              !IsPassThroughSwapchain(device, pAcquireInfo->swapchain) &&
+                              (State::Instance().isGamescopeActive || FrameLimit::isLimitingActive());
+    const uint64_t acquireStart = trackAcquire ? Util::GetTimestamp() : 0ULL;
+
+    const VkResult result = o_AcquireNextImage2KHR(device, pAcquireInfo, pImageIndex);
+    if (trackAcquire && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR))
+        FrameLimit::onVulkanAcquire(Util::GetTimestamp() - acquireStart);
+
+    return result;
 }
 
 VALIDATE_HOOK(hkvkSetHdrMetadataEXT, PFN_vkSetHdrMetadataEXT)
@@ -1553,6 +1622,8 @@ PFN_vkVoidFunction VulkanHooks::OriginalSwapchainFunction(const char* pName)
 
     return nullptr;
 }
+
+PFN_vkWaitForPresentKHR VulkanHooks::OriginalWaitForPresentKHR() { return o_WaitForPresentKHR; }
 
 void VulkanHooks::Hook(HMODULE vulkan1)
 {

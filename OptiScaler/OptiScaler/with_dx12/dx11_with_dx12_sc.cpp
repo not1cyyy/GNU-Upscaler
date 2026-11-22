@@ -14,6 +14,7 @@
 
 #include <Util.h>
 #include <Config.h>
+#include <misc/FrameLimit.h>
 #include <misc/IdentifyGpu.h>
 
 #include <d3d11.h>
@@ -753,10 +754,14 @@ HRESULT STDMETHODCALLTYPE Dx11wDx12SC::GetMaximumFrameLatency(UINT* pMaxLatency)
 
 HANDLE STDMETHODCALLTYPE Dx11wDx12SC::GetFrameLatencyWaitableObject(void)
 {
+    HANDLE handle = nullptr;
     if (_fgSwapChain != nullptr)
-        return _fgSwapChain->GetFrameLatencyWaitableObject();
+        handle = _fgSwapChain->GetFrameLatencyWaitableObject();
+    else
+        handle = _real2 != nullptr ? _real2->GetFrameLatencyWaitableObject() : nullptr;
 
-    return _real2 != nullptr ? _real2->GetFrameLatencyWaitableObject() : nullptr;
+    FrameLimit::registerWaitableHandle(handle);
+    return handle;
 }
 
 HRESULT STDMETHODCALLTYPE Dx11wDx12SC::SetMatrixTransform(const DXGI_MATRIX_3X2_F* pMatrix)

@@ -779,7 +779,11 @@ HRESULT FGHooks::hkSetFullscreenState(IDXGISwapChain* This, BOOL Fullscreen, IDX
 HANDLE FGHooks::hkGetFrameLatencyWaitableObject(IDXGISwapChain2* This)
 {
     if (State::Instance().activeFgOutput != FGOutput::XeFG)
-        return o_FGSCGetFrameLatencyWaitableObject(This);
+    {
+        HANDLE handle = o_FGSCGetFrameLatencyWaitableObject(This);
+        FrameLimit::registerWaitableHandle(handle);
+        return handle;
+    }
 
     if (_semaphore == nullptr)
     {
@@ -797,6 +801,7 @@ HANDLE FGHooks::hkGetFrameLatencyWaitableObject(IDXGISwapChain2* This)
         return nullptr;
     }
 
+    FrameLimit::registerWaitableHandle(duplicatedHandle);
     return duplicatedHandle;
 }
 
@@ -1543,6 +1548,14 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
         }
     }
 
+    const bool fgLimitActive = fg != nullptr ? fg->IsActive() && !fg->IsPaused() : false;
+    const bool shouldLimit = willPresent && !state.reflexLimitsFps && state.activeFgOutput != FGOutput::NoFG &&
+                             !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !FrameLimit::hasRecentVulkanPresent() &&
+                             !InputCommon::can_limit_fps();
+
+    if (shouldLimit)
+        FrameLimit::prePresent(fgLimitActive);
+
     HRESULT result;
     const auto presentStart = Util::MillisecondsNow();
     if (pPresentParameters == nullptr)
@@ -1594,10 +1607,9 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
         Hudfix_Dx12::PresentEnd();
 
     // DXVK's DXGI presents through Vulkan where the limiter already sleeps
-    if (willPresent && !state.reflexLimitsFps && state.activeFgOutput != FGOutput::NoFG &&
-        !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !InputCommon::can_limit_fps())
+    if (shouldLimit)
     {
-        FrameLimit::sleep(fg != nullptr ? fg->IsActive() && !fg->IsPaused() : false);
+        FrameLimit::postPresent(fgLimitActive);
     }
 
     if (willPresent)

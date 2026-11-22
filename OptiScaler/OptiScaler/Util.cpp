@@ -1122,14 +1122,38 @@ std::map<Util::Luid, std::filesystem::path> Util::GetDriverStore()
     return result;
 }
 
+uint64_t Util::QpcToNs(int64_t ticks)
+{
+    static LARGE_INTEGER s_frequency;
+    static BOOL s_use_qpc = QueryPerformanceFrequency(&s_frequency);
+
+    if (s_use_qpc && s_frequency.QuadPart > 0)
+    {
+        const uint64_t q = ticks > 0 ? static_cast<uint64_t>(ticks) : 0ULL;
+        const uint64_t f = static_cast<uint64_t>(s_frequency.QuadPart);
+        const uint64_t whole = (q / f) * 1'000'000'000ULL;
+        const uint64_t rem = q % f;
+
+        if (f <= 18'000'000'000ULL)
+            return whole + (rem * 1'000'000'000ULL) / f;
+
+        return whole + static_cast<uint64_t>(static_cast<long double>(rem) * 1'000'000'000.0L / f);
+    }
+
+    return 0ULL;
+}
+
 uint64_t Util::GetTimestamp()
 {
-    FILETIME fileTime;
-    GetSystemTimePreciseAsFileTime(&fileTime);
+    LARGE_INTEGER now;
+    if (QueryPerformanceCounter(&now))
+    {
+        const uint64_t ns = QpcToNs(now.QuadPart);
+        if (ns > 0)
+            return ns;
+    }
 
-    uint64_t time = (static_cast<uint64_t>(fileTime.dwHighDateTime) << 32) | fileTime.dwLowDateTime;
-
-    return time * 100;
+    return GetTickCount64() * 1'000'000ULL;
 }
 
 void Util::SetFlagEnvVar(const wchar_t* name, bool enabled)

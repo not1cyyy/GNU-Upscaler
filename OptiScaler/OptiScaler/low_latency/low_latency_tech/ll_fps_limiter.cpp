@@ -13,16 +13,16 @@ void FpsLimiter::limit()
     }
 
     // Behind schedule (or way ahead after a change), start pacing from now instead of catching up
-    if (next_frame_timestamp <= now || next_frame_timestamp - now > interval_ns)
+    if (next_frame_timestamp <= now || next_frame_timestamp - now > interval_ns + (interval_ns / 4))
     {
-        next_frame_timestamp = now + interval_ns;
+        next_frame_timestamp = FrameLimit::alignDeadlineToVBlank(now + interval_ns, interval_ns);
         return;
     }
 
     if (auto res = eepy(next_frame_timestamp - now); res)
         LOG_ERROR("Sleep command failed: {}", res);
 
-    next_frame_timestamp += interval_ns;
+    next_frame_timestamp = FrameLimit::alignDeadlineToVBlank(next_frame_timestamp + interval_ns, interval_ns);
 }
 
 void FpsLimiter::get_sleep_status(SleepParams* sleep_params)

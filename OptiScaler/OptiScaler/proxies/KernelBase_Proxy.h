@@ -17,6 +17,7 @@ class KernelBaseProxy
     typedef decltype(&GetModuleHandleW) PFN_GetModuleHandleW;
     typedef decltype(&GetModuleHandleExA) PFN_GetModuleHandleExA;
     typedef decltype(&GetModuleHandleExW) PFN_GetModuleHandleExW;
+    typedef decltype(&WaitForSingleObjectEx) PFN_WaitForSingleObjectEx;
 
     static void Init()
     {
@@ -41,6 +42,7 @@ class KernelBaseProxy
         _GetModuleHandleExA = (PFN_GetModuleHandleExA) (GetProcAddress(_dll, "GetModuleHandleExA"));
         _GetModuleHandleExW = (PFN_GetModuleHandleExW) (GetProcAddress(_dll, "GetModuleHandleExW"));
         _GetProcAddress = (PFN_GetProcAddress) (GetProcAddress(_dll, "GetProcAddress"));
+        _WaitForSingleObjectEx = (PFN_WaitForSingleObjectEx) (GetProcAddress(_dll, "WaitForSingleObjectEx"));
     }
 
     static HMODULE Module() { return _dll; }
@@ -55,6 +57,7 @@ class KernelBaseProxy
     static PFN_GetModuleHandleW GetModuleHandleW_() { return _GetModuleHandleW; }
     static PFN_GetModuleHandleExA GetModuleHandleExA_() { return _GetModuleHandleExA; }
     static PFN_GetModuleHandleExW GetModuleHandleExW_() { return _GetModuleHandleExW; }
+    static PFN_WaitForSingleObjectEx WaitForSingleObjectEx_() { return _WaitForSingleObjectEx; }
 
     static PFN_FreeLibrary FreeLibrary_Hooked() { return (PFN_FreeLibrary) GetProcAddress_()(_dll, "FreeLibrary"); }
     static PFN_LoadLibraryA LoadLibraryA_Hooked() { return (PFN_LoadLibraryA) _GetProcAddress(_dll, "LoadLibraryA"); }
@@ -86,6 +89,10 @@ class KernelBaseProxy
     static PFN_GetModuleHandleExW GetModuleHandleExW_Hooked()
     {
         return (PFN_GetModuleHandleExW) KernelBaseProxy::GetProcAddress_()(_dll, "GetModuleHandleExW");
+    }
+    static PFN_WaitForSingleObjectEx WaitForSingleObjectEx_Hooked()
+    {
+        return (PFN_WaitForSingleObjectEx) KernelBaseProxy::GetProcAddress_()(_dll, "WaitForSingleObjectEx");
     }
 
     static PFN_FreeLibrary Hook_FreeLibrary(PVOID method)
@@ -268,6 +275,26 @@ class KernelBaseProxy
         return addr;
     }
 
+    static PFN_WaitForSingleObjectEx Hook_WaitForSingleObjectEx(PVOID method)
+    {
+        auto addr = WaitForSingleObjectEx_Hooked();
+        if (addr == nullptr)
+            return nullptr;
+
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        DetourAttach(&(PVOID&) addr, method);
+        auto detourResult = DetourTransactionCommit();
+        if (detourResult != NO_ERROR)
+        {
+            LOG_ERROR("Failed to hook: {:X}", detourResult);
+            return nullptr;
+        }
+
+        _WaitForSingleObjectEx = addr;
+        return addr;
+    }
+
   private:
     inline static HMODULE _dll = nullptr;
 
@@ -281,4 +308,5 @@ class KernelBaseProxy
     inline static PFN_GetModuleHandleW _GetModuleHandleW = nullptr;
     inline static PFN_GetModuleHandleExA _GetModuleHandleExA = nullptr;
     inline static PFN_GetModuleHandleExW _GetModuleHandleExW = nullptr;
+    inline static PFN_WaitForSingleObjectEx _WaitForSingleObjectEx = nullptr;
 };

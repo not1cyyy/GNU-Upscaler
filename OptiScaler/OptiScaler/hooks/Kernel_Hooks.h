@@ -42,6 +42,7 @@ class KernelHooks
     inline static KernelBaseProxy::PFN_LoadLibraryExA o_KB_LoadLibraryExA = nullptr;
     inline static KernelBaseProxy::PFN_LoadLibraryExW o_KB_LoadLibraryExW = nullptr;
     inline static KernelBaseProxy::PFN_GetProcAddress o_KB_GetProcAddress = nullptr;
+    inline static KernelBaseProxy::PFN_WaitForSingleObjectEx o_KB_WaitForSingleObjectEx = nullptr;
 
     static FARPROC WINAPI hk_K32_GetProcAddress(HMODULE hModule, LPCSTR lpProcName);
     static HMODULE WINAPI hk_K32_GetModuleHandleA(LPCSTR lpModuleName);
@@ -61,6 +62,7 @@ class KernelHooks
     static HMODULE hk_K32_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags);
     static HMODULE hk_K32_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags);
     static HMODULE hk_KB_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags);
+    static DWORD WINAPI hk_KB_WaitForSingleObjectEx(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertable);
     static BOOL hk_K32_FreeLibrary(HMODULE lpLibrary);
 
     static inline std::mutex hookMutex32;
@@ -131,6 +133,9 @@ class KernelHooks
 
         if (o_KB_GetProcAddress == nullptr)
             o_KB_GetProcAddress = KernelBaseProxy::Hook_GetProcAddress(hk_KB_GetProcAddress);
+
+        if (o_KB_WaitForSingleObjectEx == nullptr)
+            o_KB_WaitForSingleObjectEx = KernelBaseProxy::Hook_WaitForSingleObjectEx(hk_KB_WaitForSingleObjectEx);
 
         if (!Config::Instance()->UseNtdllHooks.value_or_default())
         {

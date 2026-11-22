@@ -359,6 +359,9 @@
     <ClInclude Include="misc\FrameLimit.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="misc\VulkanFrameSync.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="misc\DeferredRelease.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -1413,6 +1416,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="misc\FrameLimit.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="misc\VulkanFrameSync.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="misc\DeferredRelease.cpp">
