@@ -1013,10 +1013,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
         auto isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr;
+        if (isCurrent)
+            FrameLimit::markDxgiPresent();
+
         const bool shouldLimit = isCurrent && !State::Instance().reflexLimitsFps &&
-                                 State::Instance().activeFgOutput == FGOutput::NoFG &&
-                                 !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !FrameLimit::hasRecentVulkanPresent() &&
-                                 !InputCommon::can_limit_fps();
+                                 State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();
 
         if (shouldLimit)
             FrameLimit::prePresent(false);
@@ -1028,8 +1029,6 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
         if (shouldLimit && !State::Instance().isRunningOnLinux && SUCCEEDED(result))
             RecordDxgiFrameStats(_real, _handle, SyncInterval, submitNs);
 
-        // When Reflex can't be used to limit, sleep in present
-        // DXVK's DXGI presents through Vulkan where the limiter already sleeps
         if (shouldLimit)
             FrameLimit::postPresent(false);
     }
@@ -1340,10 +1339,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
         auto isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr;
+        if (isCurrent)
+            FrameLimit::markDxgiPresent();
+
         const bool shouldLimit = isCurrent && !State::Instance().reflexLimitsFps &&
-                                 State::Instance().activeFgOutput == FGOutput::NoFG &&
-                                 !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !FrameLimit::hasRecentVulkanPresent() &&
-                                 !InputCommon::can_limit_fps();
+                                 State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();
 
         if (shouldLimit)
             FrameLimit::prePresent(false);
@@ -1355,8 +1355,6 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
         if (shouldLimit && !State::Instance().isRunningOnLinux && SUCCEEDED(result))
             RecordDxgiFrameStats(_real1, _handle, SyncInterval, submitNs);
 
-        // When Reflex can't be used to limit, sleep in present
-        // DXVK's DXGI presents through Vulkan where the limiter already sleeps
         if (shouldLimit)
             FrameLimit::postPresent(false);
     }

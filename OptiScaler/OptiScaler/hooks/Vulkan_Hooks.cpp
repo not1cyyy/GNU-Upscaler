@@ -962,6 +962,27 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
 
     MenuCommon::FGOutputPresents(fgPresent && fg->IsActive() && !fg->IsPaused());
 
+    auto dx12Fg = State::Instance().currentFG;
+    const bool dx12FgActive = dxgiBacked && dx12Fg != nullptr && dx12Fg->IsActive() && !dx12Fg->IsPaused();
+
+    if (!dx12FgActive)
+        FrameLimit::markVulkanPresent();
+
+    const bool fgActive = fgPresent && fg->IsActive() && !fg->IsPaused();
+    const bool dxgiPacingActive = dxgiBacked && FrameLimit::hasRecentDxgiPresent();
+    const bool limitActive =
+        !dx12FgActive && !dxgiPacingActive && !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
+    const bool trackFrameSync =
+        !fgPresent && !dx12FgActive &&
+        (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0);
+
+    VulkanFrameSync::PresentScope frameSyncScope {};
+    if (trackFrameSync)
+        VulkanFrameSync::PreparePresent(&localPresentInfo, fgPresent, frameSyncScope);
+
+    if (limitActive)
+        FrameLimit::prePresent(fgActive);
+
     if (fgPresent)
     {
         auto& state = State::Instance();
@@ -980,25 +1001,6 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
         if (fg->IsActive() && !fg->IsPaused())
             fg->Present();
     }
-
-    auto dx12Fg = State::Instance().currentFG;
-    const bool dx12FgActive = dxgiBacked && dx12Fg != nullptr && dx12Fg->IsActive() && !dx12Fg->IsPaused();
-
-    if (!dx12FgActive)
-        FrameLimit::markVulkanPresent();
-
-    const bool fgActive = fgPresent && fg->IsActive() && !fg->IsPaused();
-    const bool limitActive = !dx12FgActive && !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
-    const bool trackFrameSync =
-        !fgPresent && !dx12FgActive &&
-        (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0);
-
-    VulkanFrameSync::PresentScope frameSyncScope {};
-    if (trackFrameSync)
-        VulkanFrameSync::PreparePresent(&localPresentInfo, fgPresent, frameSyncScope);
-
-    if (limitActive)
-        FrameLimit::prePresent(fgActive);
 
     // original call
     ScopedVulkanCreatingSC scopedVulkanCreatingSC {};

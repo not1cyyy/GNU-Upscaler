@@ -25,6 +25,7 @@
 #endif
 
 typedef NTSTATUS(NTAPI* PFN_NtDelayExecution)(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval);
+typedef NTSTATUS(NTAPI* PFN_NtSetTimerResolution)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
 
 namespace
 {
@@ -34,10 +35,32 @@ constexpr uint64_t kMinValidRefreshNs = 1'000'000ULL;   // 1000 Hz
 constexpr uint64_t kMaxValidRefreshNs = 100'000'000ULL; // 10 Hz
 constexpr int64_t kMaxPllNudgePerFrameNs = 150'000;     // 0.15ms max phase slew per frame
 
+std::atomic<int64_t> g_timerOvershootEmaNs { 200'000 }; // Adaptive OS wakeup slack reserve (100us..1.2ms)
+
+inline void EnsureHighResTimerResolution()
+{
+    static std::once_flag s_timerResOnce;
+    std::call_once(s_timerResOnce,
+                   []()
+                   {
+                       if (HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll"))
+                       {
+                           if (auto pfnSetTimerRes = reinterpret_cast<PFN_NtSetTimerResolution>(
+                                   GetProcAddress(hNtdll, "NtSetTimerResolution")))
+                           {
+                               ULONG actualResolution = 0;
+                               pfnSetTimerRes(5000 /* 0.5ms */, TRUE, &actualResolution);
+                           }
+                       }
+                   });
+}
+
 inline int TimerSleep(int64_t hundredNs)
 {
     if (hundredNs <= 0)
         return 0;
+
+    EnsureHighResTimerResolution();
 
     static PFN_NtDelayExecution pfnNtDelayExecution = []() -> PFN_NtDelayExecution
     {
@@ -157,6 +180,7 @@ struct PacerState
 } g_pacer;
 
 std::atomic<uint64_t> g_lastVulkanPresentNs { 0 };
+std::atomic<uint64_t> g_lastDxgiPresentNs { 0 };
 std::atomic<uint64_t> g_activeIntervalNs { 0 };
 std::atomic<int> g_dynamicMaxInFlight { 2 };
 std::atomic<bool> g_gamescopeLimiterDetected { false };
@@ -183,9 +207,14 @@ uint64_t ComputeIntervalNs(bool fgActive)
             vblankLocked = g_pll.vblankLocked;
         }
 
-        // Under Gamescope / Wayland, if PaceOnSwapchain is active and PLL is not locked, keep headroom
+        // Only subtract Gamescope headroom when Gamescope's own limiter matches our interval
+        const uint64_t gsPeriod = g_gamescopeScanoutPeriodNs.load(std::memory_order_relaxed);
+        const bool gamescopeMatchesCap =
+            g_gamescopeLimiterDetected.load(std::memory_order_relaxed) && gsPeriod > 0 &&
+            std::abs(static_cast<double>(gsPeriod) - intervalNs) <= intervalNs * 0.03;
+
         if (State::Instance().isGamescopeActive && Config::Instance()->FGXeFGPaceOnSwapchain.value_or(true) &&
-            !vblankLocked && intervalNs > 500'000.0)
+            !vblankLocked && gamescopeMatchesCap && intervalNs > 500'000.0)
         {
             intervalNs -= 500'000.0;
         }
@@ -409,10 +438,28 @@ int FrameLimit::sleepDurationNs(int64_t ns)
 
     int status = 0;
     const uint64_t start = Util::GetTimestamp();
-    if (ns <= kBusywaitThresholdNs)
+    const int64_t overshootReserve = g_timerOvershootEmaNs.load(std::memory_order_relaxed);
+    const int64_t tailNs = kBusywaitThresholdNs + overshootReserve;
+
+    if (ns <= tailNs)
+    {
         status = BusywaitSleep(ns);
+    }
     else
-        status = TimerSleep((ns - kBusywaitThresholdNs) / 100);
+    {
+        const int64_t requestedSleepNs = ns - tailNs;
+        const uint64_t timerStart = Util::GetTimestamp();
+        status = TimerSleep(requestedSleepNs / 100);
+        const int64_t actualSleepNs = static_cast<int64_t>(Util::GetTimestamp() - timerStart);
+
+        if (status == 0 && actualSleepNs > requestedSleepNs)
+        {
+            const int64_t sampleOvershoot = std::clamp<int64_t>(actualSleepNs - requestedSleepNs, 0, 2'000'000);
+            int64_t ema = overshootReserve;
+            ema = (sampleOvershoot > ema) ? ((ema + sampleOvershoot) / 2) : ((ema * 19 + sampleOvershoot) / 20);
+            g_timerOvershootEmaNs.store(std::clamp<int64_t>(ema, 100'000, 1'200'000), std::memory_order_relaxed);
+        }
+    }
 
     // Fine-grained busy wait completes the remaining sub-millisecond precision
     const int64_t remaining = ns - static_cast<int64_t>(Util::GetTimestamp() - start);
@@ -616,6 +663,21 @@ void FrameLimit::markVulkanPresent()
 bool FrameLimit::hasRecentVulkanPresent()
 {
     const uint64_t last = g_lastVulkanPresentNs.load(std::memory_order_relaxed);
+    if (last == 0)
+        return false;
+
+    const uint64_t now = Util::GetTimestamp();
+    return now >= last && (now - last) < 2'000'000'000ULL;
+}
+
+void FrameLimit::markDxgiPresent()
+{
+    g_lastDxgiPresentNs.store(Util::GetTimestamp(), std::memory_order_relaxed);
+}
+
+bool FrameLimit::hasRecentDxgiPresent()
+{
+    const uint64_t last = g_lastDxgiPresentNs.load(std::memory_order_relaxed);
     if (last == 0)
         return false;
 
@@ -961,6 +1023,7 @@ FrameLimit::SyncStats FrameLimit::getStats()
 
     stats.gamescopeLimiterDetected = g_gamescopeLimiterDetected.load(std::memory_order_relaxed);
     stats.activeMaxInFlight = maxInFlightPresents();
+    stats.lastTimerOvershootUs = static_cast<uint64_t>(g_timerOvershootEmaNs.load(std::memory_order_relaxed) / 1000);
     return stats;
 }
 
@@ -983,7 +1046,7 @@ void FrameLimit::prePresent(bool fgActive)
         std::scoped_lock lock(g_pacerMutex);
         const uint64_t now = Util::GetTimestamp();
 
-        if (g_pacer.lastWakeNs > 0 && now > g_pacer.lastWakeNs && !fgActive)
+        if (g_pacer.lastWakeNs > 0 && now > g_pacer.lastWakeNs)
             UpdateCpuWorkEma(g_pacer, now - g_pacer.lastWakeNs, intervalNs);
 
         const bool modeOrFgChanged = g_pacer.lastMode != mode || g_pacer.lastFgActive != fgActive;
@@ -992,7 +1055,7 @@ void FrameLimit::prePresent(bool fgActive)
             std::llabs(static_cast<int64_t>(intervalNs) - static_cast<int64_t>(g_pacer.lastIntervalNs)) >
                 static_cast<int64_t>(g_pacer.lastIntervalNs / 4);
 
-        if (fgActive || mode == static_cast<int>(Mode::BackEdge) || g_pacer.nextTargetNs == 0 || modeOrFgChanged ||
+        if (mode == static_cast<int>(Mode::BackEdge) || g_pacer.nextTargetNs == 0 || modeOrFgChanged ||
             intervalChanged || ShouldYieldToGamescopeLimiter(intervalNs))
         {
             g_pacer.preSleptMs = 0.0;
@@ -1073,7 +1136,7 @@ void FrameLimit::postPresent(bool fgActive)
             std::llabs(static_cast<int64_t>(intervalNs) - static_cast<int64_t>(g_pacer.lastIntervalNs)) >
                 static_cast<int64_t>(g_pacer.lastIntervalNs / 4);
 
-        const bool isBackEdgeOrFg = fgActive || mode == static_cast<int>(Mode::BackEdge);
+        const bool isBackEdge = mode == static_cast<int>(Mode::BackEdge);
         bool skipSleepThisFrame = false;
 
         if (g_pacer.nextTargetNs == 0 || pauseOrWrap || modeOrFgChanged || intervalChanged)
@@ -1082,7 +1145,7 @@ void FrameLimit::postPresent(bool fgActive)
             g_pacer.simStartPending = false;
             skipSleepThisFrame = true;
         }
-        else if (isBackEdgeOrFg)
+        else if (isBackEdge)
         {
             g_pacer.simStartPending = false;
             if (g_pacer.nextTargetNs > now && (g_pacer.nextTargetNs - now) <= intervalNs * 2)
@@ -1131,17 +1194,17 @@ void FrameLimit::postPresent(bool fgActive)
         }
 
         const bool yieldGamescope = ShouldYieldToGamescopeLimiter(intervalNs);
-        if (skipSleepThisFrame || yieldGamescope || (!fgActive && mode == static_cast<int>(Mode::FrontEdgeSync)))
+        if (skipSleepThisFrame || yieldGamescope || mode == static_cast<int>(Mode::FrontEdgeSync))
         {
-            if (yieldGamescope || (!fgActive && mode == static_cast<int>(Mode::FrontEdgeSync)))
+            if (yieldGamescope || mode == static_cast<int>(Mode::FrontEdgeSync))
                 g_pacer.simStartPending = false;
             sleepNs = 0;
         }
-        else if (isBackEdgeOrFg)
+        else if (isBackEdge)
         {
             // sleepNs already computed above against current frame's target
         }
-        else if (g_pacer.simStartActive && !g_pacer.simStartPending)
+        else if (!fgActive && g_pacer.simStartActive && !g_pacer.simStartPending)
         {
             // Defer wakeup sleep to the game engine's true Simulation Start (Waitable / early Acquire)
             g_pacer.simStartPending = true;

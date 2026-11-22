@@ -1435,6 +1435,16 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
         }
     }
 
+    if (willPresent)
+        FrameLimit::markDxgiPresent();
+
+    const bool fgLimitActive = fg != nullptr && fg->IsActive() && !fg->IsPaused();
+    const bool shouldLimit =
+        willPresent && !state.reflexLimitsFps && state.activeFgOutput != FGOutput::NoFG && !InputCommon::can_limit_fps();
+
+    if (shouldLimit)
+        FrameLimit::prePresent(fgLimitActive);
+
     const bool useMutex = config->FGUseMutexForSwapchain.value_or_default();
     bool mutexUsed = false;
     if (willPresent && fg != nullptr && fg->IsActive() && !fg->IsPaused() && useMutex && fg->Mutex.getOwner() != 2)
@@ -1547,17 +1557,6 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
             xefgFrameId = InputCommon::xefg_marked_frame_id();
         }
     }
-
-    const bool fgLimitActive = fg != nullptr ? fg->IsActive() && !fg->IsPaused() : false;
-    // When DX12 FG is active, pace the real game frame here (multiplied by generated frames) instead of
-    // pacing sub-frame vkQueuePresentKHR bursts inside Vulkan_Hooks.
-    const bool shouldLimit =
-        willPresent && !state.reflexLimitsFps && state.activeFgOutput != FGOutput::NoFG &&
-        (fgLimitActive || (!IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !FrameLimit::hasRecentVulkanPresent())) &&
-        !InputCommon::can_limit_fps();
-
-    if (shouldLimit)
-        FrameLimit::prePresent(fgLimitActive);
 
     HRESULT result;
     const auto presentStart = Util::MillisecondsNow();

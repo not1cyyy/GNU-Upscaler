@@ -25,6 +25,7 @@ class FrameLimit
         uint64_t lastCpuWorkUs = 0;
         uint64_t lastGpuWorkUs = 0;
         uint64_t lastPresentMarginUs = 0;
+        uint64_t lastTimerOvershootUs = 0;
     };
 
     static int sleepDurationNs(int64_t ns);
@@ -50,6 +51,8 @@ class FrameLimit
 
     static void markVulkanPresent();
     static bool hasRecentVulkanPresent();
+    static void markDxgiPresent();
+    static bool hasRecentDxgiPresent();
 
     static void recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, uint64_t reportedRefreshNs,
                                        uint64_t presentMarginNs, bool isVsyncMode, bool fromDisplayTiming);

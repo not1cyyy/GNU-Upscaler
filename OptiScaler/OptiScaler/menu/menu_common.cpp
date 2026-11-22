@@ -7249,9 +7249,10 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
                                      : syncStats.displayTimingActive       ? "DisplayTiming"
                                      : syncStats.presentWaitActive         ? "PresentWait"
                                                                            : "DXGI Sync";
-            ImGui::Text("Sync: %s%s%s%s | CPU: %.2f ms | GPU: %.2f ms", syncSource,
+            ImGui::Text("Sync: %s%s%s%s | CPU: %.2f ms | GPU: %.2f ms | Slack: %llu us", syncSource,
                         syncStats.vblankLocked ? " (Locked)" : " (Async/VRR)", marginText.c_str(),
-                        inFlightText.c_str(), syncStats.lastCpuWorkUs / 1000.0, syncStats.lastGpuWorkUs / 1000.0);
+                        inFlightText.c_str(), syncStats.lastCpuWorkUs / 1000.0, syncStats.lastGpuWorkUs / 1000.0,
+                        static_cast<unsigned long long>(syncStats.lastTimerOvershootUs));
         }
 
         if (FrameLimit::targetFps() > 0.0f)
