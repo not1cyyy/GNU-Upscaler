@@ -981,12 +981,17 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
             fg->Present();
     }
 
-    FrameLimit::markVulkanPresent();
+    auto dx12Fg = State::Instance().currentFG;
+    const bool dx12FgActive = dxgiBacked && dx12Fg != nullptr && dx12Fg->IsActive() && !dx12Fg->IsPaused();
+
+    if (!dx12FgActive)
+        FrameLimit::markVulkanPresent();
 
     const bool fgActive = fgPresent && fg->IsActive() && !fg->IsPaused();
-    const bool limitActive = !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
+    const bool limitActive = !dx12FgActive && !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
     const bool trackFrameSync =
-        !fgPresent && (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0);
+        !fgPresent && !dx12FgActive &&
+        (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0);
 
     VulkanFrameSync::PresentScope frameSyncScope {};
     if (trackFrameSync)

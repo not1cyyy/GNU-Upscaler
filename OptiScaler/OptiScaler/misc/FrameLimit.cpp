@@ -591,6 +591,10 @@ FrameLimit::Mode FrameLimit::currentMode()
 
 int FrameLimit::maxInFlightPresents()
 {
+    // Never throttle swapchain queue depth while Frame Generation is actively buffering/interpolating frames
+    if (auto fg = State::Instance().CurrentFG(); fg != nullptr && fg->IsActive() && !fg->IsPaused())
+        return 0;
+
     const int configured = Config::Instance()->FramerateLimitMaxInFlight.value_or_default();
     if (configured < 0)
         return 0;
@@ -1069,10 +1073,29 @@ void FrameLimit::postPresent(bool fgActive)
             std::llabs(static_cast<int64_t>(intervalNs) - static_cast<int64_t>(g_pacer.lastIntervalNs)) >
                 static_cast<int64_t>(g_pacer.lastIntervalNs / 4);
 
+        const bool isBackEdgeOrFg = fgActive || mode == static_cast<int>(Mode::BackEdge);
+        bool skipSleepThisFrame = false;
+
         if (g_pacer.nextTargetNs == 0 || pauseOrWrap || modeOrFgChanged || intervalChanged)
         {
             g_pacer.nextTargetNs = ApplyVBlankPhaseNudge(now + intervalNs, intervalNs, true);
             g_pacer.simStartPending = false;
+            skipSleepThisFrame = true;
+        }
+        else if (isBackEdgeOrFg)
+        {
+            g_pacer.simStartPending = false;
+            if (g_pacer.nextTargetNs > now && (g_pacer.nextTargetNs - now) <= intervalNs * 2)
+            {
+                sleepNs = static_cast<int64_t>(g_pacer.nextTargetNs - now);
+                g_pacer.nextTargetNs = ApplyVBlankPhaseNudge(g_pacer.nextTargetNs + intervalNs, intervalNs, false);
+            }
+            else
+            {
+                // Frame exceeded its budget; start next frame immediately without a full-interval penalty sleep
+                g_pacer.nextTargetNs = ApplyVBlankPhaseNudge(now + intervalNs, intervalNs, true);
+                skipSleepThisFrame = true;
+            }
         }
         else
         {
@@ -1081,7 +1104,10 @@ void FrameLimit::postPresent(bool fgActive)
 
             // Prevent catch-up bursts after GPU bottlenecks or stalls
             if (g_pacer.nextTargetNs <= now || (g_pacer.nextTargetNs - now) > intervalNs * 2)
+            {
                 g_pacer.nextTargetNs = ApplyVBlankPhaseNudge(now + intervalNs, intervalNs, true);
+                skipSleepThisFrame = true;
+            }
         }
 
         g_pacer.lastPresentFinishNs = now;
@@ -1105,16 +1131,15 @@ void FrameLimit::postPresent(bool fgActive)
         }
 
         const bool yieldGamescope = ShouldYieldToGamescopeLimiter(intervalNs);
-        if (yieldGamescope || (!fgActive && mode == static_cast<int>(Mode::FrontEdgeSync)))
+        if (skipSleepThisFrame || yieldGamescope || (!fgActive && mode == static_cast<int>(Mode::FrontEdgeSync)))
         {
+            if (yieldGamescope || (!fgActive && mode == static_cast<int>(Mode::FrontEdgeSync)))
+                g_pacer.simStartPending = false;
             sleepNs = 0;
-            g_pacer.simStartPending = false;
         }
-        else if (fgActive || mode == static_cast<int>(Mode::BackEdge))
+        else if (isBackEdgeOrFg)
         {
-            g_pacer.simStartPending = false;
-            if (g_pacer.nextTargetNs > now)
-                sleepNs = static_cast<int64_t>(g_pacer.nextTargetNs - now);
+            // sleepNs already computed above against current frame's target
         }
         else if (g_pacer.simStartActive && !g_pacer.simStartPending)
         {

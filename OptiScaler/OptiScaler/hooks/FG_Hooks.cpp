@@ -1549,9 +1549,12 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     }
 
     const bool fgLimitActive = fg != nullptr ? fg->IsActive() && !fg->IsPaused() : false;
-    const bool shouldLimit = willPresent && !state.reflexLimitsFps && state.activeFgOutput != FGOutput::NoFG &&
-                             !IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !FrameLimit::hasRecentVulkanPresent() &&
-                             !InputCommon::can_limit_fps();
+    // When DX12 FG is active, pace the real game frame here (multiplied by generated frames) instead of
+    // pacing sub-frame vkQueuePresentKHR bursts inside Vulkan_Hooks.
+    const bool shouldLimit =
+        willPresent && !state.reflexLimitsFps && state.activeFgOutput != FGOutput::NoFG &&
+        (fgLimitActive || (!IdentifyGpu::getPrimaryGpu().dxgiIsDxvk && !FrameLimit::hasRecentVulkanPresent())) &&
+        !InputCommon::can_limit_fps();
 
     if (shouldLimit)
         FrameLimit::prePresent(fgLimitActive);
