@@ -21,15 +21,11 @@ class FrameLimit
         bool simStartActive = false;
         bool earlyAcquireActive = false;
         bool gamescopeLimiterDetected = false;
-        bool fgSubframePacingActive = false;
-        bool fgSubframeViaVulkan = false;
         int activeMaxInFlight = 0;
-        uint32_t fgSubframeMultiplier = 0;
         uint64_t lastCpuWorkUs = 0;
         uint64_t lastGpuWorkUs = 0;
         uint64_t lastPresentMarginUs = 0;
         uint64_t lastTimerOvershootUs = 0;
-        uint64_t lastSubframeIntervalUs = 0;
     };
 
     static int sleepDurationNs(int64_t ns);
@@ -40,11 +36,6 @@ class FrameLimit
     static void onSimulationStart();
     static void onVulkanAcquire(uint64_t acquireDurationNs);
     static void recordPresentDuration(uint64_t presentDurationNs);
-
-    static void onFgGamePresentStart(uint32_t frameMultiplier);
-    static void onFgGamePresentStatus(uint32_t actualFramesPresented);
-    static void onFgOutputPresent(bool fromVulkan = false);
-    static bool isSubframePacingActive();
 
     static void prePresent(bool fgActive);
     static void postPresent(bool fgActive);

@@ -972,18 +972,9 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     const bool dxgiPacingActive = dxgiBacked && FrameLimit::hasRecentDxgiPresent();
     const bool limitActive =
         !dx12FgActive && !dxgiPacingActive && !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
-
-    // Pace DX12 XeFG output frames right at the Vulkan submit boundary (downstream of VKD3D-Proton's async thread)
-    if (dxgiBacked && localPresentInfo.swapchainCount == 1)
-    {
-        if (dx12FgActive || FrameLimit::isSubframePacingActive())
-            FrameLimit::onFgOutputPresent(true);
-    }
-
     const bool trackFrameSync =
-        !fgPresent &&
-        (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0 ||
-         (dx12FgActive && FrameLimit::isSubframePacingActive()));
+        !fgPresent && !dx12FgActive &&
+        (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0);
 
     VulkanFrameSync::PresentScope frameSyncScope {};
     if (trackFrameSync)
@@ -1091,6 +1082,33 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
             localCreateInfo = *pCreateInfo;
             localCreateInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
             pCreateInfo = &localCreateInfo;
+        }
+    }
+
+    // Give VKD3D-Proton swapchains enough images for unlocked 3x+ XeFG bursts to avoid mid-batch acquire stalls
+    uint32_t originalMinImageCount = pCreateInfo != nullptr ? pCreateInfo->minImageCount : 0;
+    bool boostedMinImageCount = false;
+    if (pCreateInfo != nullptr && dxgiBacked && !State::Instance().vulkanSkipHooks && _PD != VK_NULL_HANDLE &&
+        State::Instance().activeFgOutput == FGOutput::XeFG)
+    {
+        VkSurfaceCapabilitiesKHR surfaceCaps {};
+        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(_PD, pCreateInfo->surface, &surfaceCaps) == VK_SUCCESS)
+        {
+            const uint32_t capMax =
+                surfaceCaps.maxImageCount > 0 ? std::min<uint32_t>(surfaceCaps.maxImageCount, 6u) : 6u;
+            const uint32_t targetImages = std::clamp<uint32_t>(5u, surfaceCaps.minImageCount, std::max(capMax, surfaceCaps.minImageCount));
+            if (targetImages > pCreateInfo->minImageCount)
+            {
+                if (pCreateInfo != &localCreateInfo)
+                {
+                    localCreateInfo = *pCreateInfo;
+                    pCreateInfo = &localCreateInfo;
+                }
+                localCreateInfo.minImageCount = targetImages;
+                boostedMinImageCount = true;
+                LOG_INFO("XeFG Vulkan swapchain minImageCount: {} -> {}", originalMinImageCount,
+                         localCreateInfo.minImageCount);
+            }
         }
     }
 
@@ -1217,6 +1235,13 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
             }
 
             result = o_CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+            if (result != VK_SUCCESS && boostedMinImageCount && pCreateInfo == &localCreateInfo)
+            {
+                LOG_WARN("CreateSwapchainKHR failed with minImageCount={}, retrying original {}",
+                         localCreateInfo.minImageCount, originalMinImageCount);
+                localCreateInfo.minImageCount = originalMinImageCount;
+                result = o_CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+            }
         }
     }
 

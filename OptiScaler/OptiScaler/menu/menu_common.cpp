@@ -7227,11 +7227,6 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
         const auto syncStats = FrameLimit::getStats();
         if (syncStats.simStartActive)
             currentMethod.append(syncStats.earlyAcquireActive ? " + EarlyAcquire" : " + Waitable");
-        if (syncStats.fgSubframePacingActive && syncStats.fgSubframeMultiplier > 0)
-        {
-            currentMethod.append(std::format(" + XeFG {}x Subframe [{}]", syncStats.fgSubframeMultiplier,
-                                             syncStats.fgSubframeViaVulkan ? "Vk" : "DXGI"));
-        }
         if (syncStats.vblankLocked && syncStats.detectedRefreshHz > 0.0)
             currentMethod.append(std::format(" + VBlank PLL ({:.1f} Hz)", syncStats.detectedRefreshHz));
         if (syncStats.gamescopeLimiterDetected)
@@ -7260,7 +7255,7 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
                         static_cast<unsigned long long>(syncStats.lastTimerOvershootUs));
         }
 
-        if (FrameLimit::targetFps() > 0.0f || syncStats.fgSubframePacingActive)
+        if (FrameLimit::targetFps() > 0.0f)
         {
             float pacerHistory[120] {};
             int count = 0;
@@ -7341,13 +7336,6 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
             if (ImGui::Checkbox("Compositor DesiredPresentTime", &dtSchedule))
                 config->FramerateLimitDisplayTimingSchedule = dtSchedule;
             ShowTooltip("Schedules VK_GOOGLE_display_timing desiredPresentTime when clock offset is calibrated");
-
-            const char* subframeItems[] = { "Off", "3x+ XeFG (Recommended)", "All (2x+ XeFG)" };
-            int subframeMode = std::clamp(config->FramerateLimitFgSubframeMode.value_or_default(), 0, 2);
-            if (ImGui::Combo("XeFG Sub-Frame Flattening", &subframeMode, subframeItems, IM_ARRAYSIZE(subframeItems)))
-                config->FramerateLimitFgSubframeMode = subframeMode;
-            ShowTooltip("Spaces XeFG interpolated & real output presents evenly on the presenter thread without\n"
-                        "stalling the game thread or accumulating queue latency (removes 3x+ sawtooth spikes)");
         }
 
         ImGui::Spacing();

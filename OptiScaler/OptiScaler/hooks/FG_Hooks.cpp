@@ -1553,9 +1553,6 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
 
         if (state.activeFgOutput == FGOutput::XeFG)
         {
-            if (fgFeatureActive)
-                FrameLimit::onFgGamePresentStart(frameMultiplier);
-
             xefgContext = fg->SwapchainContext();
             xefgFrameId = InputCommon::xefg_marked_frame_id();
         }
@@ -1580,8 +1577,6 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
             XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
             InputCommon::xefg_present_status(xefgFrameId, status.framesPresented);
-            if (fgFeatureActive && status.framesPresented > 0)
-                FrameLimit::onFgGamePresentStatus(status.framesPresented);
         }
     }
 
