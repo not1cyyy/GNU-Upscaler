@@ -182,10 +182,82 @@ struct PacerState
 std::atomic<uint64_t> g_lastVulkanPresentNs { 0 };
 std::atomic<uint64_t> g_lastDxgiPresentNs { 0 };
 std::atomic<uint64_t> g_activeIntervalNs { 0 };
+std::atomic<uint64_t> g_activeOutputIntervalNs { 0 };
 std::atomic<int> g_dynamicMaxInFlight { 2 };
 std::atomic<bool> g_gamescopeLimiterDetected { false };
 std::atomic<uint64_t> g_gamescopeScanoutPeriodNs { 0 };
 std::atomic<uint64_t> g_lastSleepWholeUs { 0 };
+std::atomic<bool> g_dtScheduleReady { false };
+
+// Leaf lock: never acquires g_pacerMutex or g_pllMutex
+std::mutex g_fgSubMutex;
+
+struct FgSubframeState
+{
+    uint64_t lastGamePresentNs = 0;
+    uint64_t nextTargetNs = 0;
+    uint64_t lastOutputEdgeNs = 0;
+    uint64_t lastSubIntervalNs = 0;
+    double realIntervalEmaNs = 0.0;
+    uint32_t lastBatchFrames = 0;
+    uint32_t activeMult = 0;
+    uint32_t steadyWindows = 0;
+    int32_t carryOutputs = 0;
+    bool sleptInWindow = false;
+
+    std::array<float, 120> frameTimesMs {};
+    size_t frameTimeHead = 0;
+    size_t frameTimeCount = 0;
+} g_fgSub;
+
+std::atomic<DWORD> g_fgGameThreadId { 0 };
+std::atomic<uint32_t> g_fgOutputsThisWindow { 0 };
+std::atomic<bool> g_fgSeenOutputPresent { false };
+std::atomic<bool> g_fgSubframeActive { false };
+std::atomic<int32_t> g_fgCarryOutputsAtomic { 0 };
+std::atomic<uint64_t> g_fgCurrentTargetQpcNs { 0 };
+std::atomic<uint64_t> g_fgLastScheduledDisplayNs { 0 };
+
+uint32_t ActiveSubframeMultiplier()
+{
+    const int mode = std::clamp(Config::Instance()->FramerateLimitFgSubframeMode.value_or_default(), 0, 2);
+    if (mode == 0)
+        return 0;
+
+    auto& state = State::Instance();
+    if (state.activeFgOutput != FGOutput::XeFG)
+        return 0;
+
+    auto fg = state.CurrentFG();
+    if (fg == nullptr || !fg->IsActive() || fg->IsPaused())
+        return 0;
+
+    const uint32_t mult = static_cast<uint32_t>(fg->GetInterpolatedFrameCount()) + 1u;
+    const uint32_t minMult = (mode >= 2) ? 2u : 3u;
+    return (mult >= minMult) ? mult : 0u;
+}
+
+void ResetFgSubframeLocked(bool keepRealEma)
+{
+    g_fgSub.nextTargetNs = 0;
+    g_fgSub.lastOutputEdgeNs = 0;
+    g_fgSub.lastSubIntervalNs = 0;
+    if (!keepRealEma)
+    {
+        g_fgSub.lastGamePresentNs = 0;
+        g_fgSub.realIntervalEmaNs = 0.0;
+        g_fgSub.lastBatchFrames = 0;
+    }
+    g_fgSub.activeMult = 0;
+    g_fgSub.steadyWindows = 0;
+    g_fgSub.carryOutputs = 0;
+    g_fgSub.sleptInWindow = false;
+    g_fgOutputsThisWindow.store(0, std::memory_order_relaxed);
+    g_fgSubframeActive.store(false, std::memory_order_relaxed);
+    g_fgCarryOutputsAtomic.store(0, std::memory_order_relaxed);
+    g_fgCurrentTargetQpcNs.store(0, std::memory_order_relaxed);
+    g_fgLastScheduledDisplayNs.store(0, std::memory_order_relaxed);
+}
 
 uint64_t ComputeIntervalNs(bool fgActive)
 {
@@ -194,6 +266,7 @@ uint64_t ComputeIntervalNs(bool fgActive)
         return 0;
 
     double intervalNs = std::clamp(1'000'000'000.0 / static_cast<double>(fpsCap), 100'000.0, 100'000'000'000.0);
+    const double outputIntervalNs = intervalNs;
 
     // The limit counts presented frames; native batch FG outputs multiple frames per real present
     if (fgActive)
@@ -207,11 +280,11 @@ uint64_t ComputeIntervalNs(bool fgActive)
             vblankLocked = g_pll.vblankLocked;
         }
 
-        // Only subtract Gamescope headroom when Gamescope's own limiter matches our interval
+        // Compare Gamescope's display scanout period against the output frame interval
         const uint64_t gsPeriod = g_gamescopeScanoutPeriodNs.load(std::memory_order_relaxed);
         const bool gamescopeMatchesCap =
             g_gamescopeLimiterDetected.load(std::memory_order_relaxed) && gsPeriod > 0 &&
-            std::abs(static_cast<double>(gsPeriod) - intervalNs) <= intervalNs * 0.03;
+            std::abs(static_cast<double>(gsPeriod) - outputIntervalNs) <= outputIntervalNs * 0.03;
 
         if (State::Instance().isGamescopeActive && Config::Instance()->FGXeFGPaceOnSwapchain.value_or(true) &&
             !vblankLocked && gamescopeMatchesCap && intervalNs > 500'000.0)
@@ -380,6 +453,7 @@ void ResetPacer(PacerState& pacer)
     pacer.earlyAcquireStreak = 0;
     pacer.earlyAcquireActive = false;
     g_activeIntervalNs.store(0, std::memory_order_relaxed);
+    g_activeOutputIntervalNs.store(0, std::memory_order_relaxed);
     g_dynamicMaxInFlight.store(2, std::memory_order_relaxed);
     g_gamescopeLimiterDetected.store(false, std::memory_order_relaxed);
     g_gamescopeScanoutPeriodNs.store(0, std::memory_order_relaxed);
@@ -392,7 +466,9 @@ bool ShouldYieldToGamescopeLimiter(uint64_t intervalNs)
         return false;
 
     const uint64_t gsPeriod = g_gamescopeScanoutPeriodNs.load(std::memory_order_relaxed);
-    return gsPeriod > 0 && intervalNs > 0 && static_cast<double>(gsPeriod) > static_cast<double>(intervalNs) * 1.03;
+    const uint64_t outputNs = g_activeOutputIntervalNs.load(std::memory_order_relaxed);
+    const uint64_t compareNs = outputNs > 0 ? outputNs : intervalNs;
+    return gsPeriod > 0 && compareNs > 0 && static_cast<double>(gsPeriod) > static_cast<double>(compareNs) * 1.03;
 }
 
 uint64_t ComputeJitWakeupNs(const PacerState& pacer, uint64_t intervalNs)
@@ -413,7 +489,10 @@ void UpdateGamescopeDetectorLocked(uint64_t blockNs)
         (g_pll.gamescopeBlockEmaNs <= 0.0) ? sample : (0.85 * g_pll.gamescopeBlockEmaNs + 0.15 * sample);
 
     const uint64_t sleptUs = g_lastSleepWholeUs.load(std::memory_order_relaxed);
-    const uint64_t intervalNs = g_activeIntervalNs.load(std::memory_order_relaxed);
+    const uint64_t intervalNs =
+        (g_activeOutputIntervalNs.load(std::memory_order_relaxed) > 0)
+            ? g_activeOutputIntervalNs.load(std::memory_order_relaxed)
+            : g_activeIntervalNs.load(std::memory_order_relaxed);
 
     if (intervalNs > 0 && sleptUs < 400 && g_pll.gamescopeBlockEmaNs > 2'000'000.0)
     {
@@ -428,6 +507,114 @@ void UpdateGamescopeDetectorLocked(uint64_t blockNs)
         if (g_pll.gamescopeExternalStreak == 0)
             g_gamescopeLimiterDetected.store(false, std::memory_order_relaxed);
     }
+}
+
+void UpdateTimerOvershootEma(int64_t requestedSleepNs, int64_t actualSleepNs, int64_t overshootReserve)
+{
+    if (actualSleepNs <= requestedSleepNs)
+        return;
+
+    const int64_t sampleOvershoot = std::clamp<int64_t>(actualSleepNs - requestedSleepNs, 0, 2'000'000);
+    int64_t ema = overshootReserve;
+    ema = (sampleOvershoot > ema) ? ((ema + sampleOvershoot) / 2) : ((ema * 19 + sampleOvershoot) / 20);
+    g_timerOvershootEmaNs.store(std::clamp<int64_t>(ema, 100'000, 1'200'000), std::memory_order_relaxed);
+}
+
+void StoreActiveIntervals(uint64_t intervalNs, bool fgActive)
+{
+    g_activeIntervalNs.store(intervalNs, std::memory_order_relaxed);
+    uint64_t outputNs = intervalNs;
+    if (fgActive && intervalNs > 0)
+    {
+        auto fg = State::Instance().CurrentFG();
+        const uint32_t mult = fg != nullptr ? (static_cast<uint32_t>(fg->GetInterpolatedFrameCount()) + 1u) : 2u;
+        outputNs = intervalNs / std::max(mult, 1u);
+    }
+    g_activeOutputIntervalNs.store(outputNs, std::memory_order_relaxed);
+}
+
+int SleepSubframeUntilNs(uint64_t deadlineNs, uint32_t mult)
+{
+    int status = 0;
+    const int32_t abortCarryThreshold = static_cast<int32_t>(std::max(mult, 2u));
+    auto shouldAbort = [&]() -> bool
+    {
+        return State::Instance().isShuttingDown || !g_fgSubframeActive.load(std::memory_order_relaxed) ||
+               g_fgCarryOutputsAtomic.load(std::memory_order_relaxed) >= abortCarryThreshold;
+    };
+
+    while (!shouldAbort())
+    {
+        const uint64_t now = Util::GetTimestamp();
+        if (now >= deadlineNs)
+            break;
+
+        const int64_t remaining = static_cast<int64_t>(deadlineNs - now);
+        const int64_t overshootReserve = g_timerOvershootEmaNs.load(std::memory_order_relaxed);
+        const int64_t tailNs = kBusywaitThresholdNs + overshootReserve;
+
+        if (remaining <= tailNs)
+        {
+            while (Util::GetTimestamp() < deadlineNs && !shouldAbort())
+                FL_CPU_PAUSE();
+            break;
+        }
+
+        // Cap sleep chunks so backlog aborts stay responsive even at low base FPS
+        const int64_t requestedSleepNs = std::min<int64_t>(remaining - tailNs, 3'500'000);
+        const uint64_t timerStart = Util::GetTimestamp();
+        status = TimerSleep(requestedSleepNs / 100);
+        if (status != 0)
+            break;
+
+        if (!shouldAbort())
+        {
+            const int64_t actualSleepNs = static_cast<int64_t>(Util::GetTimestamp() - timerStart);
+            UpdateTimerOvershootEma(requestedSleepNs, actualSleepNs, overshootReserve);
+        }
+    }
+
+    return status;
+}
+
+void RecordSubframeEdgeLocked(uint64_t edgeNow)
+{
+    if (g_fgSub.lastOutputEdgeNs > 0 && edgeNow > g_fgSub.lastOutputEdgeNs)
+    {
+        const float frameMs = static_cast<float>(edgeNow - g_fgSub.lastOutputEdgeNs) / 1e6f;
+        if (frameMs > 0.1f && frameMs < 1000.0f)
+        {
+            g_fgSub.frameTimesMs[g_fgSub.frameTimeHead] = frameMs;
+            g_fgSub.frameTimeHead = (g_fgSub.frameTimeHead + 1) % g_fgSub.frameTimesMs.size();
+            g_fgSub.frameTimeCount = std::min(g_fgSub.frameTimeCount + 1, g_fgSub.frameTimesMs.size());
+        }
+    }
+    g_fgSub.lastOutputEdgeNs = edgeNow;
+}
+
+void CopyRingFrameTimes(const std::array<float, 120>& ring, size_t head, size_t count, float* outMs, int maxCount,
+                        int& outCount, float& outMinMs, float& outMaxMs)
+{
+    const size_t available = std::min(count, static_cast<size_t>(maxCount));
+    if (available == 0)
+        return;
+
+    const size_t cap = ring.size();
+    const size_t start = (head + cap - available) % cap;
+
+    float minV = FLT_MAX;
+    float maxV = 0.0f;
+    for (size_t i = 0; i < available; ++i)
+    {
+        const float v = ring[(start + i) % cap];
+        outMs[i] = v;
+        minV = std::min(minV, v);
+        maxV = std::max(maxV, v);
+    }
+
+    outCount = static_cast<int>(available);
+    outMinMs = minV;
+    outMaxMs = maxV;
 }
 } // namespace
 
@@ -452,13 +639,8 @@ int FrameLimit::sleepDurationNs(int64_t ns)
         status = TimerSleep(requestedSleepNs / 100);
         const int64_t actualSleepNs = static_cast<int64_t>(Util::GetTimestamp() - timerStart);
 
-        if (status == 0 && actualSleepNs > requestedSleepNs)
-        {
-            const int64_t sampleOvershoot = std::clamp<int64_t>(actualSleepNs - requestedSleepNs, 0, 2'000'000);
-            int64_t ema = overshootReserve;
-            ema = (sampleOvershoot > ema) ? ((ema + sampleOvershoot) / 2) : ((ema * 19 + sampleOvershoot) / 20);
-            g_timerOvershootEmaNs.store(std::clamp<int64_t>(ema, 100'000, 1'200'000), std::memory_order_relaxed);
-        }
+        if (status == 0)
+            UpdateTimerOvershootEma(requestedSleepNs, actualSleepNs, overshootReserve);
     }
 
     // Fine-grained busy wait completes the remaining sub-millisecond precision
@@ -604,6 +786,219 @@ void FrameLimit::recordPresentDuration(uint64_t presentDurationNs)
 
     std::scoped_lock lock(g_pllMutex);
     UpdateGamescopeDetectorLocked(presentDurationNs);
+}
+
+void FrameLimit::onFgGamePresentStart(uint32_t frameMultiplier)
+{
+    g_fgGameThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+
+    const uint64_t now = Util::GetTimestamp();
+    const uint32_t outputsPrevWindow = g_fgOutputsThisWindow.exchange(0, std::memory_order_acq_rel);
+    const uint32_t activeMult = ActiveSubframeMultiplier();
+
+    std::scoped_lock lock(g_fgSubMutex);
+    const bool sleptPrev = g_fgSub.sleptInWindow;
+    g_fgSub.sleptInWindow = false;
+    g_fgSub.activeMult = activeMult;
+    g_fgSubframeActive.store(activeMult > 0, std::memory_order_relaxed);
+
+    if (g_fgSub.lastGamePresentNs > 0 && now > g_fgSub.lastGamePresentNs)
+    {
+        const uint64_t dtReal = now - g_fgSub.lastGamePresentNs;
+        if (dtReal > 500'000'000ULL)
+        {
+            ResetFgSubframeLocked(false);
+            g_fgSub.lastGamePresentNs = now;
+            g_fgSub.lastBatchFrames = std::max(frameMultiplier, 1u);
+            g_fgSub.activeMult = activeMult;
+            g_fgSubframeActive.store(activeMult > 0, std::memory_order_relaxed);
+            return;
+        }
+
+        if (dtReal >= 1'000'000ULL && dtReal <= 250'000'000ULL)
+        {
+            const double sample = static_cast<double>(dtReal);
+            if (g_fgSub.realIntervalEmaNs <= 0.0)
+            {
+                g_fgSub.realIntervalEmaNs = sample;
+            }
+            else
+            {
+                // Shrink quickly when frame time drops to avoid queuing; dampen single hitch spikes
+                const double alpha = (sample < g_fgSub.realIntervalEmaNs) ? 0.35
+                                     : (sample > g_fgSub.realIntervalEmaNs * 1.45) ? 0.08
+                                                                                   : 0.15;
+                g_fgSub.realIntervalEmaNs = (1.0 - alpha) * g_fgSub.realIntervalEmaNs + alpha * sample;
+            }
+        }
+
+        if (frameMultiplier != g_fgSub.lastBatchFrames)
+        {
+            g_fgSub.carryOutputs = 0;
+            g_fgSub.steadyWindows = 0;
+        }
+        else if (g_fgSeenOutputPresent.load(std::memory_order_relaxed))
+        {
+            const uint32_t expectedM = g_fgSub.lastBatchFrames > 0 ? g_fgSub.lastBatchFrames : frameMultiplier;
+            if (outputsPrevWindow > expectedM)
+            {
+                const int32_t excess = static_cast<int32_t>(outputsPrevWindow - expectedM);
+                g_fgSub.carryOutputs = std::max<int32_t>(0, g_fgSub.carryOutputs - excess);
+                g_fgSub.steadyWindows = 0;
+            }
+            else if (outputsPrevWindow < expectedM && sleptPrev)
+            {
+                const int32_t deficit = static_cast<int32_t>(expectedM - outputsPrevWindow);
+                g_fgSub.carryOutputs =
+                    std::min<int32_t>(g_fgSub.carryOutputs + deficit, static_cast<int32_t>(expectedM * 2u));
+                g_fgSub.steadyWindows = 0;
+            }
+            else if (outputsPrevWindow == expectedM && g_fgSub.carryOutputs > 0)
+            {
+                if (++g_fgSub.steadyWindows >= 6)
+                {
+                    g_fgSub.carryOutputs = 0;
+                    g_fgSub.steadyWindows = 0;
+                }
+            }
+        }
+        g_fgCarryOutputsAtomic.store(g_fgSub.carryOutputs, std::memory_order_relaxed);
+    }
+
+    g_fgSub.lastGamePresentNs = now;
+    g_fgSub.lastBatchFrames = std::max(frameMultiplier, 1u);
+}
+
+void FrameLimit::onFgGamePresentStatus(uint32_t actualFramesPresented)
+{
+    if (actualFramesPresented == 0)
+        return;
+
+    std::scoped_lock lock(g_fgSubMutex);
+    g_fgSub.lastBatchFrames = actualFramesPresented;
+}
+
+void FrameLimit::onFgOutputPresent()
+{
+    const uint32_t mult = ActiveSubframeMultiplier();
+    if (mult == 0)
+    {
+        if (g_fgSubframeActive.load(std::memory_order_relaxed))
+        {
+            std::scoped_lock lock(g_fgSubMutex);
+            ResetFgSubframeLocked(true);
+        }
+        return;
+    }
+
+    g_fgSeenOutputPresent.store(true, std::memory_order_relaxed);
+    g_fgSubframeActive.store(true, std::memory_order_relaxed);
+
+    const DWORD gameTid = g_fgGameThreadId.load(std::memory_order_relaxed);
+    if (gameTid == 0 || GetCurrentThreadId() == gameTid)
+    {
+        // Never block the game's DX12 simulation/present thread
+        std::scoped_lock lock(g_fgSubMutex);
+        RecordSubframeEdgeLocked(Util::GetTimestamp());
+        g_fgOutputsThisWindow.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    uint64_t wakeDeadlineNs = 0;
+    {
+        std::scoped_lock lock(g_fgSubMutex);
+        const uint64_t now = Util::GetTimestamp();
+        const float capFps = FrameLimit::targetFps();
+        const double capSubNs = capFps > 0.0f ? (1'000'000'000.0 / static_cast<double>(capFps)) : 0.0;
+        const double measuredSubNs =
+            g_fgSub.realIntervalEmaNs > 0.0 ? (g_fgSub.realIntervalEmaNs / static_cast<double>(mult)) : 0.0;
+
+        double subIntervalNs = std::max(capSubNs, measuredSubNs);
+        if (subIntervalNs <= 0.0)
+        {
+            g_fgSub.nextTargetNs = now;
+            g_fgSub.activeMult = mult;
+            g_fgCurrentTargetQpcNs.store(now, std::memory_order_release);
+        }
+        else
+        {
+            // Leave a tiny batch cushion so the last frame completes ahead of the next real batch
+            const double batchReserveNs = std::clamp(subIntervalNs * 0.06, 150'000.0, 450'000.0);
+            subIntervalNs = std::max(0.0, subIntervalNs - (batchReserveNs / static_cast<double>(mult)));
+
+            const int32_t carry = g_fgSub.carryOutputs;
+            if (carry >= static_cast<int32_t>(mult))
+            {
+                subIntervalNs = 0.0;
+            }
+            else if (carry > 0)
+            {
+                const double trim = 1.0 - std::clamp(0.12 * static_cast<double>(carry), 0.12, 0.35);
+                subIntervalNs *= trim;
+            }
+
+            const uint64_t stepNs = static_cast<uint64_t>(std::llround(subIntervalNs));
+            g_fgSub.lastSubIntervalNs = stepNs;
+            g_fgSub.activeMult = mult;
+
+            if (stepNs == 0 || g_fgSub.nextTargetNs == 0 ||
+                (now > g_fgSub.nextTargetNs && (now - g_fgSub.nextTargetNs) > stepNs))
+            {
+                g_fgSub.nextTargetNs = now;
+                wakeDeadlineNs = 0;
+            }
+            else
+            {
+                wakeDeadlineNs = g_fgSub.nextTargetNs;
+            }
+
+            if (wakeDeadlineNs > now)
+            {
+                const uint64_t maxWaitNs = stepNs + (stepNs / 4);
+                if ((wakeDeadlineNs - now) > maxWaitNs)
+                    wakeDeadlineNs = now + maxWaitNs;
+                g_fgSub.sleptInWindow = true;
+            }
+            else
+            {
+                wakeDeadlineNs = 0;
+            }
+
+            const uint64_t effectiveEdgeNs = (wakeDeadlineNs > now) ? wakeDeadlineNs : now;
+            g_fgSub.nextTargetNs = effectiveEdgeNs + stepNs;
+
+            const bool dtSchedule = g_dtScheduleReady.load(std::memory_order_relaxed) &&
+                                    Config::Instance()->FramerateLimitDisplayTimingSchedule.value_or_default();
+            constexpr uint64_t kScheduleCushionNs = 1'000'000ULL;
+            const uint64_t dtTargetQpc = dtSchedule ? (effectiveEdgeNs + kScheduleCushionNs) : effectiveEdgeNs;
+            g_fgCurrentTargetQpcNs.store(dtTargetQpc, std::memory_order_release);
+        }
+    }
+
+    if (wakeDeadlineNs > 0)
+    {
+        if (const int res = SleepSubframeUntilNs(wakeDeadlineNs, mult); res != 0)
+        {
+            static bool errorLogged = false;
+            if (!errorLogged)
+            {
+                LOG_ERROR("Sub-frame sleep failed: {}", res);
+                errorLogged = true;
+            }
+        }
+    }
+
+    {
+        std::scoped_lock lock(g_fgSubMutex);
+        RecordSubframeEdgeLocked(Util::GetTimestamp());
+    }
+
+    g_fgOutputsThisWindow.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool FrameLimit::isSubframePacingActive()
+{
+    return ActiveSubframeMultiplier() > 0 && g_fgSubframeActive.load(std::memory_order_relaxed);
 }
 
 float FrameLimit::targetFps()
@@ -811,10 +1206,18 @@ void FrameLimit::recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, u
                          g_pll.phaseResidualEmaNs < 1'000'000.0 &&
                          (g_pll.displayTimingActive || g_pll.latencyVarianceEmaNs > 150'000.0 ||
                           !State::Instance().isRunningOnLinux);
+    g_dtScheduleReady.store(g_pll.displayTimingActive && g_pll.displayClockCalibrated && g_pll.vblankLocked,
+                            std::memory_order_relaxed);
 
     // Dynamic GPU-load-aware MaxInFlight (1 <-> 2 switching when Auto)
-    const uint64_t activeIntervalNs = g_activeIntervalNs.load(std::memory_order_relaxed);
-    if (Config::Instance()->FramerateLimitMaxInFlight.value_or_default() == 0 && activeIntervalNs > 0)
+    auto activeFg = State::Instance().CurrentFG();
+    const bool fgCurrentlyActive = activeFg != nullptr && activeFg->IsActive() && !activeFg->IsPaused();
+    const uint64_t activeIntervalNs =
+        (g_activeOutputIntervalNs.load(std::memory_order_relaxed) > 0)
+            ? g_activeOutputIntervalNs.load(std::memory_order_relaxed)
+            : g_activeIntervalNs.load(std::memory_order_relaxed);
+    if (!fgCurrentlyActive && Config::Instance()->FramerateLimitMaxInFlight.value_or_default() == 0 &&
+        activeIntervalNs > 0)
     {
         if (dt > activeIntervalNs + (activeIntervalNs / 12))
             g_pll.missedTargetStreak = std::min(g_pll.missedTargetStreak + 1, 16u);
@@ -906,12 +1309,72 @@ void FrameLimit::calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanou
         g_pll.offsetStableCount = 1;
         g_pll.displayClockCalibrated = false;
     }
+    g_dtScheduleReady.store(g_pll.displayTimingActive && g_pll.displayClockCalibrated && g_pll.vblankLocked,
+                            std::memory_order_relaxed);
 }
 
 uint64_t FrameLimit::getDesiredDisplayTimeNs()
 {
-    if (!Config::Instance()->FramerateLimitDisplayTimingSchedule.value_or_default() || !isLimitingActive() ||
-        currentMode() == Mode::BackEdge)
+    if (!Config::Instance()->FramerateLimitDisplayTimingSchedule.value_or_default())
+    {
+        std::scoped_lock lock(g_pllMutex);
+        g_pll.displayTimingScheduleActive = false;
+        return 0;
+    }
+
+    auto activeFg = State::Instance().CurrentFG();
+    const bool fgRunning = activeFg != nullptr && activeFg->IsActive() && !activeFg->IsPaused();
+
+    if (fgRunning)
+    {
+        if (!g_fgSubframeActive.load(std::memory_order_relaxed))
+        {
+            std::scoped_lock lock(g_pllMutex);
+            g_pll.displayTimingScheduleActive = false;
+            return 0;
+        }
+
+        const uint64_t targetQpc = g_fgCurrentTargetQpcNs.load(std::memory_order_acquire);
+        const uint64_t outputIntervalNs = g_activeOutputIntervalNs.load(std::memory_order_relaxed);
+        if (targetQpc == 0 || (outputIntervalNs > 0 && ShouldYieldToGamescopeLimiter(outputIntervalNs)))
+        {
+            std::scoped_lock lock(g_pllMutex);
+            g_pll.displayTimingScheduleActive = false;
+            return 0;
+        }
+
+        std::scoped_lock pllLock(g_pllMutex);
+        if (!g_pll.displayTimingActive || !g_pll.displayClockCalibrated || !g_pll.vblankLocked ||
+            g_pll.lastDisplayTimingNs == 0)
+        {
+            g_pll.displayTimingScheduleActive = false;
+            return 0;
+        }
+
+        const int64_t converted = static_cast<int64_t>(targetQpc) + g_pll.qpcToDisplayOffsetNs;
+        if (converted <= 0)
+        {
+            g_pll.displayTimingScheduleActive = false;
+            return 0;
+        }
+
+        const uint64_t desiredDisplay = static_cast<uint64_t>(converted);
+        const uint64_t lastScheduled = g_fgLastScheduledDisplayNs.load(std::memory_order_relaxed);
+        const uint64_t maxSpanNs = (outputIntervalNs > 0) ? (outputIntervalNs * 4) : 100'000'000ULL;
+
+        if (desiredDisplay <= lastScheduled || desiredDisplay < g_pll.lastDisplayTimingNs ||
+            (desiredDisplay - g_pll.lastDisplayTimingNs) > maxSpanNs)
+        {
+            g_pll.displayTimingScheduleActive = false;
+            return 0;
+        }
+
+        g_fgLastScheduledDisplayNs.store(desiredDisplay, std::memory_order_relaxed);
+        g_pll.displayTimingScheduleActive = true;
+        return desiredDisplay;
+    }
+
+    if (!isLimitingActive() || currentMode() == Mode::BackEdge)
     {
         std::scoped_lock lock(g_pllMutex);
         g_pll.displayTimingScheduleActive = false;
@@ -975,27 +1438,20 @@ void FrameLimit::getRecentFrameTimes(float* outMs, int maxCount, int& outCount, 
     if (outMs == nullptr || maxCount <= 0)
         return;
 
-    std::scoped_lock lock(g_pacerMutex);
-    const size_t available = std::min(g_pacer.frameTimeCount, static_cast<size_t>(maxCount));
-    if (available == 0)
-        return;
-
-    const size_t cap = g_pacer.frameTimesMs.size();
-    const size_t start = (g_pacer.frameTimeHead + cap - available) % cap;
-
-    float minV = FLT_MAX;
-    float maxV = 0.0f;
-    for (size_t i = 0; i < available; ++i)
+    if (ActiveSubframeMultiplier() > 0 && g_fgSubframeActive.load(std::memory_order_relaxed))
     {
-        const float v = g_pacer.frameTimesMs[(start + i) % cap];
-        outMs[i] = v;
-        minV = std::min(minV, v);
-        maxV = std::max(maxV, v);
+        std::scoped_lock lock(g_fgSubMutex);
+        if (g_fgSub.frameTimeCount > 2)
+        {
+            CopyRingFrameTimes(g_fgSub.frameTimesMs, g_fgSub.frameTimeHead, g_fgSub.frameTimeCount, outMs, maxCount,
+                               outCount, outMinMs, outMaxMs);
+            return;
+        }
     }
 
-    outCount = static_cast<int>(available);
-    outMinMs = minV;
-    outMaxMs = maxV;
+    std::scoped_lock lock(g_pacerMutex);
+    CopyRingFrameTimes(g_pacer.frameTimesMs, g_pacer.frameTimeHead, g_pacer.frameTimeCount, outMs, maxCount, outCount,
+                       outMinMs, outMaxMs);
 }
 
 FrameLimit::SyncStats FrameLimit::getStats()
@@ -1018,6 +1474,13 @@ FrameLimit::SyncStats FrameLimit::getStats()
         stats.simStartActive = g_pacer.simStartActive;
         stats.earlyAcquireActive = g_pacer.earlyAcquireActive;
     }
+    {
+        std::scoped_lock lock(g_fgSubMutex);
+        const uint32_t liveMult = ActiveSubframeMultiplier();
+        stats.fgSubframePacingActive = liveMult > 0 && g_fgSubframeActive.load(std::memory_order_relaxed);
+        stats.fgSubframeMultiplier = liveMult > 0 ? liveMult : g_fgSub.activeMult;
+        stats.lastSubframeIntervalUs = g_fgSub.lastSubIntervalNs / 1000ULL;
+    }
     if (stats.lastGpuWorkUs == 0 && State::Instance().lastUpscalerGpuMs > 0.0)
         stats.lastGpuWorkUs = static_cast<uint64_t>(State::Instance().lastUpscalerGpuMs * 1000.0);
 
@@ -1037,7 +1500,7 @@ void FrameLimit::prePresent(bool fgActive)
         return;
     }
 
-    g_activeIntervalNs.store(intervalNs, std::memory_order_relaxed);
+    StoreActiveIntervals(intervalNs, fgActive);
 
     const int mode = static_cast<int>(currentMode());
     int64_t sleepNs = 0;
@@ -1104,7 +1567,7 @@ void FrameLimit::postPresent(bool fgActive)
         return;
     }
 
-    g_activeIntervalNs.store(intervalNs, std::memory_order_relaxed);
+    StoreActiveIntervals(intervalNs, fgActive);
 
     const int mode = static_cast<int>(currentMode());
     int64_t sleepNs = 0;

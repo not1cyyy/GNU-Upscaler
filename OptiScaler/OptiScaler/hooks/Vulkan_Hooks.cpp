@@ -973,8 +973,9 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     const bool limitActive =
         !dx12FgActive && !dxgiPacingActive && !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
     const bool trackFrameSync =
-        !fgPresent && !dx12FgActive &&
-        (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0);
+        !fgPresent &&
+        (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0 ||
+         (dx12FgActive && FrameLimit::isSubframePacingActive()));
 
     VulkanFrameSync::PresentScope frameSyncScope {};
     if (trackFrameSync)
