@@ -1380,7 +1380,7 @@ static VkResult hkvkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchai
         return fg->AcquireNextImage(device, swapchain, timeout, semaphore, fence, pImageIndex);
     }
 
-    const void* retAddr = _ReturnAddress();
+    void* retAddr = _ReturnAddress();
     const bool dxgiBacked = IsDxgiBackedCaller(retAddr);
     const bool trackAcquire = !FromFGOutput(retAddr) && !IsPassThroughSwapchain(device, swapchain) &&
                               (State::Instance().isGamescopeActive || (!dxgiBacked && FrameLimit::isLimitingActive()));
@@ -1411,7 +1411,7 @@ static VkResult hkvkAcquireNextImage2KHR(VkDevice device, const VkAcquireNextIma
                                     pAcquireInfo->fence, pImageIndex);
     }
 
-    const void* retAddr = _ReturnAddress();
+    void* retAddr = _ReturnAddress();
     const bool dxgiBacked = IsDxgiBackedCaller(retAddr);
     const bool trackAcquire = pAcquireInfo != nullptr && !FromFGOutput(retAddr) &&
                               !IsPassThroughSwapchain(device, pAcquireInfo->swapchain) &&
