@@ -1014,7 +1014,10 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
     {
         auto isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr;
         if (isCurrent)
+        {
             FrameLimit::markDxgiPresent();
+            FrameLimit::onFgOutputPresent();
+        }
 
         const bool shouldLimit = isCurrent && !State::Instance().reflexLimitsFps &&
                                  State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();
@@ -1340,7 +1343,10 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
     {
         auto isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr;
         if (isCurrent)
+        {
             FrameLimit::markDxgiPresent();
+            FrameLimit::onFgOutputPresent();
+        }
 
         const bool shouldLimit = isCurrent && !State::Instance().reflexLimitsFps &&
                                  State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();

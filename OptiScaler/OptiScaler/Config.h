@@ -806,6 +806,7 @@ class Config
     CustomOptional<int> FramerateLimitMaxInFlight { 0 };
     CustomOptional<float> FramerateLimitSyncMarginMs { 0.6f };
     CustomOptional<bool> FramerateLimitDisplayTimingSchedule { true };
+    CustomOptional<int> FramerateLimitFgSubframeMode { 1 };
 
     // HDR
     CustomOptional<bool> ForceHDR { false };

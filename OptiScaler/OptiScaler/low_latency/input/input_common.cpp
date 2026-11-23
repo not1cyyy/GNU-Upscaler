@@ -1493,6 +1493,18 @@ void InputCommon::update()
         if (current_tech != nullptr)
             apply_sleep_mode(current_tech.get());
     }
+
+    // Keep XeFG's own markers-only XeLL context informed of the capped output cadence even when another limiter sleeps
+    if (auto ownXell = xefg_xell.load(); ownXell != nullptr)
+    {
+        static std::mutex xefgXellModeMutex;
+        std::scoped_lock lock(xefgXellModeMutex);
+        SleepMode sleepMode {};
+        sleepMode.low_latency_enabled = true;
+        sleepMode.minimum_interval_us =
+            fpsLimit > 0.0f ? static_cast<uint32_t>(std::round(1'000'000.0 / static_cast<double>(fpsLimit))) : 0;
+        ownXell->set_sleep_mode(&sleepMode);
+    }
 }
 
 InputResult InputCommon::mark_present_start(IUnknown* pDevice)
@@ -1585,8 +1597,11 @@ xell_context_handle_t InputCommon::acquire_xefg_xell(IUnknown* pDevice)
         xell->set_markers_only(true);
         xell->set_forced_mode(true);
 
+        const float fpsLimit = FrameLimit::targetFps();
         SleepMode sleepMode {};
         sleepMode.low_latency_enabled = true;
+        sleepMode.minimum_interval_us =
+            fpsLimit > 0.0f ? static_cast<uint32_t>(std::round(1'000'000.0 / static_cast<double>(fpsLimit))) : 0;
         xell->set_sleep_mode(&sleepMode);
 
         xefg_xell.store(xell);

@@ -1553,6 +1553,9 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
 
         if (state.activeFgOutput == FGOutput::XeFG)
         {
+            if (fgFeatureActive)
+                FrameLimit::onFgGamePresentStart();
+
             xefgContext = fg->SwapchainContext();
             xefgFrameId = InputCommon::xefg_marked_frame_id();
         }
