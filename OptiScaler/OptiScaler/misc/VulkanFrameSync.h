@@ -15,9 +15,13 @@ class VulkanFrameSync
   public:
     struct DeviceCaps
     {
+        VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+        PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR getSurfaceCaps2 = nullptr;
         bool hasPresentId = false;
         bool hasPresentWait = false;
         bool hasDisplayTiming = false;
+        bool hasPresentTiming = false;
+        bool hasPresentAtAbsoluteTime = false;
         bool hasCalibratedTimestamps = false;
         bool hasCalibratedQpc = false;
     };
@@ -31,6 +35,9 @@ class VulkanFrameSync
         VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeatures {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR
         };
+        VkPhysicalDevicePresentTimingFeaturesEXT presentTimingFeatures {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT
+        };
         DeviceCaps caps {};
     };
 
@@ -43,6 +50,10 @@ class VulkanFrameSync
         PFN_vkWaitForPresentKHR waitForPresent = nullptr;
         PFN_vkGetRefreshCycleDurationGOOGLE getRefreshCycleDuration = nullptr;
         PFN_vkGetPastPresentationTimingGOOGLE getPastPresentationTiming = nullptr;
+        PFN_vkSetSwapchainPresentTimingQueueSizeEXT setPresentTimingQueueSize = nullptr;
+        PFN_vkGetSwapchainTimingPropertiesEXT getSwapchainTimingProperties = nullptr;
+        PFN_vkGetSwapchainTimeDomainPropertiesEXT getSwapchainTimeDomainProperties = nullptr;
+        PFN_vkGetPastPresentationTimingEXT getPastPresentationTimingExt = nullptr;
         PFN_vkGetCalibratedTimestampsKHR getCalibratedTimestamps = nullptr;
         PFN_vkCreateFence createFence = nullptr;
         PFN_vkDestroyFence destroyFence = nullptr;
@@ -54,8 +65,15 @@ class VulkanFrameSync
         bool hasPresentId = false;
         bool hasPresentWait = false;
         bool hasDisplayTiming = false;
+        bool presentTimingExtEnabled = false;
+        bool hasPresentAtAbsoluteTime = false;
         bool hasCalibratedTimestamps = false;
         bool hasCalibratedQpc = false;
+        bool presentTimingDomainValid = false;
+        VkTimeDomainKHR presentTimingDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+        uint64_t presentTimingDomainId = 0;
+        VkPresentStageFlagsEXT presentTimingStageMask = 0;
+        uint64_t presentTimingPropsCounter = 0;
 
         uint64_t nextPresentId = 0;
         uint64_t lastWaitedId = 0;
@@ -98,6 +116,8 @@ class VulkanFrameSync
         uint32_t usedTimingId = 0;
         VkPresentTimesInfoGOOGLE presentTimesInfo {};
         VkPresentTimeGOOGLE presentTime {};
+        VkPresentTimingsInfoEXT presentTimingsInfo {};
+        VkPresentTimingInfoEXT presentTimingInfo {};
     };
 
     static void PrepareDeviceExtensions(VkPhysicalDevice physicalDevice, VkInstance physicalDeviceInstance,
@@ -109,8 +129,12 @@ class VulkanFrameSync
                                 PFN_vkWaitForPresentKHR originalWaitForPresent);
     static void OnDeviceDestroyed(VkDevice device);
 
+    static void PrepareSwapchainCreate(VkDevice device, VkSwapchainCreateInfoKHR& localCreateInfo,
+                                       const VkSwapchainCreateInfoKHR*& pCreateInfo, bool& outAddedPresentTimingBit,
+                                       uint32_t& outSupportedStageMask);
     static void OnSwapchainCreated(VkDevice device, VkSwapchainKHR swapchain, VkPresentModeKHR presentMode,
-                                   VkSwapchainKHR oldSwapchain);
+                                   VkSwapchainKHR oldSwapchain, bool presentTimingEnabled = false,
+                                   uint32_t supportedPresentStages = 0);
     static void OnSwapchainDestroyed(VkDevice device, VkSwapchainKHR swapchain);
 
     static void SyncGpu(VkQueue queue, const VkPresentInfoKHR* pPresentInfo, int syncDepth);

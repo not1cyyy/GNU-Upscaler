@@ -1143,6 +1143,26 @@ uint64_t Util::QpcToNs(int64_t ticks)
     return 0ULL;
 }
 
+uint64_t Util::NsToQpc(uint64_t ns)
+{
+    static LARGE_INTEGER s_frequency;
+    static BOOL s_use_qpc = QueryPerformanceFrequency(&s_frequency);
+
+    if (s_use_qpc && s_frequency.QuadPart > 0)
+    {
+        const uint64_t f = static_cast<uint64_t>(s_frequency.QuadPart);
+        const uint64_t whole = (ns / 1'000'000'000ULL) * f;
+        const uint64_t rem = ns % 1'000'000'000ULL;
+
+        if (f <= 18'000'000'000ULL)
+            return whole + (rem * f) / 1'000'000'000ULL;
+
+        return whole + static_cast<uint64_t>(static_cast<long double>(rem) * f / 1'000'000'000.0L);
+    }
+
+    return 0ULL;
+}
+
 uint64_t Util::GetTimestamp()
 {
     LARGE_INTEGER now;

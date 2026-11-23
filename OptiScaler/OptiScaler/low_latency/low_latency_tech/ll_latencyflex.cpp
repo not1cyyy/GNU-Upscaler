@@ -62,7 +62,7 @@ void LatencyFlex::lfx_sleep(uint64_t reflex_frame_id)
             timeout_events = 0;
         }
         // log_event("lfx_sleep", "{}", timestamp - current_timestamp);
-        if (auto res = eepy(timestamp - current_timestamp); res)
+        if (auto res = FrameLimit::sleepUntilNs(timestamp); res)
             LOG_ERROR("Sleep command failed: {}", res);
     }
     else

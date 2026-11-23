@@ -19,7 +19,7 @@ void FpsLimiter::limit()
         return;
     }
 
-    if (auto res = eepy(next_frame_timestamp - now); res)
+    if (auto res = FrameLimit::sleepUntilNs(next_frame_timestamp); res)
         LOG_ERROR("Sleep command failed: {}", res);
 
     next_frame_timestamp = FrameLimit::alignDeadlineToVBlank(next_frame_timestamp + interval_ns, interval_ns);

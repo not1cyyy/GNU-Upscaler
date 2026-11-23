@@ -297,6 +297,7 @@ bool Config::Reload(std::filesystem::path iniPath)
                 readBool("Framerate", "FramerateLimitDisplayTimingSchedule"));
             FramerateLimitFgSubframeMode.set_from_config(readInt("Framerate", "FramerateLimitFgSubframeMode"));
             FramerateLimitGpuSync.set_from_config(readInt("Framerate", "FramerateLimitGpuSync"));
+            FramerateLimitPriorityBoost.set_from_config(readBool("Framerate", "FramerateLimitPriorityBoost"));
         }
 
         // FSR Common
@@ -1639,6 +1640,8 @@ bool Config::SaveIni()
                      GetIntValue(Instance()->FramerateLimitFgSubframeMode.value_for_config()).c_str());
         ini.SetValue("Framerate", "FramerateLimitGpuSync",
                      GetIntValue(Instance()->FramerateLimitGpuSync.value_for_config()).c_str());
+        ini.SetValue("Framerate", "FramerateLimitPriorityBoost",
+                     GetBoolValue(Instance()->FramerateLimitPriorityBoost.value_for_config()).c_str());
     }
 
     // Output Scaling

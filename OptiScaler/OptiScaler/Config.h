@@ -808,6 +808,7 @@ class Config
     CustomOptional<bool> FramerateLimitDisplayTimingSchedule { true };
     CustomOptional<int> FramerateLimitFgSubframeMode { 1 };
     CustomOptional<int> FramerateLimitGpuSync { 1 };
+    CustomOptional<bool> FramerateLimitPriorityBoost { true };
 
     // HDR
     CustomOptional<bool> ForceHDR { false };

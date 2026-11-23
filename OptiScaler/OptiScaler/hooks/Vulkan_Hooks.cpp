@@ -999,12 +999,10 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
 
     if (limitActive && !fgActive && !dxgiBacked)
     {
+        FrameLimit::markCpuWorkEnd();
         const int gpuSyncDepth = FrameLimit::activeGpuSyncDepth(false);
         if (gpuSyncDepth >= 0)
-        {
-            FrameLimit::markCpuWorkEnd();
             VulkanFrameSync::SyncGpu(queue, &localPresentInfo, gpuSyncDepth);
-        }
     }
 
     VulkanFrameSync::PresentScope frameSyncScope {};
@@ -1241,6 +1239,8 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
 
     VkResult result = VK_SUCCESS;
     bool fgSwapchain = false;
+    bool addedPresentTimingBit = false;
+    uint32_t supportedPresentStages = 0;
     {
         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
         auto fg = State::Instance().currentVkFG;
@@ -1265,7 +1265,20 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
                 localCreateInfo.oldSwapchain = VK_NULL_HANDLE;
             }
 
+            if (pCreateInfo != nullptr && !State::Instance().vulkanSkipHooks && device != VK_NULL_HANDLE)
+            {
+                VulkanFrameSync::PrepareSwapchainCreate(device, localCreateInfo, pCreateInfo, addedPresentTimingBit,
+                                                        supportedPresentStages);
+            }
+
             result = o_CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+            if (result != VK_SUCCESS && addedPresentTimingBit && pCreateInfo == &localCreateInfo)
+            {
+                LOG_WARN("CreateSwapchainKHR failed with VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT, retrying without it");
+                localCreateInfo.flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+                addedPresentTimingBit = false;
+                result = o_CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+            }
             if (result != VK_SUCCESS && boostedMinImageCount && pCreateInfo == &localCreateInfo)
             {
                 LOG_WARN("CreateSwapchainKHR failed with minImageCount={}, retrying original {}",
@@ -1285,7 +1298,9 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
         if (dxgiBacked)
             _dxgiSwapchainVsync.store(IsFifoPresentMode(pCreateInfo->presentMode), std::memory_order_relaxed);
 
-        VulkanFrameSync::OnSwapchainCreated(device, *pSwapchain, pCreateInfo->presentMode, pCreateInfo->oldSwapchain);
+        const bool presentTimingEnabled = (pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT) != 0;
+        VulkanFrameSync::OnSwapchainCreated(device, *pSwapchain, pCreateInfo->presentMode, pCreateInfo->oldSwapchain,
+                                            presentTimingEnabled, supportedPresentStages);
     }
 
     if (result == VK_SUCCESS && device != VK_NULL_HANDLE && pCreateInfo != nullptr && *pSwapchain != VK_NULL_HANDLE &&

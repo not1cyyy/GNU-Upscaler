@@ -7237,14 +7237,17 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
             currentMethod.append(" [Gamescope]");
         if (syncStats.externalLimiterDetected)
             currentMethod.append(" [Ext Limiter]");
+        if (syncStats.priorityBoostActive)
+            currentMethod.append(" [RT]");
 
         if (state.rtssReflexInjection)
             currentMethod.append(" (RTSS)");
 
         ImGui::Text("Current method: %s", currentMethod.c_str());
 
-        if (syncStats.displayTimingActive || syncStats.presentWaitActive || syncStats.vblankLocked ||
-            syncStats.gpuSyncActive || syncStats.lastCpuWorkUs > 0 || syncStats.lastGpuWorkUs > 0)
+        if (syncStats.displayTimingActive || syncStats.presentTimingExtActive || syncStats.presentWaitActive ||
+            syncStats.vblankLocked || syncStats.gpuSyncActive || syncStats.lastCpuWorkUs > 0 ||
+            syncStats.lastGpuWorkUs > 0)
         {
             const std::string marginText =
                 syncStats.lastPresentMarginUs > 0
@@ -7253,20 +7256,26 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
             const std::string inFlightText =
                 syncStats.activeMaxInFlight > 0 ? std::format(" | InFlight: {}", syncStats.activeMaxInFlight) : "";
             const std::string calText = syncStats.calibratedTimestampsActive ? " [Cal]" : "";
-            const char* syncSource = syncStats.displayTimingScheduleActive ? "DisplayTiming (Scheduled)"
-                                     : syncStats.displayTimingActive       ? "DisplayTiming"
-                                     : syncStats.presentWaitActive         ? "PresentWait"
-                                     : syncStats.gpuSyncActive
-                                         ? (syncStats.gpuSyncStrict ? "GPU SyncFlush" : "GPU Queue<=1")
-                                         : "DXGI Sync";
+            const char* syncSource =
+                syncStats.displayTimingScheduleActive
+                    ? (syncStats.presentTimingExtActive ? "PresentTiming (Scheduled)" : "DisplayTiming (Scheduled)")
+                    : (syncStats.presentTimingExtActive ? "PresentTiming [EXT]"
+                       : syncStats.displayTimingActive  ? "DisplayTiming"
+                       : syncStats.presentWaitActive    ? "PresentWait"
+                       : syncStats.gpuSyncActive        ? (syncStats.gpuSyncStrict ? "GPU SyncFlush" : "GPU Queue<=1")
+                                                        : "DXGI Sync");
             const std::string gpuText =
                 syncStats.lastGpuJitterUs > 0
                     ? std::format("{:.2f} (+-{:.2f}) ms", syncStats.lastGpuWorkUs / 1000.0,
                                   syncStats.lastGpuJitterUs / 1000.0)
                     : std::format("{:.2f} ms", syncStats.lastGpuWorkUs / 1000.0);
-            ImGui::Text("Sync: %s%s%s%s%s | CPU: %.2f ms | GPU: %s | Slack: %llu us", syncSource, calText.c_str(),
+            const std::string jitterText =
+                syncStats.lastPacingJitterUs > 0
+                    ? std::format(" | Jitter: {:.2f} ms", syncStats.lastPacingJitterUs / 1000.0)
+                    : "";
+            ImGui::Text("Sync: %s%s%s%s%s%s | CPU: %.2f ms | GPU: %s | Slack: %llu us", syncSource, calText.c_str(),
                         syncStats.vblankLocked ? " (Locked)" : " (Async/VRR)", marginText.c_str(),
-                        inFlightText.c_str(), syncStats.lastCpuWorkUs / 1000.0, gpuText.c_str(),
+                        inFlightText.c_str(), jitterText.c_str(), syncStats.lastCpuWorkUs / 1000.0, gpuText.c_str(),
                         static_cast<unsigned long long>(syncStats.lastTimerOvershootUs));
         }
 
@@ -7356,7 +7365,13 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
             bool dtSchedule = config->FramerateLimitDisplayTimingSchedule.value_or_default();
             if (ImGui::Checkbox("Compositor DesiredPresentTime", &dtSchedule))
                 config->FramerateLimitDisplayTimingSchedule = dtSchedule;
-            ShowTooltip("Schedules VK_GOOGLE_display_timing desiredPresentTime when clock offset is calibrated");
+            ShowTooltip("Schedules VK_GOOGLE_display_timing / VK_EXT_present_timing target time when calibrated");
+
+            bool priorityBoost = config->FramerateLimitPriorityBoost.value_or_default();
+            if (ImGui::Checkbox("Pacing Thread Priority Boost", &priorityBoost))
+                config->FramerateLimitPriorityBoost = priorityBoost;
+            ShowTooltip("Elevates presenting/pacing thread priority (MMCSS Games + Highest) while limiting FPS\n"
+                        "to reduce OS wakeup jitter on Proton/Linux (rtkit/gamemode) and Windows");
 
             const char* gpuSyncItems[] = { "Off", "Auto (Adaptive)", "Strict (SyncFlush)" };
             int gpuSyncMode = std::clamp(config->FramerateLimitGpuSync.value_or_default(), 0, 2);

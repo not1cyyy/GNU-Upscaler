@@ -16,6 +16,7 @@ class FrameLimit
         double detectedRefreshHz = 0.0;
         bool vblankLocked = false;
         bool displayTimingActive = false;
+        bool presentTimingExtActive = false;
         bool displayTimingScheduleActive = false;
         bool presentWaitActive = false;
         bool simStartActive = false;
@@ -26,11 +27,13 @@ class FrameLimit
         bool gpuSyncStrict = false;
         bool calibratedTimestampsActive = false;
         bool externalLimiterDetected = false;
+        bool priorityBoostActive = false;
         int activeMaxInFlight = 0;
         uint32_t fgSubframeMultiplier = 0;
         uint64_t lastCpuWorkUs = 0;
         uint64_t lastGpuWorkUs = 0;
         uint64_t lastGpuJitterUs = 0;
+        uint64_t lastPacingJitterUs = 0;
         uint64_t lastPresentMarginUs = 0;
         uint64_t lastTimerOvershootUs = 0;
     };
@@ -71,9 +74,10 @@ class FrameLimit
     static bool hasRecentDxgiPresent();
 
     static void recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, uint64_t reportedRefreshNs,
-                                       uint64_t presentMarginNs, bool isVsyncMode, bool fromDisplayTiming);
+                                       uint64_t presentMarginNs, bool isVsyncMode, bool fromDisplayTiming,
+                                       bool fromPresentTimingExt = false);
     static void calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanoutQpcNs, bool immediate = false);
-    static uint64_t getDesiredDisplayTimeNs(bool useActiveDxgiFrame = false);
+    static uint64_t getDesiredDisplayTimeNs(bool useActiveDxgiFrame = false, bool targetQpcDomain = false);
     static uint64_t alignDeadlineToVBlank(uint64_t deadlineNs, uint64_t intervalNs);
     static void getRecentFrameTimes(float* outMs, int maxCount, int& outCount, float& outMinMs, float& outMaxMs);
     static SyncStats getStats();

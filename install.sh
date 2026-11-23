@@ -1133,4 +1133,8 @@ patch_steam_launch_options "add" "${PROXY_CHOICE%.dll}"
 echo -e "${BOLD}Tip for Linux / Proton:${RESET}"
 echo "If the game does not load the proxy DLL automatically, ensure WINEDLLOVERRIDES is set:"
 echo -e "  ${CYAN}WINEDLLOVERRIDES=\"${PROXY_CHOICE%.dll}=n,b\" %command%${RESET}"
+if [[ -n "${DXVK_FRAME_RATE:-}" ]] || [[ "${MANGOHUD_CONFIG:-}" == *"fps_limit="* ]]; then
+    log_warn "Detected DXVK_FRAME_RATE / MangoHud fps_limit in your environment; unset external limiters to avoid double-pacing."
+fi
+echo -e "${DIM}For lowest frame-pacing jitter under Proton, consider adding PROTON_USE_NTSYNC=1 or gamemoderun to launch options.${RESET}"
 echo ""

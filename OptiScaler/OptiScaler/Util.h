@@ -69,6 +69,7 @@ void LoadProxyLibrary(const std::wstring& name, const std::wstring& optiPath, co
 
 std::map<Luid, std::filesystem::path> GetDriverStore();
 uint64_t QpcToNs(int64_t ticks);
+uint64_t NsToQpc(uint64_t ns);
 uint64_t GetTimestamp();
 
 void SetFlagEnvVar(const wchar_t* name, bool enabled);
