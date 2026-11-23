@@ -4708,11 +4708,10 @@ static bool RenderRatioOverrideSlider(const char* label, CustomOptional<int, NoD
     return true;
 }
 
-static void RenderSharedDynamicFGControls(RenderMenuContext& ctx, const char* idSuffix, IFGFeature* fgOutput)
+static void RenderSharedDynamicFGControls(float menuResScale, const char* idSuffix, IFGFeature* fgOutput)
 {
-    auto* config = ctx.config;
-    auto& state = ctx.state;
-    const float menuResScale = ctx.menuResScale;
+    auto* config = Config::Instance();
+    auto& state = State::Instance();
 
     bool dynamicFg = config->FGDynamicFG.value_or_default();
     const std::string enableLabel = std::string("Dynamic FG (2X <-> 1X)") + idSuffix;
@@ -5556,7 +5555,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             }
 
             RenderFGModeSlider(ctx, "Frame Gen##fsrfg", 1, nullptr);
-            RenderSharedDynamicFGControls(ctx, "##fsrfgDyn", fgOutput);
+            RenderSharedDynamicFGControls(menuResScale, "##fsrfgDyn", fgOutput);
 
             bool fgAsync = config->FGAsync.value_or_default();
             if (ImGui::Checkbox("Allow Async", &fgAsync))
@@ -6254,7 +6253,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             std::max({ dlssg->GetMaxInterpolationCount(), config->FGDLSSGInterpolationCount.value_or(1), 3 });
         RenderFGModeSlider(ctx, "Frame Gen##dlssg", maxDlssg,
                            &config->FGDLSSGInterpolationCount);
-        RenderSharedDynamicFGControls(ctx, "##dlssgDyn", dlssg);
+        RenderSharedDynamicFGControls(menuResScale, "##dlssgDyn", dlssg);
 
         if (dlssg->GetMaxInterpolationCount() > 1)
         {

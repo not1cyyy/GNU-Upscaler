@@ -92,7 +92,7 @@ class FFXFeature : public virtual IFeature
     }
 
     void PopulateCameraAndTimingParams(const NVSDK_NGX_Parameter* InParameters, ffxDispatchDescUpscale& params);
-    void ApplyOutputScaling(const NVSDK_NGX_Parameter* InParameters, ffxDispatchDescUpscale& params) const;
+    void ApplyOutputScaling(const NVSDK_NGX_Parameter* InParameters, ffxDispatchDescUpscale& params);
     bool ShouldUseCustomAutoExposure();
 
     float _velocity = 1.0f;

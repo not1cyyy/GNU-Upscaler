@@ -376,7 +376,7 @@ void FFXFeature::PopulateCameraAndTimingParams(const NVSDK_NGX_Parameter* InPara
         params.preExposure = 1.0f;
 }
 
-void FFXFeature::ApplyOutputScaling(const NVSDK_NGX_Parameter* InParameters, ffxDispatchDescUpscale& params) const
+void FFXFeature::ApplyOutputScaling(const NVSDK_NGX_Parameter* InParameters, ffxDispatchDescUpscale& params)
 {
     const auto& cfg = *Config::Instance();
     const bool canOutputScale = LowResMV() || RenderWidth() == DisplayWidth();
