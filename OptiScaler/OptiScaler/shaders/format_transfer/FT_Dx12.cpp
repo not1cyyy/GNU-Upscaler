@@ -106,7 +106,6 @@ bool FT_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     UINT dispatchWidth = 0;
     UINT dispatchHeight = 0;
 
-    auto inDesc = InResource->GetDesc();
     dispatchWidth = static_cast<UINT>((inDesc.Width + InNumThreadsX - 1) / InNumThreadsX);
     dispatchHeight = (inDesc.Height + InNumThreadsY - 1) / InNumThreadsY;
 

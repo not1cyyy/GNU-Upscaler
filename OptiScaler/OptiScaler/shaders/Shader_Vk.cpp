@@ -500,12 +500,17 @@ bool Shader_Vk::IsHdrPQActive()
     return State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
 }
 
+static bool Is10BitUnormVkFormat(VkFormat format)
+{
+    return format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+}
+
 ShaderColorSpace Shader_Vk::GetSrvColorSpace(VkFormat format, bool hdrPQ)
 {
     if (IsSrgbFormat(format) || IsLinearFloatFormat(format))
         return ShaderColorSpace::Linear;
 
-    if (hdrPQ && (format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10R10_UNORM_PACK32))
+    if (hdrPQ && Is10BitUnormVkFormat(format))
         return ShaderColorSpace::PQ;
 
     return ShaderColorSpace::SrgbEncoded;
@@ -516,7 +521,7 @@ ShaderColorSpace Shader_Vk::GetTargetStorageColorSpace(VkFormat format, bool hdr
     if (IsLinearFloatFormat(format))
         return ShaderColorSpace::Linear;
 
-    if (hdrPQ && (format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10R10_UNORM_PACK32))
+    if (hdrPQ && Is10BitUnormVkFormat(format))
         return ShaderColorSpace::PQ;
 
     return ShaderColorSpace::SrgbEncoded;
