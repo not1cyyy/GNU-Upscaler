@@ -325,6 +325,10 @@ struct FgOpenLoopState
 {
     uint64_t nextTargetNs = 0;
     uint64_t lastOutputEdgeNs = 0;
+    uint64_t lastGamePresentNs = 0;
+    double baseFrameIntervalEmaNs = 0.0;
+    uint32_t baseFrameSamples = 0;
+    int64_t closedLoopBiasNs = 0;
     uint32_t activeMult = 0;
 
     std::array<float, 120> frameTimesMs {};
@@ -344,8 +348,11 @@ uint32_t ActiveSubframeMultiplier()
         return 0;
 
     auto& state = State::Instance();
-    if (state.activeFgOutput != FGOutput::XeFG)
+    if (state.activeFgOutput != FGOutput::XeFG && state.activeFgOutput != FGOutput::FSRFG &&
+        state.activeFgOutput != FGOutput::DLSSG)
+    {
         return 0;
+    }
 
     auto fg = state.CurrentFG();
     if (fg == nullptr || !fg->IsActive() || fg->IsPaused())
@@ -366,6 +373,10 @@ void ResetFgSubframeLocked()
 {
     g_fgSub.nextTargetNs = 0;
     g_fgSub.lastOutputEdgeNs = 0;
+    g_fgSub.lastGamePresentNs = 0;
+    g_fgSub.baseFrameIntervalEmaNs = 0.0;
+    g_fgSub.baseFrameSamples = 0;
+    g_fgSub.closedLoopBiasNs = 0;
     g_fgSub.activeMult = 0;
     if (g_fgSubframeActive.exchange(false, std::memory_order_release))
     {
@@ -1140,8 +1151,27 @@ void FrameLimit::recordPresentDuration(uint64_t presentDurationNs)
 
 void FrameLimit::onFgGamePresentStart()
 {
+    const uint64_t now = Util::GetTimestamp();
     g_fgGameThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     g_fgEpoch.fetch_add(1ULL, std::memory_order_seq_cst);
+
+    {
+        std::scoped_lock lock(g_fgSubMutex);
+        if (g_fgSub.lastGamePresentNs > 0 && now > g_fgSub.lastGamePresentNs)
+        {
+            const uint64_t dt = now - g_fgSub.lastGamePresentNs;
+            if (dt >= 1'000'000ULL && dt <= 250'000'000ULL)
+            {
+                const double dtF = static_cast<double>(dt);
+                g_fgSub.baseFrameIntervalEmaNs =
+                    g_fgSub.baseFrameIntervalEmaNs > 0.0 ? (0.20 * dtF + 0.80 * g_fgSub.baseFrameIntervalEmaNs) : dtF;
+                if (g_fgSub.baseFrameSamples < 1000)
+                    ++g_fgSub.baseFrameSamples;
+            }
+        }
+        g_fgSub.lastGamePresentNs = now;
+    }
+
     if (g_fgSubframeActive.load(std::memory_order_acquire))
     {
         if (HANDLE ev = GetFgWakeEvent())
@@ -1165,7 +1195,7 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
 
     const uint32_t mult = ActiveSubframeMultiplier();
     const float capFps = targetFps();
-    if (mult == 0 || capFps <= 0.0f)
+    if (mult == 0)
     {
         if (g_fgSubframeActive.load(std::memory_order_relaxed))
         {
@@ -1175,27 +1205,66 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
         return;
     }
 
-    g_fgSubframeActive.store(true, std::memory_order_release);
-
-    const DWORD curTid = GetCurrentThreadId();
-    const DWORD gameTid = g_fgGameThreadId.load(std::memory_order_relaxed);
-    if (gameTid == 0 || curTid == gameTid)
-    {
-        // Never block the game's DX12 thread
-        return;
-    }
-
     uint64_t deadlineNs = 0;
     const uint64_t startEpoch = g_fgEpoch.load(std::memory_order_acquire);
+    const DWORD curTid = GetCurrentThreadId();
+    const DWORD gameTid = g_fgGameThreadId.load(std::memory_order_relaxed);
+    const bool separatePresentThread = (gameTid != 0 && curTid != gameTid);
+
     {
         std::scoped_lock lock(g_fgSubMutex);
         const uint64_t now = Util::GetTimestamp();
-        const double capSubNs = std::clamp(1'000'000'000.0 / static_cast<double>(capFps), 100'000.0, 100'000'000.0);
-        // Fixed open-loop Virtual VSync tick slightly ahead of target frame rate (0.995 * T_cap) to prevent
-        // queue stalls without overshooting the FPS cap
-        const uint64_t stepNs =
-            std::min<uint64_t>(static_cast<uint64_t>(std::llround(capSubNs * 0.995)), 50'000'000ULL);
+
+        double targetSubNs = 0.0;
+        if (capFps > 0.0f)
+        {
+            targetSubNs = std::clamp(1'000'000'000.0 / static_cast<double>(capFps), 100'000.0, 100'000'000.0);
+        }
+        else if (g_fgSub.baseFrameSamples >= 4 && g_fgSub.baseFrameIntervalEmaNs > 0.0)
+        {
+            // Uncapped / VRR mode: pace generated subframes evenly across the measured base frame interval
+            targetSubNs =
+                std::clamp(g_fgSub.baseFrameIntervalEmaNs / static_cast<double>(mult), 100'000.0, 100'000'000.0);
+        }
+
+        if (targetSubNs <= 0.0)
+        {
+            g_fgSub.nextTargetNs = 0;
+            g_fgSub.lastOutputEdgeNs = 0;
+            g_fgSub.closedLoopBiasNs = 0;
+            g_fgSub.activeMult = 0;
+            if (g_fgSubframeActive.exchange(false, std::memory_order_release))
+            {
+                if (HANDLE ev = GetFgWakeEvent())
+                    SetEvent(ev);
+            }
+            return;
+        }
+
+        g_fgSubframeActive.store(true, std::memory_order_release);
         g_fgSub.activeMult = mult;
+
+        if (!separatePresentThread)
+            return;
+
+        const uint64_t nominalStepNs =
+            std::min<uint64_t>(static_cast<uint64_t>(std::llround(targetSubNs * 0.995)), 50'000'000ULL);
+
+        if (g_fgSub.lastOutputEdgeNs > 0 && now > g_fgSub.lastOutputEdgeNs)
+        {
+            const uint64_t actualDelta = now - g_fgSub.lastOutputEdgeNs;
+            if (actualDelta < nominalStepNs * 3)
+            {
+                const int64_t deltaErr =
+                    static_cast<int64_t>(actualDelta) - static_cast<int64_t>(nominalStepNs);
+                g_fgSub.closedLoopBiasNs =
+                    std::clamp<int64_t>(g_fgSub.closedLoopBiasNs - deltaErr / 16, -350'000LL, 250'000LL);
+            }
+        }
+
+        const int64_t rawStep = static_cast<int64_t>(nominalStepNs) + g_fgSub.closedLoopBiasNs;
+        const uint64_t stepNs = static_cast<uint64_t>(
+            std::clamp<int64_t>(rawStep, 100'000LL, static_cast<int64_t>(nominalStepNs) + 250'000LL));
 
         if (!hwVsync)
         {
@@ -1220,7 +1289,7 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
             static bool errorLogged = false;
             if (!errorLogged)
             {
-                LOG_ERROR("XeFG virtual vsync sleep failed: {}", res);
+                LOG_ERROR("FG virtual vsync sleep failed: {}", res);
                 errorLogged = true;
             }
         }
@@ -1237,8 +1306,7 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
 
 bool FrameLimit::isSubframePacingActive()
 {
-    return ActiveSubframeMultiplier() > 0 && targetFps() > 0.0f &&
-           g_fgSubframeActive.load(std::memory_order_relaxed);
+    return ActiveSubframeMultiplier() > 0 && g_fgSubframeActive.load(std::memory_order_relaxed);
 }
 
 float FrameLimit::targetFps()
@@ -1249,9 +1317,9 @@ float FrameLimit::targetFps()
     if (Config::Instance()->FGXeFGDynamicMFG.value_or_default() &&
         Config::Instance()->FGXeFGTargetAsCapDMFG.value_or_default())
     {
-        if (auto fg = state.currentFG; fg != nullptr && fg->IsActive() && !fg->IsPaused() &&
-                                       state.activeFgOutput == FGOutput::XeFG && state.xefgDynamicCapFps > 0.0f &&
-                                       (fpsLimit <= 0.0f || state.xefgDynamicCapFps < fpsLimit))
+        if (auto fg = state.CurrentFG(); fg != nullptr && fg->IsActive() && !fg->IsPaused() &&
+                                         state.activeFgOutput == FGOutput::XeFG && state.xefgDynamicCapFps > 0.0f &&
+                                         (fpsLimit <= 0.0f || state.xefgDynamicCapFps < fpsLimit))
         {
             return state.xefgDynamicCapFps;
         }
@@ -1265,6 +1333,21 @@ bool FrameLimit::isLimitingActive()
     return targetFps() > 0.0f && !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
 }
 
+bool FrameLimit::isGpuSyncActive()
+{
+    const int cfg = std::clamp(Config::Instance()->FramerateLimitGpuSync.value_or_default(), 0, 2);
+    if (cfg == 0)
+        return false;
+
+    if (isLimitingActive())
+        return true;
+
+    if (Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0)
+        return true;
+
+    return targetFps() > 0.0f;
+}
+
 FrameLimit::Mode FrameLimit::currentMode()
 {
     const int raw = std::clamp(Config::Instance()->FramerateLimitMode.value_or_default(), 0, 2);
@@ -1273,18 +1356,27 @@ FrameLimit::Mode FrameLimit::currentMode()
 
 int FrameLimit::maxInFlightPresents()
 {
-    // Never throttle swapchain queue depth while Frame Generation is actively buffering/interpolating frames
-    if (auto fg = State::Instance().CurrentFG(); fg != nullptr && fg->IsActive() && !fg->IsPaused())
-        return 0;
-
     const int configured = Config::Instance()->FramerateLimitMaxInFlight.value_or_default();
     if (configured < 0)
         return 0;
 
+    if (auto fg = State::Instance().CurrentFG(); fg != nullptr && fg->IsActive() && !fg->IsPaused())
+    {
+        const uint32_t mult = fg->GetInterpolatedFrameCount() + 1u;
+        const int minFgDepth = (mult >= 3) ? 2 : 1;
+        if (configured > 0)
+            return std::clamp(configured, minFgDepth, 4);
+
+        if (isGpuSyncActive() || isLimitingActive())
+            return (mult >= 3) ? 3 : 2;
+
+        return 0;
+    }
+
     if (configured > 0)
         return std::clamp(configured, 1, 4);
 
-    if (!isLimitingActive())
+    if (!isLimitingActive() && !isGpuSyncActive())
         return 0;
 
     return g_dynamicMaxInFlight.load(std::memory_order_relaxed);
@@ -1470,21 +1562,23 @@ void FrameLimit::markCpuWorkEnd()
 
 int FrameLimit::activeGpuSyncDepth(bool fgActive)
 {
-    if (fgActive || !isLimitingActive())
-        return -1;
-
-    const uint64_t intervalNs = ComputeIntervalNs(false);
-    if (intervalNs == 0 || ShouldYieldToGamescopeLimiter(intervalNs))
+    if (fgActive || !isGpuSyncActive())
         return -1;
 
     const int cfg = std::clamp(Config::Instance()->FramerateLimitGpuSync.value_or_default(), 0, 2);
     if (cfg == 0)
         return -1;
 
+    const uint64_t intervalNs = ComputeIntervalNs(false);
+    if (intervalNs > 0 && ShouldYieldToGamescopeLimiter(intervalNs))
+        return -1;
+
     if (cfg == 2)
         return 0;
 
-    if (currentMode() != Mode::FrontEdgeSync)
+    // When an external low-latency SDK owns CPU sleep or limiting is passive (MaxInFlight only),
+    // use non-blocking depth-1 queue limiting so we do not break SDK pipeline overlap.
+    if (!isLimitingActive() || currentMode() != Mode::FrontEdgeSync)
         return 1;
 
     std::scoped_lock lock(g_pacerMutex);

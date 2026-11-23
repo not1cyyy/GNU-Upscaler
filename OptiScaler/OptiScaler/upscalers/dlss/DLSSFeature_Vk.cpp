@@ -19,7 +19,8 @@ bool DLSSFeatureVk::InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter*
 
     do
     {
-        if (!_dlssInited)
+        const bool justInited = !_dlssInited;
+        if (justInited)
         {
 
             _dlssInited = NVNGXProxy::InitVulkan(Instance, PhysicalDevice, Device, GIPA, GDPA);
@@ -33,9 +34,6 @@ bool DLSSFeatureVk::InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter*
                 (NVNGXProxy::VULKAN_GetParameters() != nullptr || NVNGXProxy::VULKAN_AllocateParameters() != nullptr) &&
                 NVNGXProxy::VULKAN_DestroyParameters() != nullptr && NVNGXProxy::VULKAN_CreateFeature() != nullptr &&
                 NVNGXProxy::VULKAN_ReleaseFeature() != nullptr && NVNGXProxy::VULKAN_EvaluateFeature() != nullptr;
-
-            // delay between init and create feature
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
 
         LOG_INFO("Creating DLSS feature");
@@ -45,8 +43,13 @@ bool DLSSFeatureVk::InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter*
             ProcessInitParams(InParameters);
 
             _p_dlssHandle = &_dlssHandle;
-            nvResult = NVNGXProxy::VULKAN_CreateFeature()(InCmdList, NVSDK_NGX_Feature_SuperSampling, InParameters,
-                                                          &_p_dlssHandle);
+            nvResult = CreateNgxFeatureWithRetry(justInited,
+                                                 [&]()
+                                                 {
+                                                     return NVNGXProxy::VULKAN_CreateFeature()(
+                                                         InCmdList, NVSDK_NGX_Feature_SuperSampling, InParameters,
+                                                         &_p_dlssHandle);
+                                                 });
 
             if (nvResult != NVSDK_NGX_Result_Success)
             {

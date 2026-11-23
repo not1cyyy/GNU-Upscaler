@@ -4,7 +4,53 @@
 #include <d3d12.h>
 
 #include <magic_enum.hpp>
+#include <cmath>
 #include "low_latency/ll_util.h"
+
+struct FractionalFpsPacer
+{
+    uint64_t nextFrameTimestamp = 0;
+
+    static int ComputeDriverCeilingFps(uint32_t intervalUs, bool& outNeedsFractionalSleep)
+    {
+        if (intervalUs == 0)
+        {
+            outNeedsFractionalSleep = false;
+            return 0;
+        }
+
+        const double exactFps = 1'000'000.0 / static_cast<double>(intervalUs);
+        const double roundedFps = std::round(exactFps);
+        outNeedsFractionalSleep = std::abs(exactFps - roundedFps) > 0.05;
+        return static_cast<int>(std::ceil(exactFps));
+    }
+
+    void Pace(uint32_t intervalUs)
+    {
+        const uint64_t intervalNs = 1000ULL * static_cast<uint64_t>(intervalUs);
+        const uint64_t now = Util::GetTimestamp();
+
+        if (intervalNs == 0)
+        {
+            nextFrameTimestamp = 0;
+            return;
+        }
+
+        // Behind schedule (or way ahead after a change), start pacing from now instead of catching up
+        if (nextFrameTimestamp <= now || nextFrameTimestamp - now > intervalNs + (intervalNs / 4))
+        {
+            nextFrameTimestamp = FrameLimit::alignDeadlineToVBlank(now + intervalNs, intervalNs);
+            return;
+        }
+
+        if (auto res = FrameLimit::sleepUntilNs(nextFrameTimestamp); res)
+            LOG_ERROR("Sleep command failed: {}", res);
+
+        nextFrameTimestamp = FrameLimit::alignDeadlineToVBlank(nextFrameTimestamp + intervalNs, intervalNs);
+    }
+
+    void Reset() { nextFrameTimestamp = 0; }
+};
 
 #define INVALID_ID 0xFFFFFFFFFFFFFFFF
 

@@ -149,6 +149,11 @@ bool Config::Reload(std::filesystem::path iniPath)
             FGModifyBufferState.set_from_config(readBool("FrameGen", "ModifyBufferState"));
             FGModifySCIndex.set_from_config(readBool("FrameGen", "ModifySCIndex"));
             FGHudCutoff.set_from_config(readFloat("FrameGen", "HudCutoff"));
+            FGDynamicFG.set_from_config(readBool("FrameGen", "DynamicFG"));
+            if (auto setting = readFloat("FrameGen", "DynamicTargetFps"); setting.has_value())
+                FGDynamicTargetFps.set_from_config(setting.value() >= 10.0f ? setting.value() : 0.0f);
+            if (auto setting = readFloat("FrameGen", "MinBaseFps"); setting.has_value())
+                FGMinBaseFps.set_from_config(std::clamp(setting.value(), 0.0f, 120.0f));
         }
 
         // FSR FG
@@ -180,6 +185,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             FGHudfixPersistentBindings.set_from_config(readBool("OptiFG", "HUDFixPersistentBindings"));
             FGZeroCopyHudless.set_from_config(readBool("OptiFG", "ZeroCopyHudless"));
             FGHudCopyTileSkip.set_from_config(readBool("OptiFG", "HudCopyTileSkip"));
+            FGDebugAsyncHudCopy.set_from_config(readBool("OptiFG", "DebugAsyncHudCopy"));
             FGUseShards.set_from_config(readBool("OptiFG", "UseShards"));
             FGAlwaysTrackHeaps.set_from_config(readBool("OptiFG", "AlwaysTrackHeaps"));
             FGResourceBlocking.set_from_config(readBool("OptiFG", "ResourceBlocking"));
@@ -1454,6 +1460,10 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->FGModifyBufferState.value_for_config()).c_str());
         ini.SetValue("FrameGen", "ModifySCIndex", GetBoolValue(Instance()->FGModifySCIndex.value_for_config()).c_str());
         ini.SetValue("FrameGen", "HudCutoff", GetFloatValue(Instance()->FGHudCutoff.value_for_config()).c_str());
+        ini.SetValue("FrameGen", "DynamicFG", GetBoolValue(Instance()->FGDynamicFG.value_for_config()).c_str());
+        ini.SetValue("FrameGen", "DynamicTargetFps",
+                     GetFloatValue(Instance()->FGDynamicTargetFps.value_for_config()).c_str());
+        ini.SetValue("FrameGen", "MinBaseFps", GetFloatValue(Instance()->FGMinBaseFps.value_for_config()).c_str());
     }
 
     // FSR FG output
@@ -1572,6 +1582,8 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->FGZeroCopyHudless.value_for_config()).c_str());
         ini.SetValue("OptiFG", "HudCopyTileSkip",
                      GetBoolValue(Instance()->FGHudCopyTileSkip.value_for_config()).c_str());
+        ini.SetValue("OptiFG", "DebugAsyncHudCopy",
+                     GetBoolValue(Instance()->FGDebugAsyncHudCopy.value_for_config()).c_str());
         ini.SetValue("OptiFG", "UseShards", GetBoolValue(Instance()->FGUseShards.value_for_config()).c_str());
         ini.SetValue("OptiFG", "AlwaysTrackHeaps",
                      GetBoolValue(Instance()->FGAlwaysTrackHeaps.value_for_config()).c_str());

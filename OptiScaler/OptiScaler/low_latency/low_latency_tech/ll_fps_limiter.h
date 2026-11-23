@@ -8,7 +8,7 @@ class FpsLimiter : public LowLatencyTech
 {
   private:
     uint32_t minimum_interval_us = 0;
-    uint64_t next_frame_timestamp = 0;
+    FractionalFpsPacer pacer {};
 
     uint64_t last_sleep_framecount = 0;
     uint64_t simulation_framecount = 0;

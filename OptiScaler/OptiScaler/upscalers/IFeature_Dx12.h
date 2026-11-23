@@ -35,6 +35,7 @@ class IFeature_Dx12 : public virtual IFeature
     std::vector<std::tuple<ID3D12Resource*, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES>> _barrierTransitions;
     bool _deferPostPasses = false;
     PendingAsyncPostPasses _pendingAsyncPasses {};
+    UINT64 _pendingAsyncDoneFence = 0;
 
     void RestoreBarriers(ID3D12GraphicsCommandList* InCommandList);
     RcasConstants BuildRcasConstants(NVSDK_NGX_Parameter* InParameters);
@@ -65,6 +66,8 @@ class IFeature_Dx12 : public virtual IFeature
     bool Init(ID3D12Device* InDevice, ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
     bool Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
     void SetDeferPostPasses(bool defer) { _deferPostPasses = defer; }
+    bool BeginPendingPostPassesAsync(ID3D12CommandQueue* directQueue);
+    bool WaitPendingPostPassesAsync(ID3D12CommandQueue* directQueue);
     bool DispatchPendingPostPassesAsync(ID3D12CommandQueue* directQueue);
 
     API Api() const override { return API::DX12; }

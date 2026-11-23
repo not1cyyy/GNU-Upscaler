@@ -987,9 +987,11 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     const bool dxgiPacingActive = dxgiBacked && FrameLimit::hasRecentDxgiPresent();
     const bool limitActive =
         !dx12FgActive && !dxgiPacingActive && !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
+    const bool gpuSyncEnabled = !dx12FgActive && !fgActive && !dxgiBacked && FrameLimit::activeGpuSyncDepth(false) >= 0;
     const bool trackFrameSync =
         !fgPresent && !dx12FgActive &&
-        (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0);
+        (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0 ||
+         FrameLimit::isGpuSyncActive() || State::Instance().reflexLimitsFps || InputCommon::can_limit_fps());
 
     if (dxgiBacked && localPresentInfo.swapchainCount == 1)
     {
@@ -1011,9 +1013,11 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
         }
     }
 
-    if (limitActive && !fgActive && !dxgiBacked)
-    {
+    if (!dxgiBacked && !fgActive)
         FrameLimit::markCpuWorkEnd();
+
+    if (gpuSyncEnabled)
+    {
         const int gpuSyncDepth = FrameLimit::activeGpuSyncDepth(false);
         if (gpuSyncDepth >= 0)
             VulkanFrameSync::SyncGpu(queue, &localPresentInfo, gpuSyncDepth);

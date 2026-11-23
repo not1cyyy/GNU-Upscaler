@@ -807,10 +807,10 @@ void MenuCommon::UpdateManualInput(HWND targetHwnd)
 
 void MenuCommon::ShowTooltip(const char* tip)
 {
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    if (tip != nullptr && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
     {
         ImGui::BeginTooltip();
-        ImGui::Text(tip);
+        ImGui::TextUnformatted(tip);
         ImGui::EndTooltip();
     }
 }
@@ -4269,7 +4269,30 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
             }
             if (ImGui::IsItemDeactivatedAfterEdit())
                 config->SaveIni();
-            ShowTooltip("Automatically steps down FSR 4 model/preset when average upscaler GPU pass exceeds this budget (0 = Off).");
+            GnuUi::HelpWithLiveAdvice(
+                "Automatically steps down FSR 4 model/preset when average upscaler GPU pass exceeds this budget, and steps back up when headroom returns (0 = Off).",
+                [&]() -> std::string
+                {
+                    const double gpuMs = state.lastUpscalerGpuMs;
+                    if (fsr4BudgetMs <= 0.0f)
+                    {
+                        return gpuMs > 0.0
+                                   ? std::format("Live output: Off. Upscaler GPU pass is {:.2f} ms; set a budget around 2.5-4.0 ms to auto-scale FSR4 cost under heavy load.",
+                                                 gpuMs)
+                                   : "Live output: Off. Recommended when using native FP8/INT8 without automatic model step-downs.";
+                    }
+                    if (gpuMs <= 0.0)
+                        return std::format("Live output: Budget {:.1f} ms armed (waiting for GPU pass samples).",
+                                           fsr4BudgetMs);
+                    if (gpuMs > fsr4BudgetMs * 1.05)
+                        return std::format("Live output: Upscaler pass {:.2f} ms exceeds {:.1f} ms budget -> stepping down quality, or raise budget if visuals matter more.",
+                                           gpuMs, fsr4BudgetMs);
+                    if (gpuMs < fsr4BudgetMs * 0.72)
+                        return std::format("Live output: Upscaler pass {:.2f} ms has wide headroom under {:.1f} ms (auto-step-up active when recovering).",
+                                           gpuMs, fsr4BudgetMs);
+                    return std::format("Live output: Upscaler pass {:.2f} ms tracking within {:.1f} ms budget.",
+                                       gpuMs, fsr4BudgetMs);
+                });
         }
 
         if (majorFsrVersion >= 3)
@@ -4683,6 +4706,104 @@ static bool RenderRatioOverrideSlider(const char* label, CustomOptional<int, NoD
         setting = index == 0 ? 0 : index - 1;
 
     return true;
+}
+
+static void RenderSharedDynamicFGControls(RenderMenuContext& ctx, const char* idSuffix, IFGFeature* fgOutput)
+{
+    auto* config = ctx.config;
+    auto& state = ctx.state;
+    const float menuResScale = ctx.menuResScale;
+
+    bool dynamicFg = config->FGDynamicFG.value_or_default();
+    const std::string enableLabel = std::string("Dynamic FG (2X <-> 1X)") + idSuffix;
+    if (GnuUi::Checkbox(enableLabel.c_str(), &dynamicFg))
+    {
+        config->FGDynamicFG = dynamicFg;
+        if (!dynamicFg)
+            state.adfgClamped = false;
+        config->SaveIni();
+    }
+    GnuUi::HelpWithLiveAdvice(
+        "Modulates frame generation between active multipliers and 1X passthrough around your target FPS and Min Base FPS latency floor.",
+        [fgOutput, dynamicFg, &state, config]() -> std::string
+        {
+            const auto fs = FrameStats::Compute();
+            const double baseFps = state.lastFGFrameTime > 0.0 ? (1000.0 / state.lastFGFrameTime) : 0.0;
+            const UINT interp = fgOutput ? fgOutput->GetInterpolatedFrameCount() : 0u;
+            if (!dynamicFg)
+            {
+                return fs.samples >= 30 && baseFps > 0.0
+                           ? std::format("Live output: Off. Base ~{:.1f} FPS | Displayed {:.1f} FPS. Enable to drop FG automatically when headroom isn't needed or base FPS dips.",
+                                         baseFps, fs.avgFps)
+                           : "Live output: Off. Enable to drop to 1X automatically when FPS limit is met or base FPS dips below the floor.";
+            }
+            if (state.adfgClamped)
+                return std::format("Live output: Clamped (Base ~{:.1f} FPS < {:.0f} FPS floor) — protecting responsiveness by stepping FG down.",
+                                   baseFps, config->FGMinBaseFps.value_or_default());
+            if (interp == 0)
+                return std::format("Live output: 1X passthrough active (Base ~{:.1f} FPS, Displayed {:.1f} FPS).",
+                                   baseFps, fs.samples >= 30 ? fs.avgFps : 0.0f);
+            return std::format("Live output: {}X active (Base ~{:.1f} FPS | Displayed {:.1f} FPS).", interp + 1u,
+                               baseFps, fs.samples >= 30 ? fs.avgFps : 0.0f);
+        });
+
+    if (!dynamicFg)
+        return;
+
+    float targetFps = config->FGDynamicTargetFps.value_or_default();
+    ImGui::SetNextItemWidth(150.0f * menuResScale);
+    const std::string targetLabel = std::string("Dynamic Target FPS") + idSuffix;
+    if (ImGui::SliderFloat(targetLabel.c_str(), &targetFps, 0.0f, 360.0f,
+                           targetFps > 0.0f ? "%.0f FPS" : "Auto (Limit/VRR)", ImGuiSliderFlags_AlwaysClamp))
+    {
+        config->FGDynamicTargetFps = targetFps >= 10.0f ? targetFps : 0.0f;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit())
+        config->SaveIni();
+    GnuUi::HelpWithLiveAdvice(
+        "Target displayed FPS for Dynamic FG (0 = OptiScaler Framerate Limit, or just under display refresh rate for VRR).",
+        [targetFps]() -> std::string
+        {
+            const auto fs = FrameStats::Compute();
+            if (targetFps <= 0.0f)
+            {
+                return refreshRate > 0
+                           ? std::format("Live output: Auto targeting ~{} Hz VRR ceiling (current avg {:.1f} FPS).",
+                                         refreshRate, fs.samples >= 30 ? fs.avgFps : 0.0f)
+                           : "Live output: Auto targeting FPS limit / display refresh.";
+            }
+            if (fs.samples >= 30 && fs.avgFps > targetFps * 1.03f)
+                return std::format("Live output: Displayed {:.1f} FPS already above {:.0f} FPS target — 1X passthrough saves latency.",
+                                   fs.avgFps, targetFps);
+            return std::format("Live output: Aiming for {:.0f} FPS (displayed avg {:.1f} FPS).", targetFps,
+                               fs.samples >= 30 ? fs.avgFps : 0.0f);
+        });
+
+    ImGui::SameLine(0.0f, 12.0f);
+    float minBaseFps = config->FGMinBaseFps.value_or_default();
+    ImGui::SetNextItemWidth(150.0f * menuResScale);
+    const std::string guardLabel = std::string("Min Base FPS") + idSuffix;
+    if (ImGui::SliderFloat(guardLabel.c_str(), &minBaseFps, 0.0f, 90.0f,
+                           minBaseFps > 0.0f ? "%.0f FPS" : "Off", ImGuiSliderFlags_AlwaysClamp))
+    {
+        config->FGMinBaseFps = minBaseFps;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit())
+        config->SaveIni();
+    GnuUi::HelpWithLiveAdvice(
+        "Drops FG above 1X if native base frame rate stays below this floor (recommended: 45 FPS; lower to 35-40 FPS for heavy single-player, raise to 55-60 FPS for twitch shooters).",
+        [minBaseFps, &state]() -> std::string
+        {
+            const double baseFps = state.lastFGFrameTime > 0.0 ? (1000.0 / state.lastFGFrameTime) : 0.0;
+            if (minBaseFps <= 0.0f)
+                return "Live output: Floor disabled. Raise to 40-50 FPS to prevent floaty input when base FPS drops.";
+            if (baseFps > 0.0 && baseFps < minBaseFps)
+                return std::format("Live output: Base ~{:.1f} FPS is below {:.0f} FPS floor -> clamping to 1X for responsiveness. Lower floor or reduce upscaler res/settings.",
+                                   baseFps, minBaseFps);
+            return baseFps > 0.0
+                       ? std::format("Live output: Base ~{:.1f} FPS safely above {:.0f} FPS floor.", baseFps, minBaseFps)
+                       : std::format("Live output: Floor armed at {:.0f} FPS.", minBaseFps);
+        });
 }
 
 void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
@@ -5105,8 +5226,22 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
             {
                 config->FGDrawUIOverFG = drawUIOverFG;
             }
-            ShowTooltip("Draws UI resource over the final image\n"
-                        "If no UI visible, enable this!");
+            GnuUi::HelpWithLiveAdvice(
+                "Draws captured UI texture over the generated frame (recommended: Off unless HUD is missing or flickers).",
+                [&]() -> std::string
+                {
+                    const bool hasUi = fgOutput->IsUsingUIAny();
+                    const bool hasHudless = fgOutput->IsUsingHudlessAny();
+                    if (!hasUi)
+                        return "Live output: No UI resource captured yet (button inactive until UI texture is seen).";
+                    if (config->FGDrawUIOverFG.value_or_default())
+                        return hasHudless
+                                   ? "Live output: On with UI + HUDless detected. Disable if HUD looks doubled or overly bright."
+                                   : "Live output: On with UI captured, but no HUDless buffer yet — keep Off if game handles UI natively.";
+                    return hasHudless
+                               ? "Live output: Recommended (Off) with HUDless + UI active. Enable only if HUD elements disappear during FG."
+                               : "Live output: Off. Enable only if in-game UI fails to appear over generated frames.";
+                });
 
             ImGui::EndDisabled();
 
@@ -5376,7 +5511,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
     auto& currentFeature = ctx.currentFeature;
     auto& menuResScale = ctx.menuResScale;
     auto& primaryGpu = *ctx.primaryGpu;
-    auto fgOutput = state.currentFG;
+    auto fgOutput = state.CurrentFG();
 
     const UiTargetMode uiTargetMode = getUiTargetMode();
     const bool outputIsHdr = uiTargetMode != UiTargetMode::SDR;
@@ -5421,6 +5556,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             }
 
             RenderFGModeSlider(ctx, "Frame Gen##fsrfg", 1, nullptr);
+            RenderSharedDynamicFGControls(ctx, "##fsrfgDyn", fgOutput);
 
             bool fgAsync = config->FGAsync.value_or_default();
             if (ImGui::Checkbox("Allow Async", &fgAsync))
@@ -5767,7 +5903,19 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
         bool paceOnSwapchain = config->FGXeFGPaceOnSwapchain.value_or(true);
         if (GnuUi::Checkbox("Pace on Swapchain", &paceOnSwapchain))
             config->FGXeFGPaceOnSwapchain = paceOnSwapchain;
-        GnuUi::Help("Relocated after Dispatch to reduce CPU stalls while keeping DXGI swapchain pacing");
+        GnuUi::HelpWithLiveAdvice(
+            "Relocated after Dispatch to reduce CPU stalls while keeping DXGI swapchain latency bounded.",
+            [&]() -> std::string
+            {
+                const auto fs = FrameStats::Compute();
+                if (!paceOnSwapchain)
+                    return "Live output: Off (Recommended On). Enable to prevent swapchain frame-queue buildup during FG bursts.";
+                return fs.samples >= 30
+                           ? std::format("Live output: Recommended (On). Present avg {:.1f} FPS / 1% low {:.1f} FPS (last FG present {:.2f} ms).",
+                                         fs.avgFps, fs.low1Fps, state.lastFGPresentMs)
+                           : "Live output: Recommended (On). Tune the wait slider right of this box if micro-stutter occurs.";
+            },
+            "XeFG.PaceOnSwapchain");
 
         if (paceOnSwapchain)
         {
@@ -5776,6 +5924,20 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             ImGui::SetNextItemWidth(100.0f * menuResScale);
             if (ImGui::SliderInt("##xefgWaitMs", &waitMs, 0, 20, "%d ms wait", ImGuiSliderFlags_AlwaysClamp))
                 config->FGXeFGMaxWaitMs = waitMs;
+            GnuUi::HelpWithLiveAdvice(
+                "Max wait timeout for the DXGI frame latency waitable object after Dispatch (recommended: 2 ms).",
+                [&]() -> std::string
+                {
+                    const auto fs = FrameStats::Compute();
+                    if (waitMs == 0)
+                        return "Live output: 0 ms (polling). Raise to 1-3 ms if queue latency feels floaty or frames pile up.";
+                    if (fs.samples >= 30 && fs.low1Fps < fs.avgFps * 0.65f)
+                        return std::format("Live output: 1% low ({:.1f}) trails avg ({:.1f} FPS). Try lowering wait by 1 ms or check base GPU load.",
+                                             fs.low1Fps, fs.avgFps);
+                    return std::format("Live output: {} ms bounded wait active (present {:.2f} ms). Raise slightly to clamp latency; lower toward 1 ms if throughput drops.",
+                                       waitMs, state.lastFGPresentMs);
+                },
+                "XeFG.MaxWaitMs");
             if (ImGui::IsItemDeactivatedAfterEdit())
                 config->SaveIni();
         }
@@ -5783,7 +5945,16 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
         ImGui::SameLine(0.0f, 16.0f);
         if (GnuUi::Checkbox("Allow Dilated Motion Vectors", &allowDilatedMV))
             config->FGXeFGAllowDilatedMV = allowDilatedMV;
-        GnuUi::Help("Allows Unreal Engine full-resolution dilated motion vectors without requiring game-side disabling");
+        GnuUi::HelpWithLiveAdvice(
+            "Lets XeFG run when a game only supplies full-resolution dilated motion vectors, e.g. Unreal Engine (recommended: Off unless blocked).",
+            [&]() -> std::string
+            {
+                if (fgOutput->IsLowResMV() || nativeAA)
+                    return "Live output: Render-resolution MVs active — keeping this Off is ideal for cleanest interpolation.";
+                if (!allowDilatedMV)
+                    return "Live output: Dilated MVs detected! XeFG is blocked unless you enable this option or disable dilated MVs in engine.";
+                return "Live output: On (Allowing dilated MVs). If ghosting around fast thin edges appears, check game MV settings.";
+            });
 
         if (dynamicMFG)
         {
@@ -5861,8 +6032,20 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             {
                 config->SaveIni();
             }
-            ShowTooltip("Prevents high multipliers when native base framerate dips too low,\n"
-                        "eliminating floaty mouse/controller input latency during heavy combat.");
+            GnuUi::HelpWithLiveAdvice(
+                "Prevents high multipliers (3X+) when native base FPS dips below this floor, keeping input latency snappy (recommended: 45 FPS).",
+                [&]() -> std::string
+                {
+                    const double baseFps = state.lastFGFrameTime > 0.0 ? (1000.0 / state.lastFGFrameTime) : 0.0;
+                    if (baseFps <= 0.0)
+                        return std::format("Live output: Floor set to {:.0f} FPS (collecting base frame samples).",
+                                           minBaseFps);
+                    if (state.adfgClamped || baseFps < minBaseFps)
+                        return std::format("Live output: Base ~{:.1f} FPS < {:.0f} FPS floor -> clamped down to avoid sluggish latency. Lower floor toward 35-40 if GPU load is normally heavy.",
+                                           baseFps, minBaseFps);
+                    return std::format("Live output: Base ~{:.1f} FPS comfortably above {:.0f} FPS floor (raise to 55-60 for faster competitive feel).",
+                                       baseFps, minBaseFps);
+                });
         }
 
         bool fgDV = config->FGXeFGDebugView.value_or_default();
@@ -5985,7 +6168,23 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                 config->FGXeFGMaxInterpolatedFrames = capValues[currentCapIdx];
                 config->SaveIni();
             }
-            GnuUi::Help("Configures [XeFG] MaxInterpolatedFrames in OptiScaler.ini. Sized at startup to allocate swapchain buffers. Requires game restart.");
+            GnuUi::HelpWithLiveAdvice(
+                "Configures [XeFG] MaxInterpolatedFrames at startup to size swapchain history buffers (recommended: 5 [6X], or 3 [4X] on tight VRAM). Requires restart.",
+                [&]() -> std::string
+                {
+                    const auto fs = FrameStats::Compute();
+                    if (refreshRate > 0 && refreshRate <= 144 && currentCeiling > 3)
+                        return std::format("Live output: {} Hz display detected (avg {:.1f} FPS). Lowering cap to 4X (3 frames) saves swapchain VRAM with zero loss below 144 Hz.",
+                                           refreshRate, fs.samples >= 30 ? fs.avgFps : 0.0f);
+                    if (refreshRate >= 240 && currentCeiling < 5)
+                        return std::format("Live output: {} Hz high-refresh panel detected. Raise to 6X (5 frames) or 8X+ to saturate refresh rate.",
+                                           refreshRate);
+                    return fs.samples >= 30
+                               ? std::format("Live output: {}X ceiling configured ({} Hz display, avg {:.1f} FPS).",
+                                             currentCeiling + 1, refreshRate, fs.avgFps)
+                               : std::format("Live output: {}X ceiling ({} max interpolated frames) active.",
+                                             currentCeiling + 1, currentCeiling);
+                });
 
             ImGui::SameLine();
             ImGui::TextColored(StatusWarn(), "[Restart Required]");
@@ -6055,6 +6254,7 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
             std::max({ dlssg->GetMaxInterpolationCount(), config->FGDLSSGInterpolationCount.value_or(1), 3 });
         RenderFGModeSlider(ctx, "Frame Gen##dlssg", maxDlssg,
                            &config->FGDLSSGInterpolationCount);
+        RenderSharedDynamicFGControls(ctx, "##dlssgDyn", dlssg);
 
         if (dlssg->GetMaxInterpolationCount() > 1)
         {
@@ -6367,14 +6567,60 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                 bool zeroCopy = config->FGZeroCopyHudless.value_or_default();
                 if (ImGui::Checkbox("Zero-Copy HUDless", &zeroCopy))
                     config->FGZeroCopyHudless = zeroCopy;
-                ShowTooltip("Passes swapchain-sized matching-format HUDless buffers straight to FG without a full-screen GPU copy.");
+                GnuUi::HelpWithLiveAdvice(
+                    "Passes swapchain-sized matching-format HUDless buffers straight to FG without a full-screen GPU copy.",
+                    [&]() -> std::string
+                    {
+                        const auto fs = FrameStats::Compute();
+                        if (config->FGImmediateCapture.value_or_default() || state.fgHudlessCompare)
+                            return "Live output: Inactive right now because Immediate Capture or HUDless Compare is enabled.";
+                        if (zeroCopy)
+                            return fs.samples >= 30
+                                       ? std::format("Live output: Avg {:.1f} FPS (1% low {:.1f}). Recommended On if image is clean; disable if UI bleeds or flickers.",
+                                                     fs.avgFps, fs.low1Fps)
+                                       : "Live output: Enabled. Disable if UI elements flicker or tear in generated frames.";
+                        return fs.samples >= 30 && state.lastFGFrameTime > 12.0
+                                   ? std::format("Live output: Frame time {:.1f} ms. Try enabling to save a full-res copy pass (keep Off if HUD flickers).",
+                                                 state.lastFGFrameTime)
+                                   : "Live output: Recommended Off by default for stability; enable to shave GPU bandwidth on heavy scenes.";
+                    },
+                    "OptiFG.ZeroCopyHudless");
 
                 ImGui::SameLine(0.0f, 16.0f);
 
                 bool tileSkip = config->FGHudCopyTileSkip.value_or_default();
                 if (ImGui::Checkbox("HudCopy Tile Skip", &tileSkip))
                     config->FGHudCopyTileSkip = tileSkip;
-                ShowTooltip("Uses a 16x16 super-tile activity mask in HudCopy to skip non-HUD screen regions and identical writes.");
+                GnuUi::HelpWithLiveAdvice(
+                    "Uses a 16x16 super-tile activity mask in HudCopy to skip static non-HUD regions and identical writes.",
+                    [&]() -> std::string
+                    {
+                        if (!tileSkip)
+                            return "Live output: Recommended On. Enable to reduce HudCopy shader cost on large displays.";
+                        return state.lastUpscalerGpuMs > 0.0
+                                   ? std::format("Live output: Optimal (On). Disable only if subtle HUD edges miss updates.")
+                                   : "Live output: Optimal (On) for lower FG UI composition overhead.";
+                    },
+                    "OptiFG.HudCopyTileSkip");
+
+                ImGui::SameLine(0.0f, 16.0f);
+
+                bool debugAsyncHudCopy = config->FGDebugAsyncHudCopy.value_or_default();
+                if (ImGui::Checkbox("Debug Async HudCopy", &debugAsyncHudCopy))
+                    config->FGDebugAsyncHudCopy = debugAsyncHudCopy;
+                GnuUi::HelpWithLiveAdvice(
+                    "[Debug] Opt-in 3-submit async compute staging for XeFG HudCopy instead of batched direct submission.",
+                    [&]() -> std::string
+                    {
+                        const auto fs = FrameStats::Compute();
+                        if (!debugAsyncHudCopy)
+                            return "Live output: Optimal (Off). Batched direct submission avoids 3 full-res staging copies.";
+                        return fs.samples >= 30
+                                   ? std::format("Live output: Debug mode Active (Avg {:.1f} / 1% low {:.1f} FPS). Turn Off unless profiling async vs. batched.",
+                                                 fs.avgFps, fs.low1Fps)
+                                   : "Live output: Debug mode Active. Turn Off for normal play to eliminate extra copy/fence overhead.";
+                    },
+                    "OptiFG.DebugAsyncHudCopy");
             }
 
             bool depthScale = config->FGEnableDepthScale.value_or_default();
@@ -6501,6 +6747,27 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
                                         ? "D3D12 only; not applicable to DX11."
                                         : "Always track resources, might cause performance issues\n, but also might "
                                           "fix HUDFix related crashes!");
+
+                        ImGui::BeginDisabled(dx11HudfixTracking);
+                        auto useShards = config->FGUseShards.value_or_default();
+                        if (ImGui::Checkbox("Use Shards (HUDfix MT)", &useShards))
+                            config->FGUseShards = useShards;
+                        ImGui::EndDisabled();
+                        GnuUi::HelpWithLiveAdvice(
+                            "Splits D3D12 command-list and HUDless tracking across 16 cache-line-aligned shards to avoid global mutex contention.",
+                            [&]() -> std::string
+                            {
+                                if (dx11HudfixTracking)
+                                    return "Live output: D3D12 only; inactive on DX11.";
+                                const auto fs = FrameStats::Compute();
+                                if (useShards)
+                                    return fs.samples >= 30
+                                               ? std::format("Live output: Recommended (On). Avg {:.1f} FPS / 1% low {:.1f} FPS.",
+                                                             fs.avgFps, fs.low1Fps)
+                                               : "Live output: Recommended (On) for multi-threaded D3D12 draw recording.";
+                                return "Live output: Off. Recommended to keep On to cut CPU lock contention on multithreaded engines.";
+                            },
+                            "OptiFG.UseShards");
 
                         auto disableRTV = config->FGHudfixDisableRTV.value_or_default();
                         if (ImGui::Checkbox("Disable RTV Tracking", &disableRTV))
@@ -7338,11 +7605,25 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
             int limitMode = std::clamp(config->FramerateLimitMode.value_or_default(), 0, 2);
             if (ImGui::Combo("Pacing Mode", &limitMode, modeItems, IM_ARRAYSIZE(modeItems)))
                 config->FramerateLimitMode = limitMode;
-            ShowTooltip("Front-Edge JIT: Sleeps after present minus measured CPU work, then trims pre-present\n"
-                        "Front-Edge Sync: RTSS-style wait right before Present aligned to VBlank\n"
-                        "Back-Edge: Drift-free post-present sleep");
+            GnuUi::HelpWithLiveAdvice(
+                "Front-Edge JIT: Sleeps after present minus CPU work, then trims pre-present (Recommended).\n"
+                "Front-Edge Sync: Waits right before Present aligned to VBlank.\n"
+                "Back-Edge: Simple post-present sleep.",
+                [&]() -> std::string
+                {
+                    const auto flStats = FrameLimit::getStats();
+                    const float jitterMs = static_cast<float>(flStats.lastPacingJitterUs) / 1000.0f;
+                    if (jitterMs > 1.2f)
+                        return std::format("Live output: Pacing jitter {:.2f} ms. Try Front-Edge Sync (mode 1) for tighter frame times.",
+                                             jitterMs);
+                    return std::format("Live output: CPU {:.2f} ms | GPU {:.2f} ms | Jitter {:.2f} ms{}.",
+                                       static_cast<float>(flStats.lastCpuWorkUs) / 1000.0f,
+                                       static_cast<float>(flStats.lastGpuWorkUs) / 1000.0f, jitterMs,
+                                       flStats.vblankLocked ? " (VBlank locked)" : "");
+                },
+                "Framerate.LimitMode");
 
-            const char* inFlightItems[] = { "Off", "Auto (2)", "1 (Strict)", "2 (Balanced)", "3", "4" };
+            const char* inFlightItems[] = { "Off", "Auto (Adaptive)", "1 (Strict)", "2 (Balanced)", "3", "4" };
             const int inFlightValues[] = { -1, 0, 1, 2, 3, 4 };
             int rawInFlight = config->FramerateLimitMaxInFlight.value_or_default();
             int inFlightIdx = 1;
@@ -7356,7 +7637,21 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
             }
             if (ImGui::Combo("Max In-Flight Presents", &inFlightIdx, inFlightItems, IM_ARRAYSIZE(inFlightItems)))
                 config->FramerateLimitMaxInFlight = inFlightValues[inFlightIdx];
-            ShowTooltip("Uses VK_KHR_present_wait to prevent swapchain queue buildup (Linux/Vulkan/DXVK/VKD3D)");
+            GnuUi::HelpWithLiveAdvice(
+                "Bounds swapchain queue buildup using VK_KHR_present_wait / waitable frame latency (recommended: Auto).",
+                [&]() -> std::string
+                {
+                    const auto flStats = FrameLimit::getStats();
+                    const auto fs = FrameStats::Compute();
+                    if (rawInFlight == -1)
+                        return "Live output: Off. Set to Auto (0) or 1-2 to eliminate swapchain buffering lag.";
+                    if (fs.samples >= 30 && flStats.activeMaxInFlight == 1 && fs.low1Fps < fs.avgFps * 0.70f)
+                        return std::format("Live output: Active depth 1 (1% low {:.1f} vs avg {:.1f} FPS). Raise to 2 if throughput drops.",
+                                             fs.low1Fps, fs.avgFps);
+                    return std::format("Live output: Bounding {} in-flight presents (GPU {:.2f} ms). Lower to 1 for min lag; 2-3 if GPU-bound.",
+                                       flStats.activeMaxInFlight, static_cast<float>(flStats.lastGpuWorkUs) / 1000.0f);
+                },
+                "Framerate.MaxInFlight");
 
             float syncMargin = config->FramerateLimitSyncMarginMs.value_or_default();
             if (ImGui::SliderFloat("VBlank Margin (ms)", &syncMargin, 0.0f, 3.0f, "%.2f"))
@@ -7378,16 +7673,38 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
             int gpuSyncMode = std::clamp(config->FramerateLimitGpuSync.value_or_default(), 0, 2);
             if (ImGui::Combo("GPU Sync", &gpuSyncMode, gpuSyncItems, IM_ARRAYSIZE(gpuSyncItems)))
                 config->FramerateLimitGpuSync = gpuSyncMode;
-            ShowTooltip("Synchronizes GPU completion before pacing sleep across D3D12, D3D11, and Vulkan:\n"
-                        "Auto: Strict depth-0 SyncFlush under Front-Edge Sync when budget allows; depth-1 queue limit otherwise\n"
-                        "Strict: Always waits current frame GPU completion before sleep (lowest latency, limits overlap)");
+            GnuUi::HelpWithLiveAdvice(
+                "Synchronizes GPU completion before Present across D3D12, D3D11, and Vulkan (recommended: Auto).",
+                [&]() -> std::string
+                {
+                    const auto flStats = FrameLimit::getStats();
+                    if (gpuSyncMode == 0)
+                        return "Live output: Off. Use Auto (1) to cap GPU queue lag even alongside Reflex/AntiLag.";
+                    return std::format("Live output: {} (GPU {:.2f} ms, jitter {:.2f} ms). Use Strict (2) if GPU-bound input lag persists; Auto (1) for best FPS.",
+                                       flStats.gpuSyncStrict ? "Depth-0 SyncFlush" : "Depth-1 Bounded",
+                                       static_cast<float>(flStats.lastGpuWorkUs) / 1000.0f,
+                                       static_cast<float>(flStats.lastGpuJitterUs) / 1000.0f);
+                },
+                "Framerate.GpuSync");
 
             const char* subframeItems[] = { "Off", "Virtual VSync 3x+ (Default)", "Virtual VSync 2x+" };
             int subframeMode = std::clamp(config->FramerateLimitFgSubframeMode.value_or_default(), 0, 2);
-            if (ImGui::Combo("XeFG Virtual VSync", &subframeMode, subframeItems, IM_ARRAYSIZE(subframeItems)))
+            if (ImGui::Combo("FG Virtual VSync", &subframeMode, subframeItems, IM_ARRAYSIZE(subframeItems)))
                 config->FramerateLimitFgSubframeMode = subframeMode;
-            ShowTooltip("Emulates a hardware 0.995 * targetFPS clock at Vulkan present for VSync-off/VRR;\n"
-                        "zero dtReal feedback so base FPS cannot spiral");
+            GnuUi::HelpWithLiveAdvice(
+                "Closed-loop subframe staggering for FG outputs (XeFG / FSRFG / DLSSG), supporting both capped and uncapped VRR.",
+                [&]() -> std::string
+                {
+                    const auto flStats = FrameLimit::getStats();
+                    if (subframeMode == 0)
+                        return "Live output: Off. Enable 3x+ (1) or 2x+ (2) if generated frames burst back-to-back.";
+                    return flStats.fgSubframePacingActive
+                               ? std::format("Live output: Active ({}x FG, jitter {:.2f} ms). Keeps subframes evenly spaced.",
+                                             flStats.fgSubframeMultiplier,
+                                             static_cast<float>(flStats.lastPacingJitterUs) / 1000.0f)
+                               : "Live output: Armed (waiting for multi-frame FG output presents). Use mode 2 to include 2x FG.";
+                },
+                "Framerate.FgSubframeMode");
         }
 
         ImGui::Spacing();
@@ -7401,13 +7718,8 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
             ImGui::PopItemWidth();
 
             float refreshRateF = static_cast<float>(refreshRate);
-            // it's fine to use with real reflex, we only care about antilag
-            auto fpsLimitTech = InputCommon::active_output();
             constexpr float margin = 0.3f; // in ms
             float frameCap = std::round(10000.f / (1000.f / refreshRateF + margin)) / 10.f;
-
-            if (fpsLimitTech == LowLatencyMode::AntiLag2 || fpsLimitTech == LowLatencyMode::AntiLagVk)
-                frameCap = std::round(frameCap);
 
             ImGui::Text("Calculated Cap: %.1f", frameCap);
 
@@ -7917,7 +8229,27 @@ void MenuCommon::RenderUpscaleRatioSettings(RenderMenuContext& ctx)
         if (gaqEnabled)
             ReInitUpscaler();
     }
-    GnuUi::Help("Dynamically adjusts internal render scale using a hardware PID controller to maintain your target framerate.");
+    GnuUi::HelpWithLiveAdvice(
+        "Dynamically adjusts internal render scale using a GPU-time and sleep-aware PID controller to maintain your target framerate.",
+        [&]() -> std::string
+        {
+            const auto fs = FrameStats::Compute();
+            const float targetFps = std::max(20.0f, config->GaqTargetFps.value_or_default());
+            const float targetMs = 1000.0f / targetFps;
+            if (!gaqEnabled)
+            {
+                return fs.samples >= 30
+                           ? std::format("Live output: Off. Present avg {:.1f} FPS (1% low {:.1f} FPS). Enable to protect frame time during GPU spikes.",
+                                         fs.avgFps, fs.low1Fps)
+                           : "Live output: Off. Enable when GPU load varies widely across scenes.";
+            }
+            if (State::Instance().gaqCpuBound)
+                return std::format("Live output: CPU-bound detected (active {:.2f} ms vs {:.2f} ms target). Lower GAQ Target FPS or lighten CPU settings; lower res cannot fix CPU limits.",
+                                   State::Instance().lastActiveFrameMs, targetMs);
+            return std::format("Live output: Scale {:.2f}x | Active frame {:.2f} ms vs {:.2f} ms target (avg {:.1f} FPS).",
+                               GaqController::Instance().CurrentRatio(), State::Instance().lastActiveFrameMs, targetMs,
+                               fs.samples >= 30 ? fs.avgFps : 0.0f);
+        });
 
     if (gaqEnabled)
     {
@@ -7932,6 +8264,23 @@ void MenuCommon::RenderUpscaleRatioSettings(RenderMenuContext& ctx)
             config->SaveIni();
             ReInitUpscaler();
         }
+        GnuUi::HelpWithLiveAdvice(
+            "Target base frame rate for GAQ Auto-DRS (recommended: 90% of stable GPU headroom or base FPS under FG).",
+            [&]() -> std::string
+            {
+                const auto fs = FrameStats::Compute();
+                if (State::Instance().gaqCpuBound && fs.samples >= 30)
+                    return std::format("Live output: CPU-bound near {:.1f} avg FPS — lower GAQ Target FPS to ~{:.0f} so GAQ holds high native clarity.",
+                                       fs.avgFps, std::max(30.0f, fs.avgFps * 0.90f));
+                if (fs.samples >= 30 && fs.avgFps < gaqTarget * 0.90f)
+                    return std::format("Live output: Running below target ({:.1f} vs {:.0f} FPS). Raise GAQ MaxRatio or lower target toward {:.0f} FPS.",
+                                       fs.avgFps, gaqTarget, std::max(30.0f, fs.avgFps));
+                return fs.samples >= 30
+                           ? std::format("Live output: Present {:.1f} FPS (1% low {:.1f}) tracking {:.0f} FPS target cleanly.",
+                                         fs.avgFps, fs.low1Fps, gaqTarget)
+                           : std::format("Live output: Targeting {:.0f} FPS ({:.2f} ms frame budget).", gaqTarget,
+                                         1000.0f / std::max(1.0f, gaqTarget));
+            });
 
         float motionBoost = config->GaqMotionBoost.value_or_default();
         ImGui::SetNextItemWidth(150.0f * menuResScale);
@@ -7939,7 +8288,19 @@ void MenuCommon::RenderUpscaleRatioSettings(RenderMenuContext& ctx)
             config->GaqMotionBoost = motionBoost;
         if (ImGui::IsItemDeactivatedAfterEdit())
             config->SaveIni();
-        GnuUi::Help("Boosts upscale ratio smoothly during rapid camera/mouse turns and decays back when stationary.");
+        GnuUi::HelpWithLiveAdvice(
+            "Temporarily boosts upscale ratio during fast camera/mouse turns and decays smoothly when stationary (recommended: 0.15-0.25x).",
+            [&]() -> std::string
+            {
+                const auto fs = FrameStats::Compute();
+                if (motionBoost <= 0.01f)
+                    return "Live output: Disabled (+0.00x). Raise to +0.20x if fast camera pans drop GPU headroom.";
+                if (fs.samples >= 30 && fs.low1Fps < fs.avgFps * 0.65f)
+                    return std::format("Live output: 1% low ({:.1f}) dips below avg ({:.1f} FPS). Dial Motion Boost down toward 0.10x if resolution steps hitch pans.",
+                                       fs.low1Fps, fs.avgFps);
+                return std::format("Live output: +{:.2f}x transient turn headroom active without waiting on the 500 ms steady PID dwell.",
+                                   motionBoost);
+            });
 
         {
             const auto fs = FrameStats::Compute();
@@ -8582,8 +8943,24 @@ void MenuCommon::RenderAdvancedSettings(RenderMenuContext& ctx)
                            "Dynamic Resolution Scaling\nFix for games ignoring official DRS limits");
 
             ImGui::TableNextColumn();
-            ConfigCheckbox("DX12 Async Compute", config->Dx12AsyncCompute,
-                           "Offloads Output Scaling, RCAS, and HudCopy compute passes onto a dedicated async compute queue");
+            ConfigCheckbox("DX12 Async Compute", config->Dx12AsyncCompute, nullptr);
+            GnuUi::HelpWithLiveAdvice(
+                "Offloads deferred Output Scaling, RCAS, and Magnifier compute passes onto a dedicated async compute queue.",
+                [&]() -> std::string
+                {
+                    const auto fs = FrameStats::Compute();
+                    const bool isAsync = config->Dx12AsyncCompute.value_or_default();
+                    if (!isAsync)
+                        return state.lastUpscalerGpuMs > 2.5
+                                   ? std::format("Live output: Off (upscaler {:.2f} ms). Usually keep Off on native DX12; test On only on bridge paths.",
+                                                 state.lastUpscalerGpuMs)
+                                   : "Live output: Recommended Off on native DX12 (post-passes run inline on the game's command list).";
+                    return (fs.samples >= 30 && fs.low1Fps < fs.avgFps * 0.65f)
+                               ? std::format("Live output: 1% low ({:.1f} FPS) trails avg ({:.1f} FPS); try turning Off if cross-queue waits stall.",
+                                             fs.low1Fps, fs.avgFps)
+                               : "Live output: Enabled. Turn Off if frame-time variance increases under Proton/VKD3D.";
+                },
+                "DX12.AsyncCompute");
 
             ImGui::TableNextColumn();
             ConfigCheckbox("DX12 Packed 32-bit Buffers", config->Dx12PackedBuffers,

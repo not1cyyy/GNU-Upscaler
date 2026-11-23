@@ -2,6 +2,7 @@
 #include "GpuTime_Dx12.h"
 
 #include <State.h>
+#include <Util.h>
 #include <misc/DeferredRelease.h>
 
 #include <include/d3dx/d3dx12.h>
@@ -63,17 +64,20 @@ GpuTime_Dx12::~GpuTime_Dx12()
 
 void GpuTime_Dx12::Start(ID3D12GraphicsCommandList* cmdList)
 {
-    if (_init && _queryHeap != nullptr)
+    _recording = false;
+
+    if (_init && _queryHeap != nullptr && Util::ShouldRecordUpscalerGpuTime())
     {
         _currentFrameIndex = (_currentFrameIndex + 1) % QUERY_BUFFER_COUNT;
 
         cmdList->EndQuery(_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, _currentFrameIndex * 2);
+        _recording = true;
     }
 }
 
 void GpuTime_Dx12::End(ID3D12GraphicsCommandList* cmdList)
 {
-    if (_init && _queryHeap != nullptr)
+    if (_recording && _init && _queryHeap != nullptr)
     {
         cmdList->EndQuery(_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, _currentFrameIndex * 2 + 1);
 
@@ -82,6 +86,8 @@ void GpuTime_Dx12::End(ID3D12GraphicsCommandList* cmdList)
 
         _trigger[_currentFrameIndex] = true;
     }
+
+    _recording = false;
 }
 
 std::optional<double> GpuTime_Dx12::ReadGpuTime(ID3D12CommandQueue* commandQueue)

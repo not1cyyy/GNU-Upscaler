@@ -1181,14 +1181,29 @@ uint64_t Util::GetTimestampAndQpc(int64_t& outQpcTicks)
     return GetTickCount64() * 1'000'000ULL;
 }
 
+static std::atomic<bool> g_lastMenuVisibleForGpuTime { false };
+static std::atomic<uint32_t> g_gpuSampleCadenceCounter { 0 };
+
+bool Util::ShouldRecordUpscalerGpuTime()
+{
+    auto* config = Config::Instance();
+    return g_lastMenuVisibleForGpuTime.load(std::memory_order_relaxed) || config->ShowFps.value_or_default() ||
+           config->GaqEnabled.value_or_default() || config->Fsr4MaxGpuMs.value_or_default() > 0.0f;
+}
+
 bool Util::ShouldSampleUpscalerGpuTime(bool menuVisible)
 {
-    if (menuVisible)
-        return true;
+    g_lastMenuVisibleForGpuTime.store(menuVisible, std::memory_order_relaxed);
 
     auto* config = Config::Instance();
-    return config->ShowFps.value_or_default() || config->GaqEnabled.value_or_default() ||
-           config->Fsr4MaxGpuMs.value_or_default() > 0.0f;
+    if (menuVisible || config->ShowFps.value_or_default())
+        return true;
+
+    if (!config->GaqEnabled.value_or_default() && config->Fsr4MaxGpuMs.value_or_default() <= 0.0f)
+        return false;
+
+    // Background GAQ and FSR4 GPU budget use smoothed EMAs, so 1-in-4 readback cadence saves GPU/CPU overhead
+    return (g_gpuSampleCadenceCounter.fetch_add(1, std::memory_order_relaxed) & 3u) == 0u;
 }
 
 void Util::SetFlagEnvVar(const wchar_t* name, bool enabled)

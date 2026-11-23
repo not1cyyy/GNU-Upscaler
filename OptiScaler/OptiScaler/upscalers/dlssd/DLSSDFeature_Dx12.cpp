@@ -19,7 +19,8 @@ bool DLSSDFeatureDx12::InitDLSSD(ID3D12GraphicsCommandList* InCommandList, NVSDK
         return false;
     }
 
-    if (!_dlssdInited)
+    const bool justInited = !_dlssdInited;
+    if (justInited)
     {
         _dlssdInited = NVNGXProxy::InitDx12(Device);
 
@@ -32,9 +33,6 @@ bool DLSSDFeatureDx12::InitDLSSD(ID3D12GraphicsCommandList* InCommandList, NVSDK
             (NVNGXProxy::D3D12_GetParameters() != nullptr || NVNGXProxy::D3D12_AllocateParameters() != nullptr) &&
             NVNGXProxy::D3D12_DestroyParameters() != nullptr && NVNGXProxy::D3D12_CreateFeature() != nullptr &&
             NVNGXProxy::D3D12_ReleaseFeature() != nullptr && NVNGXProxy::D3D12_EvaluateFeature() != nullptr;
-
-        // delay between init and create feature
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     LOG_INFO("Creating DLSSD feature");
@@ -45,13 +43,14 @@ bool DLSSDFeatureDx12::InitDLSSD(ID3D12GraphicsCommandList* InCommandList, NVSDK
 
         _p_dlssdHandle = &_dlssdHandle;
 
-        NVSDK_NGX_Result nvResult;
-        {
-            ScopedSkipHeapCapture skipHeapCapture {};
-
-            nvResult = NVNGXProxy::D3D12_CreateFeature()(InCommandList, NVSDK_NGX_Feature_RayReconstruction,
+        const auto nvResult = CreateNgxFeatureWithRetry(
+            justInited,
+            [&]()
+            {
+                ScopedSkipHeapCapture skipHeapCapture {};
+                return NVNGXProxy::D3D12_CreateFeature()(InCommandList, NVSDK_NGX_Feature_RayReconstruction,
                                                          InParameters, &_p_dlssdHandle);
-        }
+            });
 
         if (nvResult != NVSDK_NGX_Result_Success)
         {

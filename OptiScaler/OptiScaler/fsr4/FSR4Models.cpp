@@ -276,12 +276,35 @@ const char* FSR4Models::Name(FSR4Model model) { return Provider(model).name; }
 
 void FSR4Models::EvaluateGpuBudget(double upscalerGpuMs)
 {
+    static std::mutex budgetMutex;
+    static double emaGpuMs = 0.0;
+    static int overBudgetFrames = 0;
+    static int underBudgetFrames = 0;
+    static double lastChangeMs = 0.0;
+    static bool autoSteppedDown = false;
+    static std::optional<FSR4Model> baselineModel;
+    static std::optional<uint32_t> baselinePreset;
+
     const float budgetMs = Config::Instance()->Fsr4MaxGpuMs.value_or_default();
-    if (budgetMs <= 0.0f || upscalerGpuMs <= 0.0 || upscalerGpuMs >= 100.0)
+    if (budgetMs <= 0.0f)
+    {
+        std::scoped_lock lock(budgetMutex);
+        emaGpuMs = 0.0;
+        overBudgetFrames = 0;
+        underBudgetFrames = 0;
+        autoSteppedDown = false;
+        baselineModel.reset();
+        baselinePreset.reset();
+        return;
+    }
+
+    if (upscalerGpuMs <= 0.0 || upscalerGpuMs >= 100.0)
         return;
 
     std::optional<FSR4Model> activeModel;
-    std::optional<FSR4Model> lighterModel;
+    bool hasFP8 = false;
+    bool hasINT8 = false;
+    bool hasINT8Lite = false;
 
     {
         std::scoped_lock lock(hookMutex);
@@ -299,16 +322,9 @@ void FSR4Models::EvaluateGpuBudget(double upscalerGpuMs)
 
             if (activeModel.has_value())
             {
-                if (*activeModel != FSR4Model::INT8Lite && hooked.HasModel(FSR4Model::INT8Lite) &&
-                    CanGpuRun(FSR4Model::INT8Lite))
-                {
-                    lighterModel = FSR4Model::INT8Lite;
-                }
-                else if (*activeModel == FSR4Model::FP8 && hooked.HasModel(FSR4Model::INT8) &&
-                         CanGpuRun(FSR4Model::INT8))
-                {
-                    lighterModel = FSR4Model::INT8;
-                }
+                hasFP8 = hooked.HasModel(FSR4Model::FP8) && CanGpuRun(FSR4Model::FP8);
+                hasINT8 = hooked.HasModel(FSR4Model::INT8) && CanGpuRun(FSR4Model::INT8);
+                hasINT8Lite = hooked.HasModel(FSR4Model::INT8Lite) && CanGpuRun(FSR4Model::INT8Lite);
                 break;
             }
         }
@@ -317,50 +333,140 @@ void FSR4Models::EvaluateGpuBudget(double upscalerGpuMs)
     if (!activeModel.has_value())
         return;
 
-    static std::mutex budgetMutex;
-    static double emaGpuMs = 0.0;
-    static int overBudgetFrames = 0;
-    static double lastStepDownMs = 0.0;
-
     std::scoped_lock lock(budgetMutex);
+
+    std::optional<FSR4Model> lighterModel;
+    std::optional<FSR4Model> heavierModel;
+
+    if (*activeModel == FSR4Model::FP8)
+    {
+        if (hasINT8)
+            lighterModel = FSR4Model::INT8;
+        else if (hasINT8Lite)
+            lighterModel = FSR4Model::INT8Lite;
+    }
+    else if (*activeModel == FSR4Model::INT8 || *activeModel == FSR4Model::INT8_2)
+    {
+        if (hasINT8Lite)
+            lighterModel = FSR4Model::INT8Lite;
+    }
+
+    auto hasCapability = [&](FSR4Model m)
+    {
+        switch (m)
+        {
+        case FSR4Model::FP8:
+            return hasFP8;
+        case FSR4Model::INT8:
+            return hasINT8;
+        case FSR4Model::INT8Lite:
+            return hasINT8Lite;
+        default:
+            return CanGpuRun(m);
+        }
+    };
+
+    if (autoSteppedDown && baselineModel.has_value() && *activeModel != *baselineModel)
+    {
+        if (*activeModel == FSR4Model::INT8Lite)
+        {
+            if (*baselineModel == FSR4Model::FP8 && hasINT8)
+                heavierModel = FSR4Model::INT8;
+            else if (hasCapability(*baselineModel))
+                heavierModel = *baselineModel;
+        }
+        else if ((*activeModel == FSR4Model::INT8 || *activeModel == FSR4Model::INT8_2) &&
+                 *baselineModel == FSR4Model::FP8 && hasFP8)
+        {
+            heavierModel = FSR4Model::FP8;
+        }
+    }
     const double nowMs = Util::MillisecondsNow();
     emaGpuMs = emaGpuMs > 0.0 ? (0.2 * upscalerGpuMs + 0.8 * emaGpuMs) : upscalerGpuMs;
 
     if (emaGpuMs > static_cast<double>(budgetMs) * 1.05)
-        overBudgetFrames++;
-    else
-        overBudgetFrames = std::max(0, overBudgetFrames - 1);
-
-    if (overBudgetFrames < 30 || (nowMs - lastStepDownMs) < 5000.0)
-        return;
-
-    bool triggeredChange = false;
-
-    if (lighterModel.has_value())
     {
-        LOG_INFO("FSR4 Auto-Budget: EMA GPU {:.2f}ms exceeded {:.2f}ms -> stepping down model {} -> {}",
-                 emaGpuMs, budgetMs, Name(*activeModel), Name(*lighterModel));
-        Config::Instance()->Fsr4Model.set_volatile_value(*lighterModel);
-        triggeredChange = true;
+        overBudgetFrames++;
+        underBudgetFrames = std::max(0, underBudgetFrames - 2);
+    }
+    else if (emaGpuMs < static_cast<double>(budgetMs) * 0.72)
+    {
+        overBudgetFrames = std::max(0, overBudgetFrames - 1);
+        if (autoSteppedDown)
+            underBudgetFrames++;
     }
     else
     {
-        const uint32_t currentPreset =
-            Config::Instance()->Fsr4Preset.value_or(State::Instance().currentFsr4Preset.value_or(0));
-        if (currentPreset < 5)
+        overBudgetFrames = std::max(0, overBudgetFrames - 1);
+        if (emaGpuMs >= static_cast<double>(budgetMs) * 0.80)
+            underBudgetFrames = std::max(0, underBudgetFrames - 1);
+    }
+
+    auto* cfg = Config::Instance();
+    const uint32_t currentPreset = cfg->Fsr4Preset.value_or(State::Instance().currentFsr4Preset.value_or(0));
+    bool triggeredChange = false;
+
+    if (overBudgetFrames >= 30 && (lastChangeMs <= 0.0 || (nowMs - lastChangeMs) >= 5000.0))
+    {
+        if (!autoSteppedDown)
+        {
+            baselineModel = activeModel;
+            baselinePreset = currentPreset;
+            autoSteppedDown = true;
+        }
+
+        if (lighterModel.has_value())
+        {
+            LOG_INFO("FSR4 Auto-Budget: EMA GPU {:.2f}ms exceeded {:.2f}ms -> stepping down model {} -> {}",
+                     emaGpuMs, budgetMs, Name(*activeModel), Name(*lighterModel));
+            cfg->Fsr4Model.set_volatile_value(*lighterModel);
+            triggeredChange = true;
+        }
+        else if (currentPreset < 5)
         {
             const uint32_t nextPreset = std::min<uint32_t>(5, currentPreset + 1);
             LOG_INFO("FSR4 Auto-Budget: EMA GPU {:.2f}ms exceeded {:.2f}ms -> stepping down preset {} -> {}",
                      emaGpuMs, budgetMs, currentPreset, nextPreset);
-            Config::Instance()->Fsr4Preset.set_volatile_value(nextPreset);
+            cfg->Fsr4Preset.set_volatile_value(nextPreset);
             triggeredChange = true;
+        }
+    }
+    else if (autoSteppedDown && underBudgetFrames >= 120 && (lastChangeMs <= 0.0 || (nowMs - lastChangeMs) >= 10000.0))
+    {
+        const uint32_t targetPreset = baselinePreset.value_or(0);
+        if (currentPreset > targetPreset)
+        {
+            const uint32_t nextPreset = currentPreset - 1;
+            LOG_INFO("FSR4 Auto-Budget: EMA GPU {:.2f}ms well below {:.2f}ms -> stepping up preset {} -> {}",
+                     emaGpuMs, budgetMs, currentPreset, nextPreset);
+            cfg->Fsr4Preset.set_volatile_value(nextPreset);
+            triggeredChange = true;
+        }
+        else if (heavierModel.has_value())
+        {
+            LOG_INFO("FSR4 Auto-Budget: EMA GPU {:.2f}ms well below {:.2f}ms -> stepping up model {} -> {}",
+                     emaGpuMs, budgetMs, Name(*activeModel), Name(*heavierModel));
+            cfg->Fsr4Model.set_volatile_value(*heavierModel);
+            triggeredChange = true;
+
+            if (baselineModel.has_value() && *heavierModel == *baselineModel)
+            {
+                autoSteppedDown = false;
+                baselineModel.reset();
+                baselinePreset.reset();
+            }
+        }
+        else
+        {
+            autoSteppedDown = false;
+            baselineModel.reset();
+            baselinePreset.reset();
         }
     }
 
     if (triggeredChange)
     {
         auto& state = State::Instance();
-        auto* cfg = Config::Instance();
         state.newBackend = (state.api == Vulkan) ? cfg->VulkanUpscaler.value_or_default()
                          : (state.api == DX11) ? cfg->Dx11Upscaler.value_or_default()
                                                : cfg->Dx12Upscaler.value_or_default();
@@ -368,7 +474,8 @@ void FSR4Models::EvaluateGpuBudget(double upscalerGpuMs)
             entry.second = true;
 
         overBudgetFrames = 0;
+        underBudgetFrames = 0;
         emaGpuMs = 0.0;
-        lastStepDownMs = nowMs;
+        lastChangeMs = nowMs;
     }
 }

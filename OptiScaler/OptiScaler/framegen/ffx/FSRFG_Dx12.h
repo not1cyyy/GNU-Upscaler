@@ -1,6 +1,7 @@
 #pragma once
 #include "SysUtils.h"
 #include <framegen/IFGFeature_Dx12.h>
+#include <framegen/FG_DynamicController.h>
 #include <proxies/FfxApi_Proxy.h>
 #include <shaders/format_transfer/FT_Dx12.h>
 #include <shaders/hud_copy/HudCopy_Dx12.h>
@@ -29,6 +30,7 @@ class FSRFG_Dx12 : public virtual IFGFeature_Dx12
     // Dispatched in order on the same queue, one buffer is enough
     std::unique_ptr<HudCopy_Dx12> _hudCopy;
     std::unique_ptr<HCC_Dx12> _hudlessCompareCompute;
+    FG_DynamicController _dynamic;
 
     std::unique_ptr<FT_Dx12> _hudlessTransfer[BUFFER_COUNT];
     ID3D12Resource* _hudlessCopyResource[BUFFER_COUNT] {};

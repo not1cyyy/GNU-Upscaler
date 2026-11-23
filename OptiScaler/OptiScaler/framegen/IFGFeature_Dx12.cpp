@@ -102,6 +102,54 @@ UINT64 IFGFeature_Dx12::SignalSCFence()
     return value;
 }
 
+void IFGFeature_Dx12::SubmitFrameCommandLists(UINT index)
+{
+    if (index >= BUFFER_COUNT || _gameCommandQueue == nullptr)
+        return;
+
+    bool uiReady = false;
+    if (_uiCommandListResetted[index])
+    {
+        LOG_DEBUG("Closing _uiCommandList[{}]: {:X}", index, (size_t) _uiCommandList[index]);
+        const auto closeResult = _uiCommandList[index]->Close();
+        if (closeResult == S_OK)
+            uiReady = true;
+        else
+            LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", index, (UINT) closeResult);
+
+        _uiCommandListResetted[index] = false;
+    }
+
+    bool scReady = false;
+    if (_scCommandListResetted[index])
+    {
+        LOG_DEBUG("Closing _scCommandList[{}]: {:X}", index, (size_t) _scCommandList[index]);
+        const auto closeResult = _scCommandList[index]->Close();
+        if (closeResult == S_OK)
+            scReady = true;
+        else
+            LOG_ERROR("_scCommandList[{}]->Close() error: {:X}", index, (UINT) closeResult);
+
+        _scCommandListResetted[index] = false;
+    }
+
+    ID3D12CommandList* batchLists[2] {};
+    UINT batchCount = 0;
+    if (uiReady)
+        batchLists[batchCount++] = _uiCommandList[index];
+    if (scReady)
+        batchLists[batchCount++] = _scCommandList[index];
+
+    if (batchCount > 0)
+        _gameCommandQueue->ExecuteCommandLists(batchCount, batchLists);
+
+    if (uiReady && _uiFence != nullptr)
+        _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[index]);
+
+    if (scReady)
+        _scAllocatorFenceValues[index] = SignalSCFence();
+}
+
 void IFGFeature_Dx12::SubmitSCCommandList(UINT index)
 {
     if (index >= BUFFER_COUNT || !_scCommandListResetted[index])

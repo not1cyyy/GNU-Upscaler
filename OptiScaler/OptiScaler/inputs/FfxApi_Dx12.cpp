@@ -141,7 +141,7 @@ static std::optional<float> GetQualityOverrideRatioFfx(const uint32_t input)
 
     if (Config::Instance()->GaqEnabled.value_or_default())
     {
-        output = GaqController::Instance().Update(Util::MillisecondsNow());
+        output = GaqController::Instance().Update(Util::MillisecondsNow(), GaqController::MeasuredFrameTimeMs());
         return output;
     }
 

@@ -18,6 +18,7 @@ class GpuTime_Vk
 
     int _currentFrameIndex = 0;
     bool _init = false;
+    bool _recording = false;
 
     // The Vulkan w/Dx12 path records the start in the game's CB and the end in a copy-back CB.
     // A slot cannot be reused until that copy-back submit signals its timeline semaphore.

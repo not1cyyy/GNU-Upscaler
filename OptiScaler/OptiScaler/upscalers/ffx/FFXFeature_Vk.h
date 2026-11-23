@@ -4,6 +4,7 @@
 
 #include "vk/ffx_api_vk.h"
 #include <proxies/FfxApi_Proxy.h>
+#include <shaders/auto_exposure/AE_Vk.h>
 #include <shaders/velocity_convert/VC_Vk.h>
 
 class FFXFeatureVk : public FFXFeature, public IFeature_Vk
@@ -15,6 +16,8 @@ class FFXFeatureVk : public FFXFeature, public IFeature_Vk
     // Custom upscaler dll, nullptr for the regular FFX ones
     CustomFfxModule* _customUpscaler = nullptr;
 
+    std::unique_ptr<AE_Vk> _autoExposure = nullptr;
+    bool _customAutoExposure = false;
     std::unique_ptr<VelocityConvert_Vk> _velocityConvert = nullptr;
 
     // Last logged inputs of the driver provided FSR 4

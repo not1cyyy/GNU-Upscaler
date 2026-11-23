@@ -358,7 +358,21 @@ bool FSRFG_Dx12::Dispatch()
         localLastHudlessFormat = _lastHudlessFormat;
     }
 
-    fgConfig.frameGenerationEnabled = _isActive;
+    FG_DynamicController::Options dynOpt {};
+    dynOpt.enabled = config->FGDynamicFG.value_or_default() && !config->FGFollowsGame();
+    dynOpt.allow1X = true;
+    dynOpt.targetCount = 1;
+    dynOpt.currentCount = 1;
+    dynOpt.generationOff = _generationOff;
+    dynOpt.targetFps = config->FGDynamicTargetFps.value_or_default();
+    dynOpt.minBaseFps = config->FGMinBaseFps.value_or_default();
+    dynOpt.presentWaitMs = state.lastFGPresentMs;
+    dynOpt.window = Hwnd();
+
+    const auto dyn = _dynamic.Update(dynOpt);
+    _generationOff = dyn.generationOff;
+
+    fgConfig.frameGenerationEnabled = _isActive && !_generationOff;
     fgConfig.flags = 0;
 
     if (config->FGDebugView.value_or_default())
@@ -844,6 +858,9 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
         LOG_WARN("Upscaling paused! frameID: {}", params->frameID);
         params->numGeneratedFrames = 0;
     }
+
+    if (_generationOff)
+        params->numGeneratedFrames = 0;
 
     static UINT64 _lastFrameId = 0;
     if (params->frameID == _lastFrameId)
@@ -1369,7 +1386,9 @@ void FSRFG_Dx12::Activate()
         if (result == FFX_API_RETURN_OK)
         {
             _isActive = true;
+            _generationOff = false;
             _lastDispatchedFrame = 0;
+            _dynamic.Restart();
         }
 
         LOG_INFO("D3D12_Configure Enabled: true, result: {} ({})", magic_enum::enum_name((FfxApiReturnCodes) result),
@@ -1382,20 +1401,7 @@ void FSRFG_Dx12::Deactivate()
     if (_isActive)
     {
         auto fIndex = GetIndex();
-        if (_uiCommandListResetted[fIndex])
-        {
-            LOG_DEBUG("Executing _uiCommandList[fIndex][{}]: {:X}", fIndex, (size_t) _uiCommandList[fIndex]);
-            auto closeResult = _uiCommandList[fIndex]->Close();
-
-            if (closeResult == S_OK)
-                _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
-            else
-                LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
-
-            _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
-
-            _uiCommandListResetted[fIndex] = false;
-        }
+        SubmitUICommandList(fIndex);
 
         ffxReturnCode_t result = FFX_API_RETURN_ERROR;
 
@@ -1413,6 +1419,7 @@ void FSRFG_Dx12::Deactivate()
             if (result == FFX_API_RETURN_OK)
             {
                 _isActive = false;
+                _generationOff = false;
                 _waitingNewFrameData = false;
             }
         }
@@ -1420,6 +1427,7 @@ void FSRFG_Dx12::Deactivate()
         {
             LOG_DEBUG("No context to deactivate, just set  active to false");
             _isActive = false;
+            _generationOff = false;
             _waitingNewFrameData = false;
         }
 
@@ -1976,22 +1984,7 @@ bool FSRFG_Dx12::Present()
 
     // if (IsActive() && !IsPaused())
     {
-        if (_uiCommandListResetted[fIndex])
-        {
-            LOG_DEBUG("Executing _uiCommandList[{}]: {:X}", fIndex, (size_t) _uiCommandList[fIndex]);
-            auto closeResult = _uiCommandList[fIndex]->Close();
-
-            if (closeResult == S_OK)
-                _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
-            else
-                LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
-
-            _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
-
-            _uiCommandListResetted[fIndex] = false;
-        }
-
-        SubmitSCCommandList(fIndex);
+        SubmitFrameCommandLists(fIndex);
     }
 
     if ((_fgFramePresentId - _lastFGFramePresentId) > 3 && IsActive() && !_waitingNewFrameData)

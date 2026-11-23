@@ -19,7 +19,8 @@ bool DLSSDFeatureVk::InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter
 
     do
     {
-        if (!_dlssdInited)
+        const bool justInited = !_dlssdInited;
+        if (justInited)
         {
             _dlssdInited = NVNGXProxy::InitVulkan(Instance, PhysicalDevice, Device, GIPA, GDPA);
 
@@ -32,9 +33,6 @@ bool DLSSDFeatureVk::InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter
                 (NVNGXProxy::VULKAN_GetParameters() != nullptr || NVNGXProxy::VULKAN_AllocateParameters() != nullptr) &&
                 NVNGXProxy::VULKAN_DestroyParameters() != nullptr && NVNGXProxy::VULKAN_CreateFeature() != nullptr &&
                 NVNGXProxy::VULKAN_ReleaseFeature() != nullptr && NVNGXProxy::VULKAN_EvaluateFeature() != nullptr;
-
-            // delay between init and create feature
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
 
         LOG_INFO("Creating DLSSD feature");
@@ -44,8 +42,13 @@ bool DLSSDFeatureVk::InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter
             ProcessInitParams(InParameters);
 
             _p_dlssdHandle = &_dlssdHandle;
-            nvResult = NVNGXProxy::VULKAN_CreateFeature()(InCmdList, NVSDK_NGX_Feature_RayReconstruction, InParameters,
-                                                          &_p_dlssdHandle);
+            nvResult = CreateNgxFeatureWithRetry(justInited,
+                                                 [&]()
+                                                 {
+                                                     return NVNGXProxy::VULKAN_CreateFeature()(
+                                                         InCmdList, NVSDK_NGX_Feature_RayReconstruction, InParameters,
+                                                         &_p_dlssdHandle);
+                                                 });
 
             if (nvResult != NVSDK_NGX_Result_Success)
             {

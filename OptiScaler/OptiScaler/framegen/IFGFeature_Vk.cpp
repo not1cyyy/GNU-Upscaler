@@ -40,12 +40,63 @@ static VkImageAspectFlags AspectMask(VkFormat format)
     }
 }
 
+static void StageAndAccessForLayout(VkImageLayout layout, bool isSrc, VkPipelineStageFlags& outStage,
+                                    VkAccessFlags& outAccess)
+{
+    switch (layout)
+    {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+        outStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        outAccess = 0;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        outStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        outAccess = isSrc ? 0 : VK_ACCESS_TRANSFER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        outStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        outAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        outStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        outAccess = isSrc ? 0 : VK_ACCESS_SHADER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+        outStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        outAccess = isSrc ? 0 : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+        break;
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        outStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        outAccess = isSrc ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                          : (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        break;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        outStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        outAccess = isSrc ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                          : (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        break;
+    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+        outStage = isSrc ? (VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                            VK_PIPELINE_STAGE_TRANSFER_BIT)
+                         : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        outAccess = 0;
+        break;
+    case VK_IMAGE_LAYOUT_GENERAL:
+    default:
+        outStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        outAccess = isSrc ? VK_ACCESS_MEMORY_WRITE_BIT : (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        break;
+    }
+}
+
 void IFGFeature_Vk::ImageBarrier(VkCommandBuffer cmdBuffer, VkImage image, VkFormat format, VkImageLayout oldLayout,
-                                 VkImageLayout newLayout, bool firstSubresourceOnly)
+                                 VkImageLayout newLayout, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
+                                 VkAccessFlags srcAccess, VkAccessFlags dstAccess, bool firstSubresourceOnly)
 {
     VkImageMemoryBarrier barrier { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
     barrier.oldLayout = oldLayout;
     barrier.newLayout = newLayout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -54,8 +105,22 @@ void IFGFeature_Vk::ImageBarrier(VkCommandBuffer cmdBuffer, VkImage image, VkFor
     barrier.subresourceRange = { AspectMask(format), 0, firstSubresourceOnly ? 1u : VK_REMAINING_MIP_LEVELS, 0,
                                  firstSubresourceOnly ? 1u : VK_REMAINING_ARRAY_LAYERS };
 
-    vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
-                         nullptr, 0, nullptr, 1, &barrier);
+    vkCmdPipelineBarrier(cmdBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+void IFGFeature_Vk::ImageBarrier(VkCommandBuffer cmdBuffer, VkImage image, VkFormat format, VkImageLayout oldLayout,
+                                 VkImageLayout newLayout, bool firstSubresourceOnly)
+{
+    VkPipelineStageFlags srcStage = 0;
+    VkAccessFlags srcAccess = 0;
+    StageAndAccessForLayout(oldLayout, true, srcStage, srcAccess);
+
+    VkPipelineStageFlags dstStage = 0;
+    VkAccessFlags dstAccess = 0;
+    StageAndAccessForLayout(newLayout, false, dstStage, dstAccess);
+
+    ImageBarrier(cmdBuffer, image, format, oldLayout, newLayout, srcStage, dstStage, srcAccess, dstAccess,
+                 firstSubresourceOnly);
 }
 
 void IFGFeature_Vk::PrepareDevice(VkPhysicalDevice physicalDevice, VkDeviceCreateInfo& createInfo)
@@ -412,7 +477,9 @@ bool IFGFeature_Vk::FlipResource(VkCommandBuffer cmdBuffer, VkFGResource& resour
     const auto sourceLayout = resource.layout;
     ImageBarrier(cmdBuffer, resource.image, resource.format, sourceLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-    ImageBarrier(cmdBuffer, flipped.image, flipped.format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    ImageBarrier(cmdBuffer, flipped.image, flipped.format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                 VK_ACCESS_SHADER_WRITE_BIT);
 
     const bool flipResult =
         flip->Dispatch(cmdBuffer, resource.view, flipped.view, { resource.imageWidth, resource.imageHeight },
@@ -427,7 +494,8 @@ bool IFGFeature_Vk::FlipResource(VkCommandBuffer cmdBuffer, VkFGResource& resour
     }
 
     ImageBarrier(cmdBuffer, flipped.image, flipped.format, VK_IMAGE_LAYOUT_GENERAL,
-                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
     LOG_TRACE("Setting {} from flip, index: {}", magic_enum::enum_name(type), fIndex);
     resource.image = flipped.image;

@@ -699,7 +699,9 @@ void FSRFG_Vk::Activate()
     if (ConfigureEnabled(true) == FFX_API_RETURN_OK)
     {
         _isActive = true;
+        _generationOff = false;
         _lastDispatchedFrame = 0;
+        _dynamic.Restart();
     }
 }
 
@@ -711,6 +713,7 @@ void FSRFG_Vk::Deactivate()
     if (_fgContext == nullptr || ConfigureEnabled(false) == FFX_API_RETURN_OK)
     {
         _isActive = false;
+        _generationOff = false;
         _waitingNewFrameData = false;
     }
 }
@@ -831,10 +834,24 @@ VkSemaphore FSRFG_Vk::Dispatch(const VkPresentInfoKHR* pPresentInfo)
 
     const auto unblended = UnblendUi(cmdBuffer, fIndex);
 
+    FG_DynamicController::Options dynOpt {};
+    dynOpt.enabled = config->FGDynamicFG.value_or_default() && !config->FGFollowsGame();
+    dynOpt.allow1X = true;
+    dynOpt.targetCount = 1;
+    dynOpt.currentCount = 1;
+    dynOpt.generationOff = _generationOff;
+    dynOpt.targetFps = config->FGDynamicTargetFps.value_or_default();
+    dynOpt.minBaseFps = config->FGMinBaseFps.value_or_default();
+    dynOpt.presentWaitMs = state.lastFGPresentMs;
+    dynOpt.window = Util::GetProcessWindow();
+
+    const auto dyn = _dynamic.Update(dynOpt);
+    _generationOff = dyn.generationOff;
+
     ffxConfigureDescFrameGeneration fgConfig {};
     fgConfig.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
     fgConfig.swapChain = _swapchain;
-    fgConfig.frameGenerationEnabled = _isActive;
+    fgConfig.frameGenerationEnabled = _isActive && !_generationOff;
     fgConfig.allowAsyncWorkloads =
         config->FGAsync.value_or_default() && _extraQueues[AsyncComputeQueue].queue != VK_NULL_HANDLE;
     fgConfig.onlyPresentGenerated = state.fgOnlyGenerated;
@@ -969,9 +986,9 @@ VkSemaphore FSRFG_Vk::Dispatch(const VkPresentInfoKHR* pPresentInfo)
 
     vkEndCommandBuffer(cmdBuffer);
 
-    // The game's copies can be on another queue, its present semaphores order them before the prepare.
-    // FFX dispatches the interpolation on the game queue too, which keeps it after the prepare.
-    std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    // Wait only at the compute/transfer stages where prepare/copy passes consume upstream images.
+    std::vector<VkPipelineStageFlags> waitStages(
+        pPresentInfo->waitSemaphoreCount, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
 
     VkSubmitInfo submitInfo { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
@@ -1024,6 +1041,9 @@ ffxReturnCode_t FSRFG_Vk::DispatchCallback(ffxDispatchDescFrameGeneration* param
         LOG_WARN("Cancel dispatch, frameID: {}", params->frameID);
         params->numGeneratedFrames = 0;
     }
+
+    if (_generationOff)
+        params->numGeneratedFrames = 0;
 
     DispatchHudShaders(params);
 

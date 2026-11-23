@@ -5,23 +5,13 @@
 
 inline HRESULT AntiLag2::al2_sleep()
 {
-    int max_fps = 0;
+    bool needsFractionalSleep = false;
+    const int max_fps = FractionalFpsPacer::ComputeDriverCeilingFps(minimum_interval_us, needsFractionalSleep);
 
-    // TODO: test more, config for this?
-
-    // if (effective_fg_state && minimum_interval_us != 0) {
-    //     static uint64_t previous_frame_time = 0;
-    //     uint64_t current_time = Util::GetTimestamp();
-    //     uint64_t frame_time = current_time - previous_frame_time;
-    //     if (frame_time < 1000 * minimum_interval_us) {
-    //         if (auto res = eepy(minimum_interval_us * 1000 - frame_time); res)
-    //             LOG_ERROR("Sleep command failed: {}", res);
-    //     }
-    //     previous_frame_time = Util::GetTimestamp();
-    // } else {
-    //     max_fps = minimum_interval_us > 0 ? (int) std::round(1000000.0f / minimum_interval_us) : 0;
-    // }
-    max_fps = minimum_interval_us > 0 ? (int) std::round(1000000.0f / minimum_interval_us) : 0;
+    if (needsFractionalSleep)
+        fractional_pacer.Pace(minimum_interval_us);
+    else
+        fractional_pacer.Reset();
 
     HRESULT result = {};
 

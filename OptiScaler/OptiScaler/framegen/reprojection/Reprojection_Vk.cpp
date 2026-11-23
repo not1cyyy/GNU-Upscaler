@@ -250,7 +250,8 @@ VkSemaphore Reprojection_Vk::ReprojectPresent(VkQueue queue, const VkPresentInfo
 
     vkEndCommandBuffer(cmdBuffer);
 
-    std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    std::vector<VkPipelineStageFlags> waitStages(
+        pPresentInfo->waitSemaphoreCount, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
 
     VkSubmitInfo submitInfo { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;

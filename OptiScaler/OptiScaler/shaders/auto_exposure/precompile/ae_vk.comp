@@ -1,0 +1,120 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std140, set = 0, binding = 0) uniform Params
+{
+    uint RenderWidth;
+    uint RenderHeight;
+    uint GroupCountX;
+    uint GroupCount;
+    float DeltaTime;
+    uint Reset;
+    uint PassIndex;
+    float PreExposure;
+};
+
+layout(set = 0, binding = 1) uniform texture2D Color;
+// [0] smoothed log luma carried between frames, [1..] per group log luma sums
+layout(std430, set = 0, binding = 2) buffer DataBuffer
+{
+    float Data[];
+};
+layout(set = 0, binding = 3, r32f) uniform writeonly image2D Exposure;
+
+const uint THREADS = 256u;
+const uint TILE = 32u;
+const float Epsilon = 6.10e-05;
+const float Fp16Max = 65504.0;
+
+shared float Shared[THREADS];
+
+float LogLuma(uvec2 pos)
+{
+    // Exposure is applied after FSR removes pre-exposure, so it has to be measured without it too
+    vec3 rgb = max(vec3(0.0), texelFetch(Color, ivec2(pos), 0).rgb) / PreExposure;
+    float luma = min(dot(rgb, vec3(0.2126, 0.7152, 0.0722)), Fp16Max);
+    return log(max(Epsilon, luma));
+}
+
+float GroupSum(float value, uint tid)
+{
+    Shared[tid] = value;
+    memoryBarrierShared();
+    barrier();
+
+    for (uint stride = THREADS >> 1; stride > 0u; stride >>= 1)
+    {
+        if (tid < stride)
+            Shared[tid] += Shared[tid + stride];
+
+        memoryBarrierShared();
+        barrier();
+    }
+
+    return Shared[0];
+}
+
+float ComputeAutoExposureFromLavg(float Lavg)
+{
+    Lavg = exp(Lavg);
+
+    const float S = 100.0;
+    const float K = 12.5;
+    float ExposureISO100 = log2((Lavg * S) / K);
+
+    const float q = 0.65;
+    float Lmax = (78.0 / (q * S)) * pow(2.0, ExposureISO100);
+
+    return 1.0 / Lmax;
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationIndex;
+
+    if (PassIndex == 0u)
+    {
+        float sum = 0.0;
+        uvec2 renderSize = uvec2(RenderWidth, RenderHeight);
+
+        for (uint y = 0u; y < TILE; y += 16u)
+        {
+            for (uint x = 0u; x < TILE; x += 16u)
+            {
+                uvec2 pos = gl_WorkGroupID.xy * TILE + gl_LocalInvocationID.xy + uvec2(x, y);
+                if (all(lessThan(pos, renderSize)))
+                    sum += LogLuma(pos);
+            }
+        }
+
+        float total = GroupSum(sum, tid);
+
+        if (tid == 0u)
+            Data[1u + gl_WorkGroupID.y * GroupCountX + gl_WorkGroupID.x] = total;
+    }
+    else
+    {
+        float sum = 0.0;
+
+        for (uint i = tid; i < GroupCount; i += THREADS)
+            sum += Data[1u + i];
+
+        float total = GroupSum(sum, tid);
+
+        if (tid == 0u)
+        {
+            float logLuma = total / (float(RenderWidth) * float(RenderHeight));
+
+            if (Reset == 0u)
+            {
+                float prevLogLuma = Data[0];
+                logLuma = prevLogLuma + (logLuma - prevLogLuma) * (1.0 - exp(-DeltaTime));
+            }
+
+            Data[0] = logLuma;
+            imageStore(Exposure, ivec2(0, 0), vec4(ComputeAutoExposureFromLavg(logLuma), 0.0, 0.0, 0.0));
+        }
+    }
+}

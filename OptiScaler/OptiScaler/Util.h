@@ -73,6 +73,7 @@ uint64_t NsToQpc(uint64_t ns);
 uint64_t GetTimestamp();
 uint64_t GetTimestampAndQpc(int64_t& outQpcTicks);
 bool ShouldSampleUpscalerGpuTime(bool menuVisible);
+bool ShouldRecordUpscalerGpuTime();
 
 void SetFlagEnvVar(const wchar_t* name, bool enabled);
 std::mutex& DetourTransactionMutex();

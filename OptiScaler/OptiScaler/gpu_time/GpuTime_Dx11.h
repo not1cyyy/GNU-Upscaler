@@ -16,6 +16,7 @@ class GpuTime_Dx11
 
     int _currentFrameIndex = 0;
     bool _init = false;
+    bool _recording = false;
 
   public:
     GpuTime_Dx11(ID3D11Device* device);

@@ -119,6 +119,9 @@ class IFGFeature_Vk : public virtual IFGFeature
 
   public:
     static void ImageBarrier(VkCommandBuffer cmdBuffer, VkImage image, VkFormat format, VkImageLayout oldLayout,
+                             VkImageLayout newLayout, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
+                             VkAccessFlags srcAccess, VkAccessFlags dstAccess, bool firstSubresourceOnly = false);
+    static void ImageBarrier(VkCommandBuffer cmdBuffer, VkImage image, VkFormat format, VkImageLayout oldLayout,
                              VkImageLayout newLayout, bool firstSubresourceOnly = false);
 
     static VkFormat WithoutSrgb(VkFormat format);

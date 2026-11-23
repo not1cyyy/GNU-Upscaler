@@ -661,6 +661,9 @@ class Config
     CustomOptional<bool> FGModifySCIndex { false };
     CustomOptional<float> FGHudCutoff { 0.0f };
     CustomOptional<FrameTimeSource> FTInput { FrameTimeSource::Input };
+    CustomOptional<bool> FGDynamicFG { false };         // Shared Dynamic FG (FSR-FG / DLSSG 2X <-> 1X)
+    CustomOptional<float> FGDynamicTargetFps { 0.0f }; // 0 = FramerateLimit or just under display refresh
+    CustomOptional<float> FGMinBaseFps { 45.0f };      // Shared Base FPS latency floor (<= 0 disables)
     CustomOptional<bool> FGReprojectionEnabled { false }; // WIP Not saved or loaded
 
     // OptiFG
@@ -690,6 +693,7 @@ class Config
     CustomOptional<bool> FGHudfixPersistentBindings { true };
     CustomOptional<bool, SoftDefault> FGZeroCopyHudless { false };
     CustomOptional<bool, SoftDefault> FGHudCopyTileSkip { true };
+    CustomOptional<bool> FGDebugAsyncHudCopy { false };
     CustomOptional<bool> FGDontUseSwapchainBuffers { false };
     CustomOptional<bool> FGRelaxedResolutionCheck { false };
     CustomOptional<bool> FGHudfixDisableRTV { false };
@@ -705,7 +709,7 @@ class Config
     // OptiFG - Resource Tracking
     CustomOptional<bool> FGAlwaysTrackHeaps { false };
     CustomOptional<bool> FGResourceBlocking { false };
-    CustomOptional<bool> FGUseShards { false };
+    CustomOptional<bool> FGUseShards { true };
 
     // OptiFG - DLSS-D Depth scale
     CustomOptional<bool> FGEnableDepthScale { false };
@@ -746,7 +750,7 @@ class Config
     CustomOptional<bool, SoftDefault> FGXeFGForceBorderless { false };
     CustomOptional<int> FGXeFGMaxInterpolatedFrames { 5 };
     CustomOptional<bool> FGXeFGPaceOnSwapchain { true };
-    CustomOptional<int> FGXeFGMaxWaitMs { 0 };
+    CustomOptional<int> FGXeFGMaxWaitMs { 2 };
     CustomOptional<bool> FGXeFGAllowDilatedMV { false };
     CustomOptional<float> FGXeFGMinBaseFps { 45.0f };
 

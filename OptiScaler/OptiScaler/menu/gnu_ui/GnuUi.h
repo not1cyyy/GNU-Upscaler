@@ -55,6 +55,17 @@ void Help(const char* body, std::initializer_list<const char*> footnotes = {}, c
 void HelpForLastItem(const char* body, std::initializer_list<const char*> footnotes = {}, const char* ini = nullptr);
 bool LastItemHelpHovered();
 
+// Evaluates buildAdvice only when the preceding item is hovered to keep non-hovered UI zero-overhead.
+template <typename AdviceFn>
+void HelpWithLiveAdvice(const char* body, AdviceFn&& buildAdvice, const char* ini = nullptr)
+{
+    if (!LastItemHelpHovered())
+        return;
+
+    const std::string advice = buildAdvice();
+    Help(body, { advice.c_str() }, ini);
+}
+
 // Reset button placed inline after a slider to revert to defaults.
 bool ResetAfterSlider(const char* label, bool show = true);
 

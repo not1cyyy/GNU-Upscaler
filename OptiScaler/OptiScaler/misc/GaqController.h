@@ -18,61 +18,128 @@ class GaqController
         return instance;
     }
 
-    // Publishes the PID ratio in 0.05 steps with a minimum dwell between changes, so the upscaler is not
-    // asked to switch render resolution (and rebind/reallocate targets) every few frames.
-    float Update(double nowMs)
+    static double MeasuredFrameTimeMs()
     {
-        const float raw = UpdateRaw(nowMs);
+        const auto& state = State::Instance();
+        auto* fg = state.CurrentFG();
+        const bool fgActive = fg != nullptr && fg->IsActive() && !fg->IsPaused();
 
+        if (fgActive && state.lastFGFrameTime > 0.0)
+            return state.lastFGFrameTime;
+        if (state.presentFrameTime > 0.0)
+            return state.presentFrameTime;
+        if (state.lastFGFrameTime > 0.0)
+            return state.lastFGFrameTime;
+
+        return 0.0;
+    }
+
+    // Publishes the steady-state PID ratio in 0.05 steps gated by dwellMs = 500.0 while allowing transient
+    // GaqMotionBoost offsets to react rapidly to fast camera turns without being frozen by PID dwell.
+    float Update(double nowMs, double measuredFrameMs = 0.0)
+    {
         std::lock_guard<std::mutex> lock(_mutex);
 
-        if (!Config::Instance()->GaqEnabled.value_or_default())
+        auto* config = Config::Instance();
+        const float minRatio = std::clamp(config->GaqMinRatio.value_or_default(), 1.0f, 3.0f);
+        const float maxRatio = std::clamp(config->GaqMaxRatio.value_or_default(), minRatio, 4.0f);
+
+        UpdateRawLocked(nowMs, measuredFrameMs, minRatio, maxRatio);
+
+        if (!config->GaqEnabled.value_or_default())
         {
+            _publishedBaseRatio = 0.0f;
+            _lastPublishedBase = 0.0f;
             _publishedRatio = 0.0f;
-            return raw;
+            _lastPublishMs = 0.0;
+            _lastMotionPublishMs = 0.0;
+            return _currentRatio;
         }
 
         constexpr float step = 0.05f;
         constexpr double dwellMs = 500.0;
-        const float snapped = std::round(raw / step) * step;
+        constexpr double motionCooldownMs = 45.0;
+
+        const float baseSnapped = std::clamp(std::round(_currentRatio / step) * step, minRatio, maxRatio);
+        if (_publishedBaseRatio <= 0.0f)
+        {
+            _publishedBaseRatio = baseSnapped;
+            _lastPublishMs = nowMs;
+        }
+        else if (std::abs(_currentRatio - _publishedBaseRatio) >= step * 1.5f && (nowMs - _lastPublishMs) >= dwellMs)
+        {
+            _publishedBaseRatio = baseSnapped;
+            _lastPublishMs = nowMs;
+        }
+
+        const float targetWithMotion = std::clamp(_publishedBaseRatio + _motionBoostOffset, minRatio, maxRatio);
+        const float motionSnapped = std::clamp(std::round(targetWithMotion / step) * step, minRatio, maxRatio);
 
         if (_publishedRatio <= 0.0f)
         {
-            _publishedRatio = snapped;
-            _lastPublishMs = nowMs;
+            _publishedRatio = motionSnapped;
+            _lastPublishedBase = _publishedBaseRatio;
+            _lastMotionPublishMs = nowMs;
         }
-        else if (std::abs(raw - _publishedRatio) >= step * 1.5f && (nowMs - _lastPublishMs) >= dwellMs)
+        else if (motionSnapped != _publishedRatio)
         {
-            _publishedRatio = snapped;
-            _lastPublishMs = nowMs;
+            const bool baseChanged = (_publishedBaseRatio != _lastPublishedBase);
+            const float delta = std::abs(targetWithMotion - _publishedRatio);
+            if (baseChanged || delta >= step * 1.2f ||
+                (motionSnapped > _publishedRatio && (nowMs - _lastMotionPublishMs) >= motionCooldownMs) ||
+                (motionSnapped < _publishedRatio && (nowMs - _lastMotionPublishMs) >= motionCooldownMs * 2.0))
+            {
+                _publishedRatio = motionSnapped;
+                _lastPublishedBase = _publishedBaseRatio;
+                _lastMotionPublishMs = nowMs;
+            }
         }
 
         return _publishedRatio;
     }
 
-    float UpdateRaw(double nowMs)
+    float UpdateRaw(double nowMs, double measuredFrameMs = 0.0)
     {
         std::lock_guard<std::mutex> lock(_mutex);
-
-        auto config = Config::Instance();
-        auto& state = State::Instance();
-
+        auto* config = Config::Instance();
         const float minRatio = std::clamp(config->GaqMinRatio.value_or_default(), 1.0f, 3.0f);
         const float maxRatio = std::clamp(config->GaqMaxRatio.value_or_default(), minRatio, 4.0f);
+        UpdateRawLocked(nowMs, measuredFrameMs, minRatio, maxRatio);
+        return std::clamp(_currentRatio + _motionBoostOffset, minRatio, maxRatio);
+    }
+
+    float CurrentRatio() const
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto* config = Config::Instance();
+        const float minRatio = std::clamp(config->GaqMinRatio.value_or_default(), 1.0f, 3.0f);
+        const float maxRatio = std::clamp(config->GaqMaxRatio.value_or_default(), minRatio, 4.0f);
+        if (_publishedRatio > 0.0f && config->GaqEnabled.value_or_default())
+            return std::clamp(_publishedRatio, minRatio, maxRatio);
+        return std::clamp(_currentRatio + _motionBoostOffset, minRatio, maxRatio);
+    }
+
+  private:
+    void UpdateRawLocked(double nowMs, double measuredFrameMs, float minRatio, float maxRatio)
+    {
+        auto* config = Config::Instance();
+        auto& state = State::Instance();
 
         if (!config->GaqEnabled.value_or_default())
         {
             _currentRatio = minRatio;
             _integral = 0.0f;
             _lastError = 0.0f;
+            _motionBoostOffset = 0.0f;
             _lastTimeMs = 0.0;
             _emaActiveMs = 0.0;
             _emaUpscalerMs = 0.0;
             _slowMs = 0.0;
             _probeBaseRatio = 0.0f;
             _cpuBound = false;
+            _reprobePending = false;
             state.gaqCpuBound = false;
-            return _currentRatio;
+            return;
         }
 
         _currentRatio = std::clamp(_currentRatio, minRatio, maxRatio);
@@ -80,32 +147,35 @@ class GaqController
         const float targetFps = std::clamp(config->GaqTargetFps.value_or_default(), 20.0f, 360.0f);
         float targetFrameTime = 1000.0f / targetFps;
 
-        const bool fgActive = state.currentFG != nullptr && state.currentFG->IsActive() && !state.currentFG->IsPaused();
+        auto* fg = state.CurrentFG();
+        const bool fgActive = fg != nullptr && fg->IsActive() && !fg->IsPaused();
         const bool dmfgActive = fgActive && config->FGXeFGDynamicMFG.value_or_default();
 
-        const double rawFrameTime = fgActive && state.lastFGFrameTime > 0.0
-                                        ? state.lastFGFrameTime
-                                        : (state.presentFrameTime > 0.0 ? state.presentFrameTime : state.lastFGFrameTime);
+        const double fallbackFrameTime =
+            fgActive && state.lastFGFrameTime > 0.0
+                ? state.lastFGFrameTime
+                : (state.presentFrameTime > 0.0 ? state.presentFrameTime : state.lastFGFrameTime);
+        const double rawFrameTime = measuredFrameMs > 0.0 ? measuredFrameMs : fallbackFrameTime;
         const double frameTimeMs = rawFrameTime > 0.0 ? rawFrameTime : 16.6;
 
         // Discard extreme outlier frames (loading screens, pause transitions > 250ms) and rebase timer
         if (frameTimeMs <= 0.0 || frameTimeMs > 250.0)
         {
             _lastTimeMs = nowMs;
-            return _currentRatio;
+            return;
         }
 
         if (_lastTimeMs <= 0.0 || (nowMs - _lastTimeMs) > 500.0)
         {
             _lastTimeMs = nowMs;
-            return _currentRatio;
+            return;
         }
 
         const float dt = static_cast<float>((nowMs - _lastTimeMs) / 1000.0);
 
         // Rate-limit PID step so multiple queries within the same frame reuse the current ratio
         if (dt < 0.004f)
-            return _currentRatio;
+            return;
 
         _lastTimeMs = nowMs;
 
@@ -150,8 +220,8 @@ class GaqController
 
         // CPU-bound detection: lowering render resolution should cut frame time roughly in proportion to the
         // pixel count (1/ratio^2). If the ratio went up and frame time barely moved, the game is CPU-bound and
-        // lower resolution only costs image quality, so GAQ returns to the minimum ratio and re-probes later.
-        _slowMs = _slowMs > 0.0 ? (0.05 * activeFrameMs + 0.95 * _slowMs) : activeFrameMs;
+        // lower resolution only costs image quality, so GAQ returns to the minimum ratio and re-probes mildly.
+        _slowMs = _slowMs > 0.0 ? (0.15 * activeFrameMs + 0.85 * _slowMs) : activeFrameMs;
         _probeAgeSec += dt;
 
         if (_cpuBound)
@@ -160,7 +230,10 @@ class GaqController
             if (_cpuBoundAgeSec > 20.0f)
             {
                 _cpuBound = false;
-                _probeBaseRatio = 0.0f;
+                _reprobePending = true;
+                _probeBaseRatio = _currentRatio;
+                _probeBaseMs = _slowMs;
+                _probeAgeSec = 0.0f;
             }
             else
             {
@@ -169,7 +242,7 @@ class GaqController
                 _lastError = 0.0f;
                 _motionBoostOffset = 0.0f;
                 state.gaqCpuBound = true;
-                return _currentRatio;
+                return;
             }
         }
         state.gaqCpuBound = false;
@@ -192,6 +265,10 @@ class GaqController
                 _cpuBound = true;
                 _cpuBoundAgeSec = 0.0f;
             }
+            else
+            {
+                _reprobePending = false;
+            }
 
             _probeBaseRatio = r1;
             _probeBaseMs = _slowMs;
@@ -212,6 +289,9 @@ class GaqController
         constexpr float Ki = 0.004f;
         constexpr float Kd = 0.002f;
 
+        // During post-CPU-bound reprobe, cap excursion mildly (+0.20x above minRatio) until GPU scaling is proven
+        const float effectiveMaxRatio = _reprobePending ? std::min(maxRatio, minRatio + 0.20f) : maxRatio;
+
         // Deadband of 0.3ms to prevent oscillation around target (bypassed if ADFG hit latency floor)
         if (std::abs(error) > 0.3f || (state.adfgClamped && error > 0.0f))
         {
@@ -220,13 +300,14 @@ class GaqController
             _lastError = error;
 
             const float deltaRatio = gainScale * (Kp * error + Ki * _integral + Kd * derivative);
-            _currentRatio = std::clamp(_currentRatio + deltaRatio, minRatio, maxRatio);
+            _currentRatio = std::clamp(_currentRatio + deltaRatio, minRatio, effectiveMaxRatio);
         }
         else
         {
             // Within deadband: decay integral slowly
             _integral *= 0.95f;
             _lastError = 0.0f;
+            _currentRatio = std::clamp(_currentRatio, minRatio, effectiveMaxRatio);
         }
 
         // Motion-Adaptive GAQ Boost: proactively raise upscale ratio during fast camera turns/swipes
@@ -252,27 +333,8 @@ class GaqController
         {
             _motionBoostOffset = 0.0f;
         }
-
-        return std::clamp(_currentRatio + _motionBoostOffset, minRatio, maxRatio);
     }
 
-    float Update(double nowMs, double frameTimeMs)
-    {
-        return Update(nowMs);
-    }
-
-    float CurrentRatio() const
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        auto* config = Config::Instance();
-        const float minRatio = std::clamp(config->GaqMinRatio.value_or_default(), 1.0f, 3.0f);
-        const float maxRatio = std::clamp(config->GaqMaxRatio.value_or_default(), minRatio, 4.0f);
-        if (_publishedRatio > 0.0f && config->GaqEnabled.value_or_default())
-            return std::clamp(_publishedRatio, minRatio, maxRatio);
-        return std::clamp(_currentRatio + _motionBoostOffset, minRatio, maxRatio);
-    }
-
-  private:
     mutable std::mutex _mutex;
     float _currentRatio = 1.3f;
     float _integral = 0.0f;
@@ -283,11 +345,15 @@ class GaqController
     double _emaActiveMs = 0.0;
     double _emaUpscalerMs = 0.0;
     double _slowMs = 0.0;
+    float _publishedBaseRatio = 0.0f;
+    float _lastPublishedBase = 0.0f;
     float _publishedRatio = 0.0f;
     double _lastPublishMs = 0.0;
+    double _lastMotionPublishMs = 0.0;
     double _probeBaseMs = 0.0;
     float _probeBaseRatio = 0.0f;
     float _probeAgeSec = 0.0f;
     float _cpuBoundAgeSec = 0.0f;
     bool _cpuBound = false;
+    bool _reprobePending = false;
 };

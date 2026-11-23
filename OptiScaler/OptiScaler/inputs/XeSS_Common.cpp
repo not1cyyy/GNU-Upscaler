@@ -14,7 +14,7 @@ static std::optional<float> GetQualityOverrideRatio(const xess_quality_settings_
 
     if (Config::Instance()->GaqEnabled.value_or_default())
     {
-        output = GaqController::Instance().Update(Util::MillisecondsNow());
+        output = GaqController::Instance().Update(Util::MillisecondsNow(), GaqController::MeasuredFrameTimeMs());
         return output;
     }
 

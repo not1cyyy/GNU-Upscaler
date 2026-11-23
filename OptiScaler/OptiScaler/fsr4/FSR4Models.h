@@ -24,6 +24,6 @@ class FSR4Models
 
     static const char* Name(FSR4Model model);
 
-    // Monitors FSR 4 GPU pass duration and steps down model/preset when exceeding Fsr4MaxGpuMs
+    // Monitors FSR 4 GPU pass duration and steps down/up model and preset around Fsr4MaxGpuMs
     static void EvaluateGpuBudget(double upscalerGpuMs);
 };

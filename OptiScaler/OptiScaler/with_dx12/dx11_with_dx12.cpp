@@ -269,18 +269,17 @@ bool Dx11WithDx12::SyncDx12ToDx11()
 
     if (UseCpuWaitForDx12())
     {
-        // Upscaler work is short, polling avoids the event wake up latency under Wine
-        const auto spinStart = Util::MillisecondsNow();
-        while (Util::MillisecondsNow() - spinStart < 2.0)
+        if (Dx12FenceTextureCopy->GetCompletedValue() >= fenceValue)
+            return true;
+
+        // Brief micro-yield avoids kernel event latency on instant hits without burning full milliseconds of CPU spin.
+        for (int spin = 0; spin < 64; ++spin)
         {
             if (Dx12FenceTextureCopy->GetCompletedValue() >= fenceValue)
                 return true;
 
             YieldProcessor();
         }
-
-        if (Dx12FenceTextureCopy->GetCompletedValue() >= fenceValue)
-            return true;
 
         if (Dx12TextureCopyEvent == NULL)
             Dx12TextureCopyEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);

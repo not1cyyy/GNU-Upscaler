@@ -1,6 +1,7 @@
 #pragma once
 #include "IFeature.h"
 
+#include <d3d11_1.h>
 #include <menu/menu_dx11.h>
 #include <shaders/rcas/RCAS_Dx11.h>
 #include <shaders/output_scaling/OS_Dx11.h>
@@ -11,6 +12,28 @@
 class IFeature_Dx11 : public virtual IFeature
 {
   protected:
+    // Captures and restores D3D11 compute + OM state via bulk slot calls instead of per-slot COM loops.
+    struct ScopedComputeState
+    {
+        ID3D11DeviceContext* Context = nullptr;
+        UINT UavCount = D3D11_PS_CS_UAV_REGISTER_COUNT;
+        ID3D11ShaderResourceView* SRVs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+        ID3D11SamplerState* Samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+        ID3D11Buffer* CBs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+        ID3D11UnorderedAccessView* UAVs[D3D11_1_UAV_SLOT_COUNT] = {};
+        ID3D11RenderTargetView* RTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+        ID3D11DepthStencilView* DSV = nullptr;
+        bool Restored = false;
+
+        ScopedComputeState(ID3D11Device* device, ID3D11DeviceContext* context);
+        ~ScopedComputeState();
+
+        ScopedComputeState(const ScopedComputeState&) = delete;
+        ScopedComputeState& operator=(const ScopedComputeState&) = delete;
+
+        void Restore();
+    };
+
     ID3D11Device* Device = nullptr;
     ID3D11DeviceContext* DeviceContext = nullptr;
     inline static std::unique_ptr<Menu_Dx11> Imgui = nullptr;

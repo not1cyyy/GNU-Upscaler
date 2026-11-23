@@ -1447,7 +1447,10 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     }
 
     if (willPresent)
+    {
         FrameLimit::markDxgiPresent();
+        FrameLimit::markCpuWorkEnd();
+    }
 
     const bool fgLimitActive = fg != nullptr && fg->IsActive() && !fg->IsPaused();
     const bool shouldLimit =
@@ -1555,6 +1558,13 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     void* xefgContext = nullptr;
     uint64_t xefgFrameId = 0;
 
+    if (willPresent && fgFeatureActive &&
+        (state.activeFgOutput == FGOutput::XeFG || state.activeFgOutput == FGOutput::FSRFG ||
+         state.activeFgOutput == FGOutput::DLSSG))
+    {
+        FrameLimit::onFgGamePresentStart();
+    }
+
     if (auto fg = state.currentFG; willPresent && fg != nullptr &&
                                    (state.activeFgOutput == FGOutput::FSRFG || state.activeFgOutput == FGOutput::XeFG))
     {
@@ -1564,9 +1574,6 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
 
         if (state.activeFgOutput == FGOutput::XeFG)
         {
-            if (fgFeatureActive)
-                FrameLimit::onFgGamePresentStart();
-
             xefgContext = fg->SwapchainContext();
             xefgFrameId = InputCommon::xefg_marked_frame_id();
         }

@@ -9,6 +9,10 @@ class AntiLagVk : public LowLatencyTech
   private:
     VkDevice device = VK_NULL_HANDLE;
     uint32_t max_fps = 0;
+    uint32_t minimum_interval_us = 0;
+    bool needs_fractional_sleep = false;
+    FractionalFpsPacer fractional_pacer {};
+    std::optional<uint64_t> last_paced_frame_id;
 
     // The input stage goes on simulation start markers with frame ids, without them on the sleep calls
     uint32_t sleeps_since_id_marker = UINT32_MAX / 2;

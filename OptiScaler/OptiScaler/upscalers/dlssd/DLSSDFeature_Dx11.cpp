@@ -18,7 +18,8 @@ bool DLSSDFeatureDx11::InitInternal(ID3D11DeviceContext* InContext, NVSDK_NGX_Pa
 
     do
     {
-        if (!_dlssdInited)
+        const bool justInited = !_dlssdInited;
+        if (justInited)
         {
             _dlssdInited = NVNGXProxy::InitDx11(Device);
 
@@ -31,9 +32,6 @@ bool DLSSDFeatureDx11::InitInternal(ID3D11DeviceContext* InContext, NVSDK_NGX_Pa
                 (NVNGXProxy::D3D11_GetParameters() != nullptr || NVNGXProxy::D3D11_AllocateParameters() != nullptr) &&
                 NVNGXProxy::D3D11_DestroyParameters() != nullptr && NVNGXProxy::D3D11_CreateFeature() != nullptr &&
                 NVNGXProxy::D3D11_ReleaseFeature() != nullptr && NVNGXProxy::D3D11_EvaluateFeature() != nullptr;
-
-            // delay between init and create feature
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
 
         LOG_INFO("Creating DLSSD feature");
@@ -43,8 +41,13 @@ bool DLSSDFeatureDx11::InitInternal(ID3D11DeviceContext* InContext, NVSDK_NGX_Pa
             ProcessInitParams(InParameters);
 
             _p_dlssdHandle = &_dlssdHandle;
-            nvResult = NVNGXProxy::D3D11_CreateFeature()(InContext, NVSDK_NGX_Feature_RayReconstruction, InParameters,
+            nvResult = CreateNgxFeatureWithRetry(justInited,
+                                                 [&]()
+                                                 {
+                                                     return NVNGXProxy::D3D11_CreateFeature()(
+                                                         InContext, NVSDK_NGX_Feature_RayReconstruction, InParameters,
                                                          &_p_dlssdHandle);
+                                                 });
 
             if (nvResult != NVSDK_NGX_Result_Success)
             {

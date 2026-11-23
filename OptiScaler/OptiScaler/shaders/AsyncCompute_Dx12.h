@@ -30,13 +30,19 @@ class AsyncCompute_Dx12
         return (state & graphicsOnlyStates) == 0;
     }
 
-    // Executes recordCompute(ID3D12GraphicsCommandList*) on the async compute queue,
-    // bracketed by directQueue->Signal -> computeQueue->Wait and computeQueue->Signal -> directQueue->Wait.
+    // Records and submits compute work on _computeQueue ordered after prior directQueue work,
+    // returning the compute fence value without blocking directQueue yet so callers can overlap work.
     template <typename RecordFn>
-    bool Dispatch(ID3D12CommandQueue* directQueue, RecordFn&& recordCompute)
+    bool BeginDispatch(ID3D12CommandQueue* directQueue, RecordFn&& recordCompute, UINT64& outDoneVal,
+                       bool forceEnable = false)
     {
-        if (!_init || directQueue == nullptr || !Config::Instance()->Dx12AsyncCompute.value_or_default())
+        outDoneVal = 0;
+
+        if (!_init || directQueue == nullptr ||
+            (!forceEnable && !Config::Instance()->Dx12AsyncCompute.value_or_default()))
+        {
             return false;
+        }
 
         const UINT nextSlot = (_slot + 1) % SlotCount;
 
@@ -75,12 +81,30 @@ class AsyncCompute_Dx12
         if (FAILED(_computeQueue->Signal(_fence, doneVal)))
             return false;
 
-        if (FAILED(directQueue->Wait(_fence, doneVal)))
-            return false;
-
         _slotFenceValues[nextSlot] = doneVal;
         _slot = nextSlot;
+        outDoneVal = doneVal;
         return true;
+    }
+
+    bool WaitOnDirectQueue(ID3D12CommandQueue* directQueue, UINT64 doneVal)
+    {
+        if (!_init || directQueue == nullptr || doneVal == 0)
+            return false;
+
+        return SUCCEEDED(directQueue->Wait(_fence, doneVal));
+    }
+
+    // Executes recordCompute(ID3D12GraphicsCommandList*) on the async compute queue,
+    // bracketed by directQueue->Signal -> computeQueue->Wait and computeQueue->Signal -> directQueue->Wait.
+    template <typename RecordFn>
+    bool Dispatch(ID3D12CommandQueue* directQueue, RecordFn&& recordCompute, bool forceEnable = false)
+    {
+        UINT64 doneVal = 0;
+        if (!BeginDispatch(directQueue, std::forward<RecordFn>(recordCompute), doneVal, forceEnable))
+            return false;
+
+        return WaitOnDirectQueue(directQueue, doneVal);
     }
 
     void Release()

@@ -157,7 +157,7 @@ static std::optional<float> GetQualityOverrideRatioFfx(const Fsr3::FfxFsr3Upscal
 
     if (Config::Instance()->GaqEnabled.value_or_default())
     {
-        output = GaqController::Instance().Update(Util::MillisecondsNow());
+        output = GaqController::Instance().Update(Util::MillisecondsNow(), GaqController::MeasuredFrameTimeMs());
         return output;
     }
 

@@ -16,6 +16,7 @@
 #include <nvsdk_ngx_vk.h>
 #include <nvsdk_ngx_helpers_vk.h>
 #include <misc/DeferredRelease.h>
+#include <misc/GaqController.h>
 
 static std::unordered_map<ffxContext, ffxCreateContextDescUpscale> _initParams;
 static std::unordered_map<ffxContext, NVSDK_NGX_Parameter*> _nvParams;
@@ -301,6 +302,12 @@ static bool CreateDLSSContext(ffxContext handle, const ffxDispatchDescUpscale* p
 static std::optional<float> GetQualityOverrideRatioFfx(const uint32_t input)
 {
     std::optional<float> output;
+
+    if (Config::Instance()->GaqEnabled.value_or_default())
+    {
+        output = GaqController::Instance().Update(Util::MillisecondsNow(), GaqController::MeasuredFrameTimeMs());
+        return output;
+    }
 
     auto sliderLimit = Config::Instance()->ExtendedLimits.value_or(false) ? 0.1f : 1.0f;
 

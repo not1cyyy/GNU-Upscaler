@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "GpuTime_Dx11.h"
 #include <State.h>
+#include <Util.h>
 
 GpuTime_Dx11::GpuTime_Dx11(ID3D11Device* device)
 {
@@ -42,23 +43,28 @@ GpuTime_Dx11::~GpuTime_Dx11()
 
 void GpuTime_Dx11::Start(ID3D11DeviceContext* context)
 {
-    if (_init && context)
+    _recording = false;
+
+    if (_init && context && Util::ShouldRecordUpscalerGpuTime())
     {
         // Record the queries in the current frame
         context->Begin(_disjointQueries[_currentFrameIndex]);
         context->End(_startQueries[_currentFrameIndex]);
+        _recording = true;
     }
 }
 
 void GpuTime_Dx11::End(ID3D11DeviceContext* context)
 {
-    if (_init && context)
+    if (_recording && _init && context)
     {
         context->End(_endQueries[_currentFrameIndex]);
         context->End(_disjointQueries[_currentFrameIndex]);
 
         _trigger[_currentFrameIndex] = true;
     }
+
+    _recording = false;
 }
 
 std::optional<double> GpuTime_Dx11::ReadGpuTime(ID3D11DeviceContext* context)

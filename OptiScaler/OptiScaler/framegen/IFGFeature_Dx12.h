@@ -53,9 +53,10 @@ class IFGFeature_Dx12 : public virtual IFGFeature
     bool InitCopyCmdList();
     void DestroyCopyCmdList();
     bool WaitForUIAllocator(UINT index);
-    bool SubmitUICommandList(UINT index);
 
   protected:
+    bool SubmitUICommandList(UINT index);
+    void SubmitFrameCommandLists(UINT index);
     ID3D12Device* _device = nullptr;
     IDXGISwapChain* _swapChain = nullptr;
     ID3D12CommandQueue* _gameCommandQueue = nullptr;

@@ -16,6 +16,7 @@ class AntiLag2 : public LowLatencyTech
     uint64_t amdxc64_load_times = 0;
 
     uint32_t minimum_interval_us = 0;
+    FractionalFpsPacer fractional_pacer {};
 
     uint64_t last_sleep_framecount = 0;
     uint64_t simulation_framecount = 0;

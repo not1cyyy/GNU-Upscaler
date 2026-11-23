@@ -3,26 +3,13 @@
 
 void FpsLimiter::limit()
 {
-    uint64_t interval_ns = 1000ULL * minimum_interval_us;
-    uint64_t now = Util::GetTimestamp();
-
-    if (interval_ns == 0 || !is_limiting())
+    if (minimum_interval_us == 0 || !is_limiting())
     {
-        next_frame_timestamp = 0;
+        pacer.Reset();
         return;
     }
 
-    // Behind schedule (or way ahead after a change), start pacing from now instead of catching up
-    if (next_frame_timestamp <= now || next_frame_timestamp - now > interval_ns + (interval_ns / 4))
-    {
-        next_frame_timestamp = FrameLimit::alignDeadlineToVBlank(now + interval_ns, interval_ns);
-        return;
-    }
-
-    if (auto res = FrameLimit::sleepUntilNs(next_frame_timestamp); res)
-        LOG_ERROR("Sleep command failed: {}", res);
-
-    next_frame_timestamp = FrameLimit::alignDeadlineToVBlank(next_frame_timestamp + interval_ns, interval_ns);
+    pacer.Pace(minimum_interval_us);
 }
 
 void FpsLimiter::get_sleep_status(SleepParams* sleep_params)

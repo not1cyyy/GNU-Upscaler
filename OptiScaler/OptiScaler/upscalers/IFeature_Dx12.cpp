@@ -136,10 +136,11 @@ bool IFeature_Dx12::ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const
     return true;
 }
 
-bool IFeature_Dx12::DispatchPendingPostPassesAsync(ID3D12CommandQueue* directQueue)
+bool IFeature_Dx12::BeginPendingPostPassesAsync(ID3D12CommandQueue* directQueue)
 {
     const PendingAsyncPostPasses passes = _pendingAsyncPasses;
     _pendingAsyncPasses = {};
+    _pendingAsyncDoneFence = 0;
 
     if (!passes.active)
         return true;
@@ -147,12 +148,35 @@ bool IFeature_Dx12::DispatchPendingPostPassesAsync(ID3D12CommandQueue* directQue
     if (AsyncCompute != nullptr && AsyncCompute->IsInit() && directQueue != nullptr &&
         Config::Instance()->Dx12AsyncCompute.value_or_default())
     {
-        return AsyncCompute->Dispatch(directQueue,
-                                      [&](ID3D12GraphicsCommandList* computeCmdList) -> bool
-                                      { return ExecutePostPassSet(computeCmdList, passes); });
+        return AsyncCompute->BeginDispatch(
+            directQueue,
+            [&](ID3D12GraphicsCommandList* computeCmdList) -> bool { return ExecutePostPassSet(computeCmdList, passes); },
+            _pendingAsyncDoneFence);
     }
 
     return false;
+}
+
+bool IFeature_Dx12::WaitPendingPostPassesAsync(ID3D12CommandQueue* directQueue)
+{
+    const UINT64 doneFence = _pendingAsyncDoneFence;
+    _pendingAsyncDoneFence = 0;
+
+    if (doneFence == 0)
+        return true;
+
+    if (AsyncCompute != nullptr && AsyncCompute->IsInit())
+        return AsyncCompute->WaitOnDirectQueue(directQueue, doneFence);
+
+    return false;
+}
+
+bool IFeature_Dx12::DispatchPendingPostPassesAsync(ID3D12CommandQueue* directQueue)
+{
+    if (!BeginPendingPostPassesAsync(directQueue))
+        return false;
+
+    return WaitPendingPostPassesAsync(directQueue);
 }
 
 bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)

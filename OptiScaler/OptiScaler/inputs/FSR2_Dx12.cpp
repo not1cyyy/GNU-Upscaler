@@ -12,6 +12,7 @@
 
 #include "scanner/scanner.h"
 #include "detours/detours.h"
+#include <misc/GaqController.h>
 
 #include "fsr2_212/ffx_fsr2.h"
 #include "fsr2_212/dx12/ffx_fsr2_dx12.h"
@@ -316,6 +317,12 @@ static std::optional<float> GetQualityOverrideRatioFfx(const Fsr212::FfxFsr2Qual
     LOG_DEBUG("");
 
     std::optional<float> output;
+
+    if (Config::Instance()->GaqEnabled.value_or_default())
+    {
+        output = GaqController::Instance().Update(Util::MillisecondsNow(), GaqController::MeasuredFrameTimeMs());
+        return output;
+    }
 
     auto sliderLimit = Config::Instance()->ExtendedLimits.value_or_default() ? 0.1f : 1.0f;
 

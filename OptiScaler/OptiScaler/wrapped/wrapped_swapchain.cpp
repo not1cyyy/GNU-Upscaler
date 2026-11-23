@@ -566,7 +566,7 @@ struct DxSwapchainGpuSync
 
 static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT syncInterval, uint64_t submitNs)
 {
-    if (swapChain == nullptr || State::Instance().isRunningOnLinux)
+    if (swapChain == nullptr)
         return;
 
     DXGI_FRAME_STATISTICS stats {};
@@ -955,25 +955,27 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
     const bool shouldLimit = willPresent && isCurrent && !State::Instance().reflexLimitsFps &&
                              State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();
+    const bool shouldGpuSync =
+        willPresent && isCurrent && State::Instance().activeFgOutput == FGOutput::NoFG && gpuSync != nullptr;
+    const int gpuSyncDepth = shouldGpuSync ? FrameLimit::activeGpuSyncDepth(false) : -1;
+
+    if (willPresent && isCurrent && State::Instance().activeFgOutput == FGOutput::NoFG)
+        FrameLimit::markCpuWorkEnd();
+
+    if (gpuSyncDepth >= 0)
+    {
+        if (isD3D11 && device != nullptr)
+            gpuSync->SyncD3D11(device, gpuSyncDepth);
+        else if (!isD3D11 && cq != nullptr && device12 != nullptr)
+            gpuSync->SyncD3D12(cq, device12, gpuSyncDepth);
+    }
 
     if (shouldLimit)
-    {
-        const int gpuSyncDepth = FrameLimit::activeGpuSyncDepth(false);
-        if (gpuSyncDepth >= 0 && gpuSync != nullptr)
-        {
-            FrameLimit::markCpuWorkEnd();
-            if (isD3D11 && device != nullptr)
-                gpuSync->SyncD3D11(device, gpuSyncDepth);
-            else if (!isD3D11 && cq != nullptr && device12 != nullptr)
-                gpuSync->SyncD3D12(cq, device12, gpuSyncDepth);
-        }
         FrameLimit::prePresent(false);
-    }
 
     LOG_DEBUG("Calling original present");
 
-    const uint64_t submitNs =
-        (shouldLimit && !State::Instance().isRunningOnLinux) ? Util::GetTimestamp() : 0ULL;
+    const uint64_t submitNs = (shouldLimit || gpuSyncDepth >= 0) ? Util::GetTimestamp() : 0ULL;
 
     // swapchain present
     if (pPresentParameters == nullptr)
@@ -981,7 +983,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     else
         presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
 
-    if (shouldLimit && !State::Instance().isRunningOnLinux && SUCCEEDED(presentResult))
+    if ((shouldLimit || gpuSyncDepth >= 0) && SUCCEEDED(presentResult))
         RecordDxgiFrameStats(pSwapChain, hWnd, SyncInterval, submitNs);
 
     if (shouldLimit)

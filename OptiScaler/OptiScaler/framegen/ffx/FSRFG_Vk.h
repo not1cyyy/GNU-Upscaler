@@ -1,6 +1,7 @@
 #pragma once
 #include "SysUtils.h"
 #include <framegen/IFGFeature_Vk.h>
+#include <framegen/FG_DynamicController.h>
 #include <proxies/FfxApi_Proxy.h>
 #include <shaders/hud_copy/HudCopy_Vk.h>
 #include <shaders/hudless_compare_compute/HCC_Vk.h>
@@ -53,6 +54,7 @@ class FSRFG_Vk : public virtual IFGFeature_Vk
 
     std::unique_ptr<HudCopy_Vk> _hudCopy;
     std::unique_ptr<HCC_Vk> _hudlessCompare;
+    FG_DynamicController _dynamic;
 
     // Views of FFX's replacement images the game renders to
     std::unordered_map<VkImage, VkImageView> _presentViews;

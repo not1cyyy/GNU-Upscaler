@@ -1,11 +1,15 @@
 #include <pch.h>
 #include <Config.h>
+#include <Util.h>
 #include "FFXFeature.h"
+#include "MathUtils.h"
 #include <proxies/FfxApi_Proxy.h>
 #include <proxies/Dxgi_Proxy.h>
 #include <proxies/D3d12_Proxy.h>
 #include <misc/IdentifyGpu.h>
 #include <fsr4/FSR4DriverProviderVk.h>
+
+using namespace OptiMath;
 
 static void FfxLogCallback(uint32_t type, const wchar_t* message)
 {
@@ -303,6 +307,111 @@ void FFXFeature::InitFlags()
                 config->FsrMinDisOccAcc.set_volatile_value(scaleRatio / 20.0f);
         }
     }
+}
+
+void FFXFeature::PopulateCameraAndTimingParams(const NVSDK_NGX_Parameter* InParameters, ffxDispatchDescUpscale& params)
+{
+    const auto& cfg = *Config::Instance();
+
+    params.motionVectorScale.x = 1.0f;
+    params.motionVectorScale.y = 1.0f;
+
+    if (InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &params.motionVectorScale.x) != NVSDK_NGX_Result_Success ||
+        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &params.motionVectorScale.y) != NVSDK_NGX_Result_Success)
+    {
+        LOG_WARN("Can't get motion vector scales!");
+    }
+
+    LOG_DEBUG("Sharpness: {0}", params.sharpness);
+
+    if (!cfg.FsrUseFsrInputValues.value_or_default() ||
+        InParameters->Get("FSR.cameraNear", &params.cameraNear) != NVSDK_NGX_Result_Success)
+    {
+        if (DepthInverted())
+            params.cameraFar = cfg.FsrCameraNear.value_or_default();
+        else
+            params.cameraNear = cfg.FsrCameraNear.value_or_default();
+    }
+
+    if (!cfg.FsrUseFsrInputValues.value_or_default() ||
+        InParameters->Get("FSR.cameraFar", &params.cameraFar) != NVSDK_NGX_Result_Success)
+    {
+        if (DepthInverted())
+            params.cameraNear = cfg.FsrCameraFar.value_or_default();
+        else
+            params.cameraFar = cfg.FsrCameraFar.value_or_default();
+    }
+
+    if (!cfg.FsrUseFsrInputValues.value_or_default() ||
+        InParameters->Get(OptiKeys::FSR_CameraFovVertical, &params.cameraFovAngleVertical) != NVSDK_NGX_Result_Success)
+    {
+        if (cfg.FsrVerticalFov.has_value())
+            params.cameraFovAngleVertical = GetRadiansFromDeg(cfg.FsrVerticalFov.value());
+        else if (cfg.FsrHorizontalFov.value_or_default() > 0.0f)
+        {
+            const float hFovRad = GetRadiansFromDeg(cfg.FsrHorizontalFov.value());
+            params.cameraFovAngleVertical =
+                GetVerticalFovFromHorizontal(hFovRad, (float) TargetWidth(), (float) TargetHeight());
+        }
+        else
+            params.cameraFovAngleVertical = GetRadiansFromDeg(60);
+    }
+
+    if (!cfg.FsrUseFsrInputValues.value_or_default() ||
+        InParameters->Get("FSR.frameTimeDelta", &params.frameTimeDelta) != NVSDK_NGX_Result_Success)
+    {
+        if (InParameters->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &params.frameTimeDelta) !=
+                NVSDK_NGX_Result_Success ||
+            params.frameTimeDelta < 1.0f)
+            params.frameTimeDelta = (float) GetDeltaTime();
+    }
+
+    LOG_DEBUG("FrameTimeDeltaInMsec: {0}", params.frameTimeDelta);
+
+    if (!cfg.FsrUseFsrInputValues.value_or_default() ||
+        InParameters->Get("FSR.viewSpaceToMetersFactor", &params.viewSpaceToMetersFactor) != NVSDK_NGX_Result_Success)
+        params.viewSpaceToMetersFactor = 0.0f;
+
+    if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &params.preExposure) != NVSDK_NGX_Result_Success)
+        params.preExposure = 1.0f;
+}
+
+void FFXFeature::ApplyOutputScaling(const NVSDK_NGX_Parameter* InParameters, ffxDispatchDescUpscale& params) const
+{
+    const auto& cfg = *Config::Instance();
+    const bool canOutputScale = LowResMV() || RenderWidth() == DisplayWidth();
+
+    if (canOutputScale && InParameters->Get("FSR.upscaleSize.width", &params.upscaleSize.width) == NVSDK_NGX_Result_Success &&
+        cfg.OutputScalingEnabled.value_or_default())
+    {
+        auto originalWidth = static_cast<float>(params.upscaleSize.width);
+        params.upscaleSize.width =
+            static_cast<uint32_t>(originalWidth * cfg.OutputScalingMultiplier.value_or_default());
+    }
+    else if (params.upscaleSize.width == 0)
+    {
+        params.upscaleSize.width = TargetWidth();
+    }
+
+    if (canOutputScale &&
+        InParameters->Get("FSR.upscaleSize.height", &params.upscaleSize.height) == NVSDK_NGX_Result_Success &&
+        cfg.OutputScalingEnabled.value_or_default())
+    {
+        auto originalHeight = static_cast<float>(params.upscaleSize.height);
+        params.upscaleSize.height =
+            static_cast<uint32_t>(originalHeight * cfg.OutputScalingMultiplier.value_or_default());
+    }
+    else if (params.upscaleSize.height == 0)
+    {
+        params.upscaleSize.height = TargetHeight();
+    }
+}
+
+bool FFXFeature::ShouldUseCustomAutoExposure()
+{
+    const auto& cfg = *Config::Instance();
+    return Version().major >= 4 && AutoExposure() && !cfg.FsrNonLinearPQ.value_or_default() &&
+           !cfg.FsrNonLinearSRGB.value_or_default() && !cfg.FsrNonLinearColorSpace.value_or_default();
 }
 
 FFXFeature::FFXFeature(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters) : IFeature(InHandleId, InParameters)

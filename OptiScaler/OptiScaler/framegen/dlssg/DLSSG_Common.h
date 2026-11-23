@@ -1,6 +1,7 @@
 #pragma once
 
 #include <framegen/IFGFeature.h>
+#include <framegen/FG_DynamicController.h>
 
 #include <proxies/Streamline_Proxy.h>
 
@@ -10,9 +11,12 @@ class DLSSG_Common : public virtual IFGFeature
   protected:
     sl::ViewportHandle _viewport { 0 };
     sl::FrameToken* _frameToken = nullptr;
+    FG_DynamicController _dynamic;
 
     // Streamline's own max, over _maxInterpolationCount when an nvngx provider generates fewer frames
     int _streamlineMaxInterpolationCount = 1;
+
+    virtual HWND WindowHandle();
 
     // Max interpolation count and DMFG support, once the swapchain exists
     void QueryState();

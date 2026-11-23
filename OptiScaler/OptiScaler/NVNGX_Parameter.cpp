@@ -19,9 +19,7 @@ std::optional<float> GetQualityOverrideRatio(const NVSDK_NGX_PerfQuality_Value i
 
     if (Config::Instance()->GaqEnabled.value_or_default())
     {
-        double nowMs = Util::MillisecondsNow();
-        double frameTimeMs = State::Instance().lastFGFrameTime > 0.0 ? State::Instance().lastFGFrameTime : 16.6;
-        output = GaqController::Instance().Update(nowMs, frameTimeMs);
+        output = GaqController::Instance().Update(Util::MillisecondsNow(), GaqController::MeasuredFrameTimeMs());
         return output;
     }
 

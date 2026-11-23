@@ -22,6 +22,7 @@ class DLSSG_Dx12 : public virtual IFGFeature_Dx12, public DLSSG_Common
   protected:
     void ReleaseObjects() override final;
     void CreateObjects(ID3D12Device* InDevice) override final;
+    HWND WindowHandle() override final { return Hwnd(); }
 
   public:
     HWND Hwnd() override final;

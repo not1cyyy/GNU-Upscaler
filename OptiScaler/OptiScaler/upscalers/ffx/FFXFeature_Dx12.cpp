@@ -4,9 +4,6 @@
 #include <proxies/FfxApi_Proxy.h>
 #include "FFXFeature_Dx12.h"
 #include <misc/DeferredRelease.h>
-#include "MathUtils.h"
-
-using namespace OptiMath;
 
 NVSDK_NGX_Parameter* FFXFeatureDx12::SetParameters(NVSDK_NGX_Parameter* InParameters)
 {
@@ -55,8 +52,6 @@ bool FFXFeatureDx12::InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSD
 bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
 {
     LOG_FUNC();
-
-    auto& cfg = *Config::Instance();
 
     struct ffxDispatchDescUpscale params = { 0 };
     params.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -310,76 +305,9 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
     // For FSR 4 as it seems to be missing some conversions from typeless
     // transparencyAndComposition and exposure might be unnecessary here
     if (Version().major >= 4)
-    {
-        ffxResolveTypelessFormat(params.color.description.format);
-        ffxResolveTypelessFormat(params.depth.description.format);
-        ffxResolveTypelessFormat(params.motionVectors.description.format);
-        ffxResolveTypelessFormat(params.exposure.description.format);
-        ffxResolveTypelessFormat(params.transparencyAndComposition.description.format);
-        ffxResolveTypelessFormat(params.output.description.format);
-    }
+        ResolveTypelessFormats(params);
 
-    params.motionVectorScale.x = 1.0f;
-    params.motionVectorScale.y = 1.0f;
-
-    if (InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &params.motionVectorScale.x) != NVSDK_NGX_Result_Success ||
-        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &params.motionVectorScale.y) != NVSDK_NGX_Result_Success)
-    {
-        LOG_WARN("Can't get motion vector scales!");
-    }
-
-    LOG_DEBUG("Sharpness: {0}", params.sharpness);
-
-    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default() ||
-        InParameters->Get("FSR.cameraNear", &params.cameraNear) != NVSDK_NGX_Result_Success)
-    {
-        if (DepthInverted())
-            params.cameraFar = Config::Instance()->FsrCameraNear.value_or_default();
-        else
-            params.cameraNear = Config::Instance()->FsrCameraNear.value_or_default();
-    }
-
-    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default() ||
-        InParameters->Get("FSR.cameraFar", &params.cameraFar) != NVSDK_NGX_Result_Success)
-    {
-        if (DepthInverted())
-            params.cameraNear = cfg.FsrCameraFar.value_or_default();
-        else
-            params.cameraFar = cfg.FsrCameraFar.value_or_default();
-    }
-
-    if (!cfg.FsrUseFsrInputValues.value_or_default() ||
-        InParameters->Get(OptiKeys::FSR_CameraFovVertical, &params.cameraFovAngleVertical) != NVSDK_NGX_Result_Success)
-    {
-        if (cfg.FsrVerticalFov.has_value())
-            params.cameraFovAngleVertical = GetRadiansFromDeg(cfg.FsrVerticalFov.value());
-        else if (cfg.FsrHorizontalFov.value_or_default() > 0.0f)
-        {
-            const float hFovRad = GetRadiansFromDeg(cfg.FsrHorizontalFov.value());
-            params.cameraFovAngleVertical =
-                GetVerticalFovFromHorizontal(hFovRad, (float) TargetWidth(), (float) TargetHeight());
-        }
-        else
-            params.cameraFovAngleVertical = GetRadiansFromDeg(60);
-    }
-
-    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default() ||
-        InParameters->Get("FSR.frameTimeDelta", &params.frameTimeDelta) != NVSDK_NGX_Result_Success)
-    {
-        if (InParameters->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &params.frameTimeDelta) !=
-                NVSDK_NGX_Result_Success ||
-            params.frameTimeDelta < 1.0f)
-            params.frameTimeDelta = (float) GetDeltaTime();
-    }
-
-    LOG_DEBUG("FrameTimeDeltaInMsec: {0}", params.frameTimeDelta);
-
-    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default() ||
-        InParameters->Get("FSR.viewSpaceToMetersFactor", &params.viewSpaceToMetersFactor) != NVSDK_NGX_Result_Success)
-        params.viewSpaceToMetersFactor = 0.0f;
-
-    if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &params.preExposure) != NVSDK_NGX_Result_Success)
-        params.preExposure = 1.0f;
+    PopulateCameraAndTimingParams(InParameters, params);
 
     if (Version() >= feature_version { 3, 1, 1 } && _velocity != Config::Instance()->FsrVelocity.value_or_default())
     {
@@ -449,30 +377,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
         }
     }
 
-    const bool canOutputScale = LowResMV() || RenderWidth() == DisplayWidth();
-    if (canOutputScale && InParameters->Get("FSR.upscaleSize.width", &params.upscaleSize.width) == NVSDK_NGX_Result_Success &&
-        Config::Instance()->OutputScalingEnabled.value_or_default())
-    {
-        auto originalWidth = static_cast<float>(params.upscaleSize.width);
-        params.upscaleSize.width =
-            static_cast<uint32_t>(originalWidth * Config::Instance()->OutputScalingMultiplier.value_or_default());
-    }
-    else if (params.upscaleSize.width == 0)
-    {
-        params.upscaleSize.width = TargetWidth();
-    }
-
-    if (canOutputScale && InParameters->Get("FSR.upscaleSize.height", &params.upscaleSize.height) == NVSDK_NGX_Result_Success &&
-        Config::Instance()->OutputScalingEnabled.value_or_default())
-    {
-        auto originalHeight = static_cast<float>(params.upscaleSize.height);
-        params.upscaleSize.height =
-            static_cast<uint32_t>(originalHeight * Config::Instance()->OutputScalingMultiplier.value_or_default());
-    }
-    else if (params.upscaleSize.height == 0)
-    {
-        params.upscaleSize.height = TargetHeight();
-    }
+    ApplyOutputScaling(InParameters, params);
 
     if (_customAutoExposure)
     {
@@ -562,10 +467,8 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
         // Run our own auto exposure instead and hand FSR4 the result as a regular exposure texture.
         // Only linear input is affected, color space changes recreate the feature.
         _customAutoExposure = false;
-        auto& cfg = *Config::Instance();
 
-        if (Version().major >= 4 && AutoExposure() && !cfg.FsrNonLinearPQ.value_or_default() &&
-            !cfg.FsrNonLinearSRGB.value_or_default() && !cfg.FsrNonLinearColorSpace.value_or_default())
+        if (ShouldUseCustomAutoExposure())
         {
             if (_autoExposure == nullptr)
                 _autoExposure = std::make_unique<AE_Dx12>("AutoExposure", Device);

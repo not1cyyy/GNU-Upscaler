@@ -81,6 +81,20 @@ class FFXFeature : public virtual IFeature
         }
     }
 
+    static inline void ResolveTypelessFormats(ffxDispatchDescUpscale& params)
+    {
+        ffxResolveTypelessFormat(params.color.description.format);
+        ffxResolveTypelessFormat(params.depth.description.format);
+        ffxResolveTypelessFormat(params.motionVectors.description.format);
+        ffxResolveTypelessFormat(params.exposure.description.format);
+        ffxResolveTypelessFormat(params.transparencyAndComposition.description.format);
+        ffxResolveTypelessFormat(params.output.description.format);
+    }
+
+    void PopulateCameraAndTimingParams(const NVSDK_NGX_Parameter* InParameters, ffxDispatchDescUpscale& params);
+    void ApplyOutputScaling(const NVSDK_NGX_Parameter* InParameters, ffxDispatchDescUpscale& params) const;
+    bool ShouldUseCustomAutoExposure();
+
     float _velocity = 1.0f;
     float _reactiveScale = 1.0f;
     float _shadingScale = 1.0f;

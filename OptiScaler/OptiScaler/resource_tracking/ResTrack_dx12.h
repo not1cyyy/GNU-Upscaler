@@ -173,8 +173,8 @@ struct DescriptorResourceInfo
 
 struct HeapInfo : public std::enable_shared_from_this<HeapInfo>
 {
-    // Avoiding one lock object per descriptor
-    static constexpr size_t DESCRIPTOR_LOCK_STRIPE_COUNT = 256;
+    // Avoiding one lock object per descriptor while shrinking per-heap mutex footprint
+    static constexpr size_t DESCRIPTOR_LOCK_STRIPE_COUNT = 64;
     static_assert((DESCRIPTOR_LOCK_STRIPE_COUNT & (DESCRIPTOR_LOCK_STRIPE_COUNT - 1)) == 0);
 
     mutable std::array<std::shared_mutex, DESCRIPTOR_LOCK_STRIPE_COUNT> descriptorLocks;
@@ -591,7 +591,7 @@ using BindingStateMutex = std::mutex;
 struct alignas(CACHE_LINE_SIZE) BindingStateShard
 {
     BindingStateMutex mutex;
-    ankerl::unordered_dense::map<ID3D12GraphicsCommandList*, std::unique_ptr<CommandListBindingState>> map;
+    ankerl::unordered_dense::map<ID3D12GraphicsCommandList*, std::shared_ptr<CommandListBindingState>> map;
 };
 
 #ifdef USE_SPINLOCK_MUTEX
@@ -621,11 +621,12 @@ class ResTrack_Dx12
 {
   private:
     inline static bool _presentDone = true;
-    inline static bool _useShards = false;
+    inline static bool _useShards = true;
     inline static std::atomic<bool> _bindingTrackingEnabled { false };
+    inline static std::atomic<uint64_t> _bindingStateGeneration { 1 };
 
     inline static std::mutex _bindingStateMutex;
-    inline static ankerl::unordered_dense::map<ID3D12GraphicsCommandList*, std::unique_ptr<CommandListBindingState>>
+    inline static ankerl::unordered_dense::map<ID3D12GraphicsCommandList*, std::shared_ptr<CommandListBindingState>>
         _bindingStates;
 
     inline static std::mutex _rootSignatureInfoMutex;

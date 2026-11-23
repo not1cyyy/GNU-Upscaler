@@ -2,6 +2,7 @@
 #include "GpuTime_Vk.h"
 
 #include <State.h>
+#include <Util.h>
 #include <misc/DeferredRelease.h>
 
 GpuTime_Vk::GpuTime_Vk(VkDevice device, VkPhysicalDevice physicalDevice) : _device(device)
@@ -50,23 +51,28 @@ GpuTime_Vk::~GpuTime_Vk()
 
 void GpuTime_Vk::Start(VkCommandBuffer cmdBuffer)
 {
-    if (_init && _queryPool != VK_NULL_HANDLE)
+    _recording = false;
+
+    if (_init && _queryPool != VK_NULL_HANDLE && Util::ShouldRecordUpscalerGpuTime())
     {
         _currentFrameIndex = (_currentFrameIndex + 1) % QUERY_BUFFER_COUNT;
 
         vkCmdResetQueryPool(cmdBuffer, _queryPool, _currentFrameIndex * 2, 2);
         vkCmdWriteTimestamp(cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, _queryPool, _currentFrameIndex * 2);
+        _recording = true;
     }
 }
 
 void GpuTime_Vk::End(VkCommandBuffer cmdBuffer)
 {
-    if (_init && _queryPool != VK_NULL_HANDLE)
+    if (_recording && _init && _queryPool != VK_NULL_HANDLE)
     {
         vkCmdWriteTimestamp(cmdBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, _queryPool, _currentFrameIndex * 2 + 1);
 
         _trigger[_currentFrameIndex] = true;
     }
+
+    _recording = false;
 }
 
 std::optional<double> GpuTime_Vk::ReadGpuTime()

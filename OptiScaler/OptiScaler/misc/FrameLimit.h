@@ -65,6 +65,7 @@ class FrameLimit
     // uses it.
     static float targetFps();
     static bool isLimitingActive();
+    static bool isGpuSyncActive();
     static Mode currentMode();
     static int maxInFlightPresents();
 

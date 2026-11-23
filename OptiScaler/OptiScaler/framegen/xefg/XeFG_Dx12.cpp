@@ -702,20 +702,7 @@ void XeFG_Dx12::Deactivate()
     if (_isActive)
     {
         auto fIndex = GetIndex();
-        if (_uiCommandListResetted[fIndex])
-        {
-            LOG_DEBUG("Executing _uiCommandList[fIndex][{}]: {:X}", fIndex, (size_t) _uiCommandList[fIndex]);
-            auto closeResult = _uiCommandList[fIndex]->Close();
-
-            if (closeResult == S_OK)
-                _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
-            else
-                LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
-
-            _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
-
-            _uiCommandListResetted[fIndex] = false;
-        }
+        SubmitUICommandList(fIndex);
 
         xefg_swapchain_result_t result = XEFG_SWAPCHAIN_RESULT_SUCCESS;
 
@@ -1476,8 +1463,11 @@ bool XeFG_Dx12::Present()
                         if (SUCCEEDED(sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backBuffer))) &&
                             backBuffer != nullptr)
                         {
+                            // Async HudCopy stays behind an opt-in debug toggle because splitting prep/compute/post
+                            // introduces 3 full-screen copies and cross-queue waits vs. batched direct submission.
                             const bool canAsyncHudCopy =
-                                fIndex >= 0 && fIndex < BUFFER_COUNT && Config::Instance()->Dx12AsyncCompute.value_or_default() &&
+                                fIndex >= 0 && fIndex < BUFFER_COUNT &&
+                                Config::Instance()->FGDebugAsyncHudCopy.value_or_default() &&
                                 _gameCommandQueue != nullptr && _asyncCompute != nullptr && _asyncCompute->IsInit() &&
                                 _hudPostCommandAllocator[fIndex] != nullptr && _hudPostCommandList[fIndex] != nullptr;
 
@@ -1543,59 +1533,17 @@ bool XeFG_Dx12::Present()
     // if (IsActive() && !IsPaused())
     if (fIndex >= 0 && fIndex < BUFFER_COUNT)
     {
-        bool uiReady = false;
-        if (_uiCommandListResetted[fIndex])
-        {
-            LOG_DEBUG("Closing _uiCommandList[{}]: {:X}", fIndex, (size_t) _uiCommandList[fIndex]);
-            auto closeResult = _uiCommandList[fIndex]->Close();
+        SubmitFrameCommandLists(fIndex);
 
-            if (closeResult == S_OK)
-                uiReady = true;
-            else
-                LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
-
-            _uiCommandListResetted[fIndex] = false;
-        }
-
-        bool scReady = false;
-        if (_scCommandListResetted[fIndex])
-        {
-            LOG_DEBUG("Closing _scCommandList[{}]: {:X}", fIndex, (size_t) _scCommandList[fIndex]);
-            auto closeResult = _scCommandList[fIndex]->Close();
-
-            if (closeResult == S_OK)
-                scReady = true;
-            else
-                LOG_ERROR("_scCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
-
-            _scCommandListResetted[fIndex] = false;
-        }
-
-        // Batch command lists into a single ExecuteCommandLists call to eliminate redundant queue submissions
         if (_gameCommandQueue != nullptr)
         {
-            ID3D12CommandList* batchLists[2];
-            UINT batchCount = 0;
-            if (uiReady) batchLists[batchCount++] = _uiCommandList[fIndex];
-            if (scReady) batchLists[batchCount++] = _scCommandList[fIndex];
-
-            if (batchCount > 0)
-            {
-                _gameCommandQueue->ExecuteCommandLists(batchCount, batchLists);
-            }
-
-            if (uiReady)
-                _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
-
-            if (scReady)
-                _scAllocatorFenceValues[fIndex] = SignalSCFence();
-
             if (pendingAsyncHudCopy.backBuffer != nullptr)
             {
                 auto prepCmdList = GetSCCommandList(fIndex);
                 if (prepCmdList != nullptr && _hudCopy != nullptr)
                 {
                     bool asyncDispatched = false;
+                    bool prepSubmitted = false;
                     if (_hudCopy->PrepareAsyncDispatch(prepCmdList, pendingAsyncHudCopy.hudless,
                                                        pendingAsyncHudCopy.backBuffer,
                                                        pendingAsyncHudCopy.hudlessState,
@@ -1605,6 +1553,7 @@ bool XeFG_Dx12::Present()
                         _scCommandListResetted[fIndex] = false;
                         ID3D12CommandList* prepList[] = { prepCmdList };
                         _gameCommandQueue->ExecuteCommandLists(1, prepList);
+                        prepSubmitted = true;
 
                         const bool computeOk = _asyncCompute->Dispatch(
                             _gameCommandQueue,
@@ -1612,7 +1561,8 @@ bool XeFG_Dx12::Present()
                             {
                                 return _hudCopy->DispatchAsyncCompute(computeList, pendingAsyncHudCopy.hudless,
                                                                       pendingAsyncHudCopy.threshold);
-                            });
+                            },
+                            true);
 
                         if (computeOk && SUCCEEDED(_hudPostCommandAllocator[fIndex]->Reset()) &&
                             SUCCEEDED(_hudPostCommandList[fIndex]->Reset(_hudPostCommandAllocator[fIndex], nullptr)))
@@ -1632,13 +1582,30 @@ bool XeFG_Dx12::Present()
                         _scAllocatorFenceValues[fIndex] = SignalSCFence();
                     }
 
-                    if (!asyncDispatched && _scCommandListResetted[fIndex])
+                    if (!asyncDispatched)
                     {
-                        // PrepareAsyncDispatch failed before closing prepCmdList: run synchronous path cleanly
-                        _hudCopy->Dispatch(prepCmdList, pendingAsyncHudCopy.hudless, pendingAsyncHudCopy.backBuffer,
-                                           pendingAsyncHudCopy.hudlessState, D3D12_RESOURCE_STATE_PRESENT,
-                                           pendingAsyncHudCopy.threshold);
-                        SubmitSCCommandList(fIndex);
+                        auto fallbackCmdList = _scCommandListResetted[fIndex] ? prepCmdList : GetSCCommandList(fIndex);
+                        if (fallbackCmdList != nullptr)
+                        {
+                            if (prepSubmitted)
+                            {
+                                // PrepareAsyncDispatch left _buffer in UAV and hudless in NON_PIXEL_SHADER_RESOURCE
+                                _hudCopy->Dispatch(fallbackCmdList, pendingAsyncHudCopy.hudless,
+                                                   pendingAsyncHudCopy.backBuffer,
+                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                   D3D12_RESOURCE_STATE_PRESENT, pendingAsyncHudCopy.threshold);
+                                ResourceBarrier(fallbackCmdList, pendingAsyncHudCopy.hudless,
+                                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                pendingAsyncHudCopy.hudlessState);
+                            }
+                            else
+                            {
+                                _hudCopy->Dispatch(fallbackCmdList, pendingAsyncHudCopy.hudless,
+                                                   pendingAsyncHudCopy.backBuffer, pendingAsyncHudCopy.hudlessState,
+                                                   D3D12_RESOURCE_STATE_PRESENT, pendingAsyncHudCopy.threshold);
+                            }
+                            SubmitSCCommandList(fIndex);
+                        }
                     }
                 }
                 pendingAsyncHudCopy.backBuffer->Release();

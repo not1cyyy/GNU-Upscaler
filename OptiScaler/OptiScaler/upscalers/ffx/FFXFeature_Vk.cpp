@@ -4,10 +4,7 @@
 #include <proxies/FfxApi_Proxy.h>
 #include "FFXFeature_Vk.h"
 #include "nvsdk_ngx_vk.h"
-#include "MathUtils.h"
 #include <fsr4/FSR4DriverProviderVk.h>
-
-using namespace OptiMath;
 
 static inline uint32_t ffxApiGetSurfaceFormatVKLocal(VkFormat fmt)
 {
@@ -249,6 +246,25 @@ bool FFXFeatureVk::InitFFX(const NVSDK_NGX_Parameter* InParameters)
             return false;
         }
 
+        _name = "FSR";
+        parse_version(versions.names[upscalerIndex.value_or_default()]);
+
+        // FSR4's own auto exposure reads the whole color texture instead of just renderSize.
+        // Run OptiScaler's auto exposure over renderSize and hand FSR4 the 1x1 exposure texture.
+        _customAutoExposure = false;
+        if (ShouldUseCustomAutoExposure())
+        {
+            if (_autoExposure == nullptr)
+                _autoExposure = std::make_unique<AE_Vk>("AutoExposure", Device, PhysicalDevice);
+
+            if (_autoExposure->IsInit())
+            {
+                _customAutoExposure = true;
+                _contextDesc.flags &= ~FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+                LOG_INFO("Using OptiScaler auto exposure instead of FSR's");
+            }
+        }
+
         LOG_DEBUG("_createContext!");
         auto ret = _ffx->CreateContext(&_context, &_contextDesc.header, NULL);
 
@@ -258,12 +274,6 @@ bool FFXFeatureVk::InitFFX(const NVSDK_NGX_Parameter* InParameters)
             return false;
         }
     }
-
-    auto& versions = _customUpscaler != nullptr ? _customUpscaler->versions : State::Instance().ffxUpscalerVersionsVk;
-    auto& upscalerIndex =
-        Config::Instance()->FfxUpscalerIndexFor(_customUpscaler != nullptr ? _customUpscaler->name : "");
-    _name = "FSR";
-    parse_version(versions.names[upscalerIndex.value_or_default()]);
 
     SetInit(true);
 
@@ -286,10 +296,6 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
 
     if (!IsInited())
         return false;
-
-    auto& state = State::Instance();
-    auto& cfg = *Config::Instance();
-    const auto& ngxParams = *InParameters;
 
     struct ffxDispatchDescUpscale params = { 0 };
     params.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -458,7 +464,10 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
         {
             if (paramReactiveMask2 != nullptr)
             {
-                if (Config::Instance()->FsrUseMaskForTransparency.value_or_default())
+                LOG_DEBUG("Bias mask exist..");
+                Config::Instance()->DisableReactiveMask.set_volatile_value(false);
+
+                if (paramTransparency == nullptr && Config::Instance()->FsrUseMaskForTransparency.value_or_default())
                 {
                     params.transparencyAndComposition =
                         ffxApiGetResourceVK(paramReactiveMask2->Resource.ImageViewInfo.Image,
@@ -466,20 +475,30 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
                                             FFX_API_RESOURCE_STATE_COMPUTE_READ);
                 }
 
-                LOG_DEBUG("Bias mask exist..");
-
-                if (Config::Instance()->DlssReactiveMaskBias.value_or_default() > 0.0f)
+                const float reactiveBias = Config::Instance()->DlssReactiveMaskBias.value_or_default();
+                if (reactiveBias > 0.0f && Bias != nullptr && Bias->CanRender())
                 {
-                    params.reactive = ffxApiGetResourceVK(paramReactiveMask2->Resource.ImageViewInfo.Image,
-                                                          ffxApiGetImageResourceDescriptionVKLocal(paramReactiveMask2),
-                                                          FFX_API_RESOURCE_STATE_COMPUTE_READ);
+                    const auto& biasInfo = paramReactiveMask2->Resource.ImageViewInfo;
+                    if (Bias->Dispatch(InCmdBuffer, biasInfo.ImageView, { biasInfo.Width, biasInfo.Height },
+                                       reactiveBias))
+                    {
+                        auto reactiveDesc = ffxApiGetImageResourceDescriptionVKLocal(paramReactiveMask2);
+                        reactiveDesc.usage = FFX_API_RESOURCE_USAGE_READ_ONLY;
+                        reactiveDesc.format = FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
+                        params.reactive =
+                            ffxApiGetResourceVK(Bias->GetImage(), reactiveDesc, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+                    }
+                }
+                else
+                {
+                    LOG_DEBUG("Skipping reactive mask, Bias: {0}, Bias Init: {1}, Bias CanRender: {2}", reactiveBias,
+                              Bias != nullptr && Bias->IsInit(), Bias != nullptr && Bias->CanRender());
                 }
             }
             else
             {
                 LOG_DEBUG("Bias mask not exist and its enabled in config, it may cause problems!!");
                 Config::Instance()->DisableReactiveMask.set_volatile_value(true);
-                return true;
             }
         }
     }
@@ -492,44 +511,10 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
     _accessToReactiveMask = paramReactiveMask != nullptr || paramReactiveMask2 != nullptr;
     _hasOutput = params.output.resource != nullptr;
 
-    params.motionVectorScale.x = 1.0f;
-    params.motionVectorScale.y = 1.0f;
-
-    if (InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &params.motionVectorScale.x) != NVSDK_NGX_Result_Success ||
-        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &params.motionVectorScale.y) != NVSDK_NGX_Result_Success)
-    {
-        LOG_WARN("Can't get motion vector scales!");
-    }
-
     params.enableSharpening = _sharpness > 0.0f;
     params.sharpness = _sharpness;
 
-    if (DepthInverted())
-    {
-        params.cameraFar = cfg.FsrCameraNear.value_or_default();
-        params.cameraNear = cfg.FsrCameraFar.value_or_default();
-    }
-    else
-    {
-        params.cameraFar = cfg.FsrCameraFar.value_or_default();
-        params.cameraNear = cfg.FsrCameraNear.value_or_default();
-    }
-
-    if (cfg.FsrVerticalFov.has_value())
-        params.cameraFovAngleVertical = GetRadiansFromDeg(cfg.FsrVerticalFov.value());
-    else if (cfg.FsrHorizontalFov.value_or_default() > 0.0f)
-    {
-        const float hFovRad = GetRadiansFromDeg(cfg.FsrHorizontalFov.value());
-        params.cameraFovAngleVertical =
-            GetVerticalFovFromHorizontal(hFovRad, (float) TargetWidth(), (float) TargetHeight());
-    }
-    else
-        params.cameraFovAngleVertical = GetRadiansFromDeg(60);
-
-    if (InParameters->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &params.frameTimeDelta) !=
-            NVSDK_NGX_Result_Success ||
-        params.frameTimeDelta < 1.0f)
-        params.frameTimeDelta = (float) GetDeltaTime();
+    PopulateCameraAndTimingParams(InParameters, params);
 
     if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &params.preExposure) != NVSDK_NGX_Result_Success)
         params.preExposure = 1.0f;
@@ -602,38 +587,50 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
         }
     }
 
-    const bool canOutputScale = LowResMV() || RenderWidth() == DisplayWidth();
-    if (canOutputScale && InParameters->Get("FSR.upscaleSize.width", &params.upscaleSize.width) == NVSDK_NGX_Result_Success &&
-        Config::Instance()->OutputScalingEnabled.value_or_default())
+    ApplyOutputScaling(InParameters, params);
+
+    if (_customAutoExposure && _autoExposure != nullptr)
     {
-        auto originalWidth = static_cast<float>(params.upscaleSize.width);
-        params.upscaleSize.width =
-            static_cast<uint32_t>(originalWidth * Config::Instance()->OutputScalingMultiplier.value_or_default());
-    }
-    else if (params.upscaleSize.width == 0)
-    {
-        params.upscaleSize.width = TargetWidth();
+        const auto& colorInfo = paramColor->Resource.ImageViewInfo;
+        if (_autoExposure->Dispatch(InCmdBuffer, colorInfo.ImageView, params.renderSize.width,
+                                    params.renderSize.height, params.preExposure, params.frameTimeDelta / 1000.0f,
+                                    params.reset))
+        {
+            FfxApiResourceDescription expDesc {};
+            expDesc.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
+            expDesc.width = 1;
+            expDesc.height = 1;
+            expDesc.mipCount = 1;
+            expDesc.depth = 1;
+            expDesc.usage = FFX_API_RESOURCE_USAGE_READ_ONLY;
+            expDesc.flags = FFX_API_RESOURCE_FLAGS_NONE;
+            expDesc.format = FFX_API_SURFACE_FORMAT_R32_FLOAT;
+            params.exposure =
+                ffxApiGetResourceVK(_autoExposure->Exposure(), expDesc, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+            _hasExposure = true;
+        }
+        else
+        {
+            LOG_ERROR("Auto exposure dispatch failed");
+        }
     }
 
-    if (canOutputScale && InParameters->Get("FSR.upscaleSize.height", &params.upscaleSize.height) == NVSDK_NGX_Result_Success &&
-        Config::Instance()->OutputScalingEnabled.value_or_default())
-    {
-        auto originalHeight = static_cast<float>(params.upscaleSize.height);
-        params.upscaleSize.height =
-            static_cast<uint32_t>(originalHeight * Config::Instance()->OutputScalingMultiplier.value_or_default());
-    }
-    else if (params.upscaleSize.height == 0)
-    {
-        params.upscaleSize.height = TargetHeight();
-    }
+    if (Version().major >= 4)
+        ResolveTypelessFormats(params);
 
     // Log what the driver provided FSR 4 gets, only when it changes
     if (_ffx == FSR4DriverProviderVk::Module())
     {
         auto describe = [](const char* name, NVSDK_NGX_Resource_VK* vkRes, const FfxApiResource& res)
         {
-            if (res.resource == nullptr || vkRes == nullptr)
+            if (res.resource == nullptr)
                 return std::format("{}: none", name);
+
+            if (vkRes == nullptr)
+            {
+                return std::format("{}: {}x{} ffx: {} usage: {:X}", name, res.description.width,
+                                   res.description.height, res.description.format, res.description.usage);
+            }
 
             return std::format("{}: {}x{} vk: {} ffx: {} usage: {:X}", name, res.description.width,
                                res.description.height, (int) vkRes->Resource.ImageViewInfo.Format,

@@ -49,8 +49,11 @@ void AntiLagVk::set_sleep_mode(SleepMode* sleep_mode)
     // use_markers_to_optimize
 
     low_latency_enabled = sleep_mode->low_latency_enabled;
-    max_fps =
-        sleep_mode->minimum_interval_us > 0 ? (uint32_t) std::round(1000000.0f / sleep_mode->minimum_interval_us) : 0;
+    minimum_interval_us = sleep_mode->minimum_interval_us;
+    max_fps = static_cast<uint32_t>(
+        FractionalFpsPacer::ComputeDriverCeilingFps(minimum_interval_us, needs_fractional_sleep));
+    if (!needs_fractional_sleep)
+        fractional_pacer.Reset();
 }
 
 void AntiLagVk::sleep(std::optional<uint32_t> frame_id)
@@ -60,12 +63,20 @@ void AntiLagVk::sleep(std::optional<uint32_t> frame_id)
     {
         if (!last_input_frame_id.has_value() || (uint32_t) *last_input_frame_id != *frame_id)
         {
+            if (needs_fractional_sleep && (!last_paced_frame_id.has_value() || *last_paced_frame_id != *frame_id))
+            {
+                last_paced_frame_id = *frame_id;
+                fractional_pacer.Pace(minimum_interval_us);
+            }
             last_input_frame_id = *frame_id;
             update(VK_ANTI_LAG_STAGE_INPUT_AMD, *frame_id);
         }
 
         return;
     }
+
+    if (needs_fractional_sleep)
+        fractional_pacer.Pace(minimum_interval_us);
 
     // The simulation start markers with frame ids are better
     if (++sleeps_since_id_marker > 20)
@@ -98,6 +109,12 @@ void AntiLagVk::set_marker(IUnknown* pDevice, const MarkerParams& marker_params)
 
         if (!last_input_frame_id.has_value() || (uint32_t) *last_input_frame_id != (uint32_t) marker_params.frame_id)
         {
+            if (needs_fractional_sleep &&
+                (!last_paced_frame_id.has_value() || *last_paced_frame_id != marker_params.frame_id))
+            {
+                last_paced_frame_id = marker_params.frame_id;
+                fractional_pacer.Pace(minimum_interval_us);
+            }
             last_input_frame_id = marker_params.frame_id;
             update(VK_ANTI_LAG_STAGE_INPUT_AMD, marker_params.frame_id);
         }

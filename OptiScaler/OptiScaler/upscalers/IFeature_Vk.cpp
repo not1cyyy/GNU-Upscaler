@@ -21,6 +21,9 @@ bool IFeature_Vk::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice In
     {
         OutputScaler = std::make_unique<OS_Vk>("Output Scaling", InDevice, InPD, (TargetWidth() < DisplayWidth()));
         RCAS = std::make_unique<RCAS_Vk>("RCAS", InDevice, InPD);
+        // DLSS/DLSSD take the bias mask as is
+        if (GetUpscalerType() != Upscaler::DLSS && GetUpscalerType() != Upscaler::DLSSD)
+            Bias = std::make_unique<Bias_Vk>("Bias", InDevice, InPD);
         Magnifier = std::make_unique<Magnifier_Vk>("Magnifier", InDevice, InPD);
         UpscalerTime = std::make_unique<GpuTime_Vk>(InDevice, InPD);
     }

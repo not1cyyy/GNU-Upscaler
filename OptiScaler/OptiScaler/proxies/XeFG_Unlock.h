@@ -4,11 +4,58 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <string>
+#include <vector>
 #include "Config.h"
 #include "Logger.h"
 
 namespace XeFGUnlock
 {
+struct DllVersionInfo
+{
+    bool valid = false;
+    WORD major = 0;
+    WORD minor = 0;
+    WORD build = 0;
+    WORD revision = 0;
+};
+
+inline DllVersionInfo ReadModuleVersionInfo(HMODULE mod)
+{
+    DllVersionInfo out {};
+    if (mod == nullptr)
+        return out;
+
+    HRSRC hRes = FindResourceW(mod, MAKEINTRESOURCEW(VS_VERSION_INFO), RT_VERSION);
+    if (hRes == nullptr)
+        return out;
+
+    const DWORD resSize = SizeofResource(mod, hRes);
+    HGLOBAL hData = LoadResource(mod, hRes);
+    if (hData == nullptr || resSize < sizeof(VS_FIXEDFILEINFO))
+        return out;
+
+    const auto* bytes = static_cast<const uint8_t*>(LockResource(hData));
+    if (bytes == nullptr)
+        return out;
+
+    constexpr uint32_t kFixedSig = 0xFEEF04BDu;
+    for (DWORD i = 0; i + sizeof(VS_FIXEDFILEINFO) <= resSize; i += 4)
+    {
+        const auto* info = reinterpret_cast<const VS_FIXEDFILEINFO*>(bytes + i);
+        if (info->dwSignature == kFixedSig)
+        {
+            out.valid = true;
+            out.major = HIWORD(info->dwFileVersionMS);
+            out.minor = LOWORD(info->dwFileVersionMS);
+            out.build = HIWORD(info->dwFileVersionLS);
+            out.revision = LOWORD(info->dwFileVersionLS);
+            break;
+        }
+    }
+
+    return out;
+}
 // Scans an in-memory buffer for a byte pattern with wildcard '?' masking
 inline uint8_t* FindPattern(uint8_t* start, size_t size, const uint8_t* pattern, const char* mask)
 {
@@ -52,10 +99,29 @@ inline bool Apply(HMODULE libxefgModule)
     if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
         return false;
 
+    if (ntHeaders->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        ntHeaders->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    {
+        LOG_WARN("XeFG Unlock: unsupported PE architecture (machine 0x{:04X}, magic 0x{:04X}), using stock limits",
+                 ntHeaders->FileHeader.Machine, ntHeaders->OptionalHeader.Magic);
+        return false;
+    }
+
     const uint32_t timestamp = ntHeaders->FileHeader.TimeDateStamp;
+    const uint32_t imageSize = ntHeaders->OptionalHeader.SizeOfImage;
+    const auto ver = ReadModuleVersionInfo(libxefgModule);
     const uint32_t ceiling = std::clamp(Config::Instance()->FGXeFGMaxInterpolatedFrames.value_or(5), 1, 9);
 
-    LOG_INFO("XeFG Unlock: checking provider build 0x{:08X}, ceiling: {} ({}X)", timestamp, ceiling, ceiling + 1);
+    if (ver.valid)
+    {
+        LOG_INFO("XeFG Unlock: checking libxess_fg v{}.{}.{}.{} (build 0x{:08X}, size 0x{:X}), ceiling: {} ({}X)",
+                 ver.major, ver.minor, ver.build, ver.revision, timestamp, imageSize, ceiling, ceiling + 1);
+    }
+    else
+    {
+        LOG_INFO("XeFG Unlock: checking libxess_fg (no version resource, build 0x{:08X}, size 0x{:X}), ceiling: {} ({}X)",
+                 timestamp, imageSize, ceiling, ceiling + 1);
+    }
 
     // Locate the .text (or executable) section for dynamic pattern searching
     uint8_t* textStart = nullptr;
@@ -159,14 +225,23 @@ inline bool Apply(HMODULE libxefgModule)
 
     int successCount = 0;
 
+    std::vector<std::string> failedPatches;
+    auto tryPatch = [&](size_t fallbackRva, const uint8_t* expected, const uint8_t* patchBytes, size_t patchSize,
+                        const uint8_t* sigPattern, const char* sigMask, size_t sigTargetOffset, const char* name)
+    {
+        if (resolveAndPatch(fallbackRva, expected, patchBytes, patchSize, sigPattern, sigMask, sigTargetOffset, name))
+            successCount++;
+        else
+            failedPatches.emplace_back(name);
+    };
+
     // U1: frame-count-fallback bypass (0F 85 CC 00 00 00 -> E9 CD 00 00 00 90)
     // Sig: 84 C0 0F 85 ?? ?? ?? ?? 83 FB 01 (target is at +2)
     {
         const uint8_t u1_exp[] = { 0x0F, 0x85, 0xCC, 0x00, 0x00, 0x00 };
         const uint8_t u1_pat[] = { 0xE9, 0xCD, 0x00, 0x00, 0x00, 0x90 };
         const uint8_t u1_sig[] = { 0x84, 0xC0, 0x0F, 0x85, 0x00, 0x00, 0x00, 0x00, 0x83, 0xFB, 0x01 };
-        if (resolveAndPatch(0x20DA4F, u1_exp, u1_pat, sizeof(u1_exp), u1_sig, "xxxx????xxx", 2, "U1/frame-count-fallback"))
-            successCount++;
+        tryPatch(0x20DA4F, u1_exp, u1_pat, sizeof(u1_exp), u1_sig, "xxxx????xxx", 2, "U1/frame-count-fallback");
     }
 
     // U2: model-downgrade bypass (74 09 -> EB 06)
@@ -175,8 +250,7 @@ inline bool Apply(HMODULE libxefgModule)
         const uint8_t u2_exp[] = { 0x74, 0x09 };
         const uint8_t u2_pat[] = { 0xEB, 0x06 };
         const uint8_t u2_sig[] = { 0x80, 0x79, 0x4D, 0x00, 0x74, 0x09, 0x80, 0x79, 0x64, 0x00, 0x74, 0x03, 0xB0, 0x01, 0xC3 };
-        if (resolveAndPatch(0x1A5DE4, u2_exp, u2_pat, sizeof(u2_exp), u2_sig, "xxxx?xxxx?xxxxx", 4, "U2/model-downgrade"))
-            successCount++;
+        tryPatch(0x1A5DE4, u2_exp, u2_pat, sizeof(u2_exp), u2_sig, "xxxx?xxxx?xxxxx", 4, "U2/model-downgrade");
     }
 
     // U3: default-ceiling (BB 03 00 00 00 -> BB <ceiling> 00 00 00)
@@ -185,8 +259,7 @@ inline bool Apply(HMODULE libxefgModule)
         const uint8_t u3_exp[] = { 0xBB, 0x03, 0x00, 0x00, 0x00 };
         const uint8_t u3_pat[] = { 0xBB, static_cast<uint8_t>(ceiling), 0x00, 0x00, 0x00 };
         const uint8_t u3_sig[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xF9, 0xBB, 0x03, 0x00, 0x00, 0x00 };
-        if (resolveAndPatch(0x1A517D, u3_exp, u3_pat, sizeof(u3_exp), u3_sig, "xxxxxxxxxxxxxx?xxx", 13, "U3/default-ceiling"))
-            successCount++;
+        tryPatch(0x1A517D, u3_exp, u3_pat, sizeof(u3_exp), u3_sig, "xxxxxxxxxxxxxx?xxx", 13, "U3/default-ceiling");
     }
 
     // U4: override-clamp (C7 87 6C 01 00 00 01 00 00 00 -> C7 87 6C 01 00 00 <ceiling> 00 00 00)
@@ -195,8 +268,7 @@ inline bool Apply(HMODULE libxefgModule)
         const uint8_t u4_exp[] = { 0xC7, 0x87, 0x6C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
         const uint8_t u4_pat[] = { 0xC7, 0x87, 0x6C, 0x01, 0x00, 0x00, static_cast<uint8_t>(ceiling), 0x00, 0x00, 0x00 };
         const uint8_t u4_sig[] = { 0x84, 0xC0, 0x75, 0x11, 0xC7, 0x87, 0x6C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
-        if (resolveAndPatch(0x1A45C2, u4_exp, u4_pat, sizeof(u4_exp), u4_sig, "xxx?xxxxxx?xxx", 4, "U4/override-clamp"))
-            successCount++;
+        tryPatch(0x1A45C2, u4_exp, u4_pat, sizeof(u4_exp), u4_sig, "xxx?xxxxxx?xxx", 4, "U4/override-clamp");
     }
 
     // U5: reported-maximum (B8 01 00 00 00 -> B8 <ceiling> 00 00 00)
@@ -205,14 +277,26 @@ inline bool Apply(HMODULE libxefgModule)
         const uint8_t u5_exp[] = { 0xB8, 0x01, 0x00, 0x00, 0x00 };
         const uint8_t u5_pat[] = { 0xB8, static_cast<uint8_t>(ceiling), 0x00, 0x00, 0x00 };
         const uint8_t u5_sig[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0x89, 0x47, 0x20, 0x33, 0xC0 };
-        if (resolveAndPatch(0x20973B, u5_exp, u5_pat, sizeof(u5_exp), u5_sig, "x?xxxxxxxx", 0, "U5/reported-maximum"))
-            successCount++;
+        tryPatch(0x20973B, u5_exp, u5_pat, sizeof(u5_exp), u5_sig, "x?xxxxxxxx", 0, "U5/reported-maximum");
     }
 
-    if (successCount > 0)
+    if (successCount == 5)
+    {
         s_lastPatchedModule = libxefgModule;
+        LOG_INFO("XeFG Unlock: 5/5 patches applied (MFG unlocked up to {}X, ceiling: {})", ceiling + 1, ceiling);
+        return true;
+    }
 
-    LOG_INFO("XeFG Unlock: {}/5 patches applied (MFG unlocked up to {}X, ceiling: {})", successCount, ceiling + 1, ceiling);
-    return successCount == 5;
+    std::string missing;
+    for (size_t i = 0; i < failedPatches.size(); ++i)
+    {
+        if (i > 0)
+            missing += ", ";
+        missing += failedPatches[i];
+    }
+    LOG_WARN("XeFG Unlock: incomplete unlock ({}/5; failed: [{}]) — unknown libxess_fg build 0x{:08X}; "
+             "keeping stock FG limits safely",
+             successCount, missing, timestamp);
+    return false;
 }
 } // namespace XeFGUnlock

@@ -203,7 +203,13 @@
     <ClInclude Include="shaders\auto_exposure\AE_Dx12.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="shaders\auto_exposure\AE_Vk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="shaders\auto_exposure\precompile\AE_Shader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\auto_exposure\precompile\AE_Shader_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="shaders\bias\Bias_Common.h">
@@ -215,10 +221,16 @@
     <ClInclude Include="shaders\bias\Bias_Dx12.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="shaders\bias\Bias_Vk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="shaders\bias\precompile\Bias_Shader.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="shaders\bias\precompile\Bias_Shader_Dx11.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\bias\precompile\Bias_Shader_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="shaders\format_transfer\FT_Common.h">
@@ -558,6 +570,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="inputs\FG\Streamline_Inputs.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="framegen\FG_DynamicController.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="framegen\xefg\XeFG_Dx12.h">
@@ -1349,7 +1364,13 @@
     <ClCompile Include="shaders\auto_exposure\AE_Dx12.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="shaders\auto_exposure\AE_Vk.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="shaders\bias\Bias_Dx12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="shaders\bias\Bias_Vk.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="shaders\format_transfer\FT_Dx12.cpp">
@@ -1521,6 +1542,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="inputs\FG\Streamline_Inputs.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="framegen\FG_DynamicController.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="framegen\xefg\XeFG_Dx12.cpp">

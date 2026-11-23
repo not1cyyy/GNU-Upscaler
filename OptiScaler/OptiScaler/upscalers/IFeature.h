@@ -5,6 +5,8 @@
 #include <nvsdk_ngx_defs.h>
 
 #include <array>
+#include <chrono>
+#include <thread>
 #include <unordered_set>
 #include <Util.h>
 
@@ -113,6 +115,18 @@ class IFeature
     void GetRenderResolution(const NVSDK_NGX_Parameter* InParameters, unsigned int* OutWidth, unsigned int* OutHeight);
     void GetDynamicOutputResolution(NVSDK_NGX_Parameter* InParameters, unsigned int* width, unsigned int* height);
     float GetSharpness(const NVSDK_NGX_Parameter* InParameters);
+
+    template <typename CreateFn>
+    static NVSDK_NGX_Result CreateNgxFeatureWithRetry(bool retryOnFailure, CreateFn&& createFn)
+    {
+        NVSDK_NGX_Result result = createFn();
+        if (result != NVSDK_NGX_Result_Success && retryOnFailure)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            result = createFn();
+        }
+        return result;
+    }
 
     virtual void SetInit(bool InValue) { _isInited = InValue; }
 

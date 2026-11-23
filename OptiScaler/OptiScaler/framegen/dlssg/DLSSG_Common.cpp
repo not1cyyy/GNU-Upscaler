@@ -2,6 +2,7 @@
 
 #include "DLSSG_Common.h"
 
+#include <Util.h>
 #include <hooks/Reflex_Hooks.h>
 #include <framegen/nvngx/Nvngx_FG.h>
 
@@ -10,6 +11,8 @@
 #include <DirectXMath.h>
 
 using namespace DirectX;
+
+HWND DLSSG_Common::WindowHandle() { return Util::GetProcessWindow(); }
 
 feature_version DLSSG_Common::Version()
 {
@@ -35,6 +38,8 @@ void DLSSG_Common::Activate()
 
         UpdateTarget();
         _isActive = true;
+        _generationOff = false;
+        _dynamic.Restart();
     }
 }
 
@@ -60,6 +65,7 @@ void DLSSG_Common::Deactivate()
             StreamlineProxy::ReflexSetOptions()(reflexConst);
 
         _isActive = false;
+        _generationOff = false;
         _waitingNewFrameData = false;
     }
 }
@@ -98,9 +104,35 @@ void DLSSG_Common::SetOptions(bool gameMarkersReachStreamline)
                  _maxInterpolationCount);
     }
 
-    const int targetCount =
+    int targetCount =
         std::clamp(config->FGInterpolationCount(config->FGDLSSGInterpolationCount.value_or_default()), 1,
                    std::max(_maxInterpolationCount, 1));
+
+    const bool forceDMFG = config->FGDLSSGForceDMFG.value_or_default();
+    const bool dynamicEnabled = config->FGDynamicFG.value_or_default() && !config->FGFollowsGame();
+
+    if (!forceDMFG)
+    {
+        FG_DynamicController::Options dynOpt {};
+        dynOpt.enabled = dynamicEnabled;
+        dynOpt.allow1X = true;
+        dynOpt.targetCount = targetCount;
+        dynOpt.currentCount = _framesToInterpolate > 0 ? _framesToInterpolate : targetCount;
+        dynOpt.generationOff = _generationOff;
+        dynOpt.targetFps = config->FGDynamicTargetFps.value_or_default();
+        dynOpt.minBaseFps = config->FGMinBaseFps.value_or_default();
+        dynOpt.presentWaitMs = State::Instance().lastFGPresentMs;
+        dynOpt.window = WindowHandle();
+
+        const auto dyn = _dynamic.Update(dynOpt);
+        _generationOff = dyn.generationOff;
+        targetCount = dyn.count;
+    }
+    else
+    {
+        // Hardware DMFG still obeys OptiScaler's Base FPS latency floor guard when opted in
+        _generationOff = _dynamic.EvaluateBaseFpsGuard(dynamicEnabled, config->FGMinBaseFps.value_or_default());
+    }
 
     if (_framesToInterpolate != targetCount)
     {
@@ -110,14 +142,21 @@ void DLSSG_Common::SetOptions(bool gameMarkersReachStreamline)
     }
 
     sl::DLSSGOptions options {};
-    options.mode = sl::DLSSGMode::eOn;
     options.numFramesToGenerate = _framesToInterpolate;
     options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
 
-    if (config->FGDLSSGForceDMFG.value_or_default())
+    if (_generationOff)
+    {
+        options.mode = sl::DLSSGMode::eOff;
+    }
+    else if (forceDMFG)
     {
         options.mode = sl::DLSSGMode::eDynamic;
         options.dynamicTargetFrameRate = config->FGDLSSGFramerateTargetDMFG.value_or_default();
+    }
+    else
+    {
+        options.mode = sl::DLSSGMode::eOn;
     }
 
     auto dlssgSetOptionsResult = StreamlineProxy::DLSSGSetOptions()(_viewport, options);
