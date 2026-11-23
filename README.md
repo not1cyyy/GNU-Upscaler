@@ -1,183 +1,238 @@
+<div align="center">
+
 # GNU-Upscaler
 
-GNU-Upscaler is a fork of OptiScaler for Linux gaming under Proton. It packages OptiPatcher alongside FidelityFX libraries with a native installation script.
+**A Linux & Proton-first fork of OptiScaler with 10x Multi-Frame Generation, Closed-Loop Auto-DRS, Sub-Millisecond Frame Pacing, and Native Steam Deployment**
 
-Automated builds compile on Windows via GitHub Actions and publish to the repository releases page.
+[![Build GNU-Upscaler](https://github.com/not1cyyy/GNU-Upscaler/actions/workflows/build.yml/badge.svg)](https://github.com/not1cyyy/GNU-Upscaler/actions/workflows/build.yml)
+[![Latest Release](https://img.shields.io/github/v/release/not1cyyy/GNU-Upscaler?include_prereleases&label=Release&color=blue)](https://github.com/not1cyyy/GNU-Upscaler/releases/tag/latest)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%2F%20Proton%20%2F%20SteamOS-informational)](#installation)
+[![License](https://img.shields.io/badge/License-GPL--3.0-green)](#)
+
+*Bundles **OptiScaler**, **OptiPatcher** (`OptiPatcher.asi`), **AMD FidelityFX** (FSR 4 / 3.1 / FG), and **Intel XeSS v3.0.2** (`libxess_fg.dll` + `libxell.dll`) in one automated package.*
+
+</div>
+
+---
+
+<!-- Hero Showcase -->
+<p align="center">
+  <img src="docs/screenshots/stellar-blade-showcase.jpg" alt="Stellar Blade running under VKD3D-Proton at 1440p with GNU-Upscaler" width="92%" />
+  <br />
+  <sub><b>Stellar Blade</b> (2560×1440, VKD3D-Proton) on <b>RX 7800 XT + R7 5700X</b> — <b>181 FPS (5.5 ms)</b> with a flat frametime graph (5.3–8.7 ms)</sub>
+</p>
+
+## Why GNU-Upscaler?
+
+Upstream OptiScaler is built primarily for Windows. Running modern upscaling and frame generation under **Wine / Proton / VKD3D-Proton** introduces coarse timer jitter, swapchain color-space crashes, `WINELOADER` Streamline blocks, and missing vendor unlocks. **GNU-Upscaler** solves those at the engine and presentation boundary while adding an entire suite of original features:
+
+| Feature | What It Does | Where It Shines |
+| :--- | :--- | :--- |
+| **10x XeFG Unlock** | Patches `libxess_fg.dll` in memory (SIMD AOB) to unlock `2x`, `3x`, `4x`, `6x`, and `10x` on **any GPU** | High-refresh monitors (144Hz–360Hz+) |
+| **Adaptive Dynamic FG (ADFG)** | Shared `FG_DynamicController` for XeFG, FSR-FG & DLSS-G with a `MinBaseFps` latency floor guard | Keeps input lag low in heavy combat |
+| **GNU Adaptive Quality (GAQ)** | GPU-timestamp & sleep-aware PID Auto-DRS with **CPU-bound detection** & **MotionBoost** | Steam Deck, handhelds & 4K targets |
+| **Front-Edge Frame Pacing** | JIT / VBlank PLL / `VK_EXT_present_timing` / `VK_GOOGLE_display_timing` + GPU completion sync | Butter-smooth frametimes under Proton |
+| **FSR 4 Auto-Step-Down** | Monitors FSR 4 GPU pass time (`Fsr4MaxGpuMs`) and steps models (`FP8`, `INT8`, `INT8 Lite`) & presets | Preventing GPU-bound stutters |
+| **Zero-Copy & Tile-Skip HUDFix** | `ZeroCopyHudless` + 16×16 super-tile `HudCopyTileSkip` + `PackedBuffers` (`R11G11B10F`) | Slashes Frame Gen overhead & VRAM bandwidth |
+| **Integrated OptiPatcher** | SIMD (`memchr`) pattern scanner, generic UE unlock, `patches.ini`, & Nixxes `WINELOADER` bypass | Native AMD/Intel shader paths without spoofing |
+| **Modern `GnuUi` Overlay** | 6-tab redesigned ImGui UI with **One-Click Presets** & live pipeline telemetry | Instant tuning with `Insert` |
+
+---
 
 ## Contents
 
-- Features unique to GNU-Upscaler
-- Installation
-- Frame generation architecture
-- GNU Adaptive Quality (GAQ Auto-DRS)
-- OptiPatcher
-- Recommended game engine tweaks
-- Manual configuration
-- Building from source
+- [Installation](#installation)
+- [Core Features](#core-features)
+  - [Multi-Frame Generation up to 10x & Adaptive Dynamic FG](#multi-frame-generation-up-to-10x--adaptive-dynamic-fg)
+  - [GNU Adaptive Quality (GAQ Auto-DRS)](#gnu-adaptive-quality-gaq-auto-drs)
+  - [Frame Pacing, Latency & Vulkan Parity](#frame-pacing-latency--vulkan-parity)
+  - [FSR 4 Model Management & Auto-Step-Down](#fsr-4-model-management--auto-step-down)
+  - [Zero-Copy HUDFix, DX12 & HDR Pipeline](#zero-copy-hudfix-dx12--hdr-pipeline)
+  - [OptiPatcher & Game-Specific Linux Fixes](#optipatcher--game-specific-linux-fixes)
+  - [Anti-Cheat Safety Guard](#anti-cheat-safety-guard)
+- [In-Game Overlay (`GnuUi`) & Hotkeys](#in-game-overlay-gnuui--hotkeys)
+- [Configuration Reference (`OptiScaler.ini`)](#configuration-reference-optiscalerini)
+- [Recommended Game Engine Tweaks](#recommended-game-engine-tweaks)
+- [Building from Source](#building-from-source)
 
-## Features unique to GNU-Upscaler
-
-GNU-Upscaler includes several modifications not present in upstream OptiScaler.
-
-### Multi-frame generation up to 10x
-Upstream XeFG limits frame generation to 4x on Intel Arc hardware. GNU-Upscaler patches `libxess_fg.dll` in memory to unlock multipliers up to 10x on any GPU architecture.
-- In-memory unlocking across `libxess_fg.dll` builds without external ASI loaders.
-- Automatic swapchain buffer scaling that expands backbuffer counts to prevent queue starvation at 6x and 10x.
-- Multiplier fallback when target frame intervals cannot be sustained.
-
-### Adaptive Dynamic Frame Generation (ADFG)
-A real-time frame generation controller that adjusts interpolation multipliers based on GPU load.
-- Latency floor guard: when base rendering drops during heavy scenes, the multiplier clamps to 2x to prevent input latency spikes.
-- Decouples interpolation pacing from coarse Windows timers under Wine.
-
-### GNU Adaptive Quality (GAQ)
-A closed-loop PID controller for Dynamic Resolution Scaling (DRS).
-- Adjusts render resolution between configured bounds to maintain a steady framerate target.
-- Functions across all upscaler inputs without requiring native game engine DRS support.
-- Useful for handheld devices like the Steam Deck.
-
-### VKD3D-Proton and Linux stability fixes
-- Unreal Engine swapchain fix: resolves crashes when games invoke `SetColorSpace1` under VKD3D-Proton, configuring 10-bit swapchains (`DXGI_FORMAT_R10G10B10A2_UNORM`).
-- Command list submission batching: aggregates DirectX 12 command lists to lower CPU overhead across the Wine-to-Vulkan boundary.
-- Auto-detect inverted depth: inspects engine projection matrices at runtime to identify inverted Z-buffers.
-
-### Anti-cheat safety guard
-Monitors running processes for anti-cheat runtimes like Easy Anti-Cheat. If a protected multiplayer session is detected, GNU-Upscaler aborts DLL hooks to prevent account penalties.
-
-### XeFG HUD mask support
-Separates HUD masks within XeFG to eliminate UI ghosting at high multipliers without game-specific HUD mods.
-
-### Ray reconstruction spoofing
-Exposes NVIDIA DLSS 3.5 Ray Reconstruction to supported titles on non-NVIDIA GPUs under Proton.
-
-### HDR pipeline fixes
-- RCAS highlight preservation: protects specular highlight peaks from clipping when applying RCAS sharpening on HDR displays.
-- Automatic HDR10 PQ color transfer detection: identifies HDR PQ curves and adjusts compute dispatch dimensions for output scaling.
-
-### Integrated OptiPatcher
-Bundles an upgraded OptiPatcher ASI plugin with a SIMD byte scanner. It includes generic Unreal Engine pattern detection plus external `patches.ini` support.
+---
 
 ## Installation
 
-Run the installer directly without cloning the repository:
+### One-Line Linux Installer
+
+Run the installer directly without cloning the repository. It downloads the latest CI release from GitHub, caches it in `~/.cache/gnu-upscaler/`, auto-discovers your Steam libraries (native & Flatpak), resolves nested binary folders (e.g., `*/Binaries/Win64`, `bin/x64`, `Client/WindowsNoEditor/HT/Binaries/Win64`), and can automatically inject `WINEDLLOVERRIDES` into Steam's `localconfig.vdf` (creating a `.bak` backup first).
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/not1cyyy/GNU-Upscaler/main/install.sh)
 ```
 
-Or pass options and a game path directly:
+Or pass flags and a game path directly:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/not1cyyy/GNU-Upscaler/main/install.sh) --fsr4 --fg "/path/to/game"
+# FSR 4 + Frame Generation with automatic Steam launch option injection
+bash <(curl -fsSL https://raw.githubusercontent.com/not1cyyy/GNU-Upscaler/main/install.sh) --fsr4 --fg --auto-steam "/path/to/game"
 ```
 
-Alternatively, clone the repository and run `install.sh` locally:
+### Common Installer Recipes
 
 ```bash
-git clone https://github.com/not1cyyy/GNU-Upscaler.git
-cd GNU-Upscaler
-./install.sh "/path/to/game"
-```
+# Universal Frame Generation (OptiFG) for games without native FG toggles
+./install.sh --optifg "/path/to/Stellar Blade"
 
-The installer fetches the newest release archive from GitHub and caches it in `~/.cache/gnu-upscaler/`. It detects game binary folders like `Binaries/Win64` automatically, and can auto-discover installed Steam games when run without arguments.
-
-If you run `./install.sh` inside a game directory without arguments, it detects the current folder and prompts for confirmation.
-
-### Common installer options
-
-```bash
-# Configure for FSR 4 and frame generation
-./install.sh --fsr4 --fg "/path/to/game"
-
-# Universal frame generation for games without native FG options
-./install.sh --optifg "/path/to/game"
-
-# Enable XeFG multi-frame generation (2x, 3x, 4x, 6x, 10x) and GAQ Auto-DRS
+# XeFG 6x Multi-Frame Generation + GAQ Auto-DRS
 ./install.sh --xefg --mfg=6x --gaq "/path/to/game"
 
-# Use a different proxy DLL (default is dxgi.dll)
+# Fetch FSR 4 INT8 / FP8 extra model variants into custom/ (recommended, 'all', or tag filter)
+./install.sh --fsr4 --fetch-extras "/path/to/game"
+
+# Use an alternate proxy DLL (default: dxgi.dll)
 ./install.sh --proxy=version.dll "/path/to/game"
 
-# Re-download the latest build from GitHub
+# Force re-download of the latest CI build
 ./install.sh --update "/path/to/game"
 
-# Remove all installed files from the game
+# Cleanly remove GNU-Upscaler and Steam launch overrides from a game
 ./install.sh --uninstall "/path/to/game"
 ```
 
-### Steam launch option
+<details>
+<summary><b>All <code>install.sh</code> CLI Flags &amp; Supported Proxy DLLs</b></summary>
 
-When using `dxgi.dll` or another proxy under Proton, set the DLL override in Steam game properties:
+| Flag | Description |
+| :--- | :--- |
+| `--proxy=<name>` | Proxy DLL name: `dxgi.dll` (default), `winmm.dll`, `version.dll`, `d3d12.dll`, `dbghelp.dll`, `wininet.dll`, `winhttp.dll` |
+| `--fsr4` / `--fsr3` / `--xess` / `--dlss` | Pre-configure `OptiScaler.ini` upscaler backend across DX12, DX11, and Vulkan |
+| `--fg` | Enable Frame Generation (`FGOutput=auto`, `FGInput=auto`) |
+| `--optifg` | Enable universal upscaler-driven Frame Generation (`FGInput=upscaler`, `HUDFix=true`) |
+| `--xefg` | Set Frame Generation output to Intel XeFG |
+| `--mfg=<mult>` | Enable XeFG Multi-Frame Generation (`2x`, `3x`, `4x`, `6x`, `10x`) |
+| `--gaq` | Enable GNU Adaptive Quality (`[GAQ] Enabled=true`) |
+| `--fetch-extras[=filter]` | Download FSR 4 INT8 & FP8 variants from `Optiscaler-Client` into `custom/` (`recommended`, `all`, or tag substring) |
+| `--auto-steam` | Automatically inject `WINEDLLOVERRIDES` into Steam `localconfig.vdf` (with `.bak` backup) |
+| `-u`, `--update` | Force re-check and download of the latest GitHub release |
+| `--uninstall` | Remove proxy DLLs, companion DLLs, `OptiPatcher.asi`, and Steam launch overrides |
+
+</details>
+
+### Steam Launch Option
+
+If you don't use `--auto-steam` (or decline the interactive prompt), add the DLL override in Steam game properties:
 
 ```text
 WINEDLLOVERRIDES="dxgi=n,b" %command%
 ```
 
-Replace `dxgi` with the proxy name if you selected `version.dll` or `winmm.dll`.
+> **Tip:** Replace `dxgi` if you chose another proxy (e.g. `version=n,b`). For lowest frame-pacing jitter under Proton, avoid stacking external limiters like `DXVK_FRAME_RATE` or MangoHud `fps_limit` on top of GNU-Upscaler's pacer, and consider `PROTON_USE_NTSYNC=1`.
 
-## Frame generation architecture
+---
 
-OptiScaler supports two primary routes on Linux:
+## Core Features
 
-1. Games with in-game DLSS frame generation:
-   Turn on Frame Generation in the game settings. OptiScaler intercepts the stream through its Streamline hook and outputs interpolated frames through FSR FG (`amd_fidelityfx_framegeneration_dx12.dll`) or XeFG (`libxess_fg.dll`).
-2. Games without native frame generation options:
-   Install with `--optifg` (or set `FGInput=upscaler` and `HUDFix=true` in `OptiScaler.ini`). This generates interpolated frames directly from the upscaler pass.
+### Multi-Frame Generation up to 10x & Adaptive Dynamic FG
 
-## GNU Adaptive Quality (GAQ Auto-DRS)
+- **Universal 10x XeFG Unlock (`XeFG_Unlock.h`)**: Upstream Intel XeFG caps interpolation at 4x and restricts it to Intel Arc GPUs. GNU-Upscaler dynamically scans `libxess_fg.dll` in memory using AOB patterns and unlocks **`2x`, `3x`, `4x`, `6x`, and `10x`** (`InterpolationCount` `1` through `9`) on AMD, Intel, and NVIDIA GPUs—no external ASI loader required.
+- **3x+ Swapchain & Sub-Frame Stagger**: Automatically scales VKD3D swapchain `minImageCount` for 3x+ XeFG, uses an open-loop Virtual VSync clock / DXGI stagger (`FramerateLimitFgSubframeMode`), and bounds DXGI latency waitable waits (`PaceOnSwapchain=true`, `MaxWaitMs=2`).
+- **Shared Dynamic Frame Generation (`FG_DynamicController`)**:
+  - Works across **XeFG** (`DynamicMFG`), **FSR-FG** (DX12 & Vulkan), and **DLSS-G** (`DynamicFG`).
+  - Modulates between multipliers and `2X <-> 1X` passthrough with hysteresis around `DynamicTargetFps` (or your refresh rate / FPS cap).
+  - **Latency Floor Guard (`MinBaseFps`, default `45.0`)**: Automatically drops Frame Generation down when native base rendering dips below your floor so controls never feel sluggish.
+  - **Camera Cut Detection**: Detects sharp camera transitions to reset interpolation history cleanly without smearing.
 
-GAQ monitors frametimes every frame and adjusts the upscaler internal resolution to hit your target framerate.
+---
 
-To configure GAQ in `OptiScaler.ini`:
+### GNU Adaptive Quality (GAQ Auto-DRS)
 
-```ini
-[GAQ]
-; Enable closed-loop PID dynamic resolution scaling
-Enabled=true
+A closed-loop **PID Dynamic Resolution Scaling** engine (`GaqController.h`) that works with **every upscaler input** even when the game has no native DRS:
 
-; Target framerate
-TargetFps=60.0
+- **GPU-Timestamp & Sleep-Aware**: Reads actual active GPU/present frametimes (ignoring limiter/VSync sleep) and adjusts render scale in smooth `0.05` steps (`dwellMs = 500ms`) between `MinRatio` and `MaxRatio`.
+- **CPU-Bound Detection**: Automatically detects when the game is CPU-bottlenecked (`gaqCpuBound`) so it stops needlessly lowering resolution when GPU headroom isn't the problem.
+- **MotionBoost (`MotionBoost = 0.20`)**: Temporarily increases the upscale ratio during rapid camera/mouse turns—where extra pixels are hardest to notice—and smoothly recovers quality when the camera settles.
 
-; Render scale range (1.0 = native, 1.5 = Quality, 2.0 = Performance, 3.0 = Ultra Performance)
-MinRatio=1.0
-MaxRatio=2.5
-```
+---
 
-## OptiPatcher
+### Frame Pacing, Latency & Vulkan Parity
 
-Many games check your GPU vendor ID on startup and hide DLSS or Frame Generation toggles if an NVIDIA card is absent.
+GNU-Upscaler replaces coarse Wine/Windows timer sleeps with a precision frame-pacing stack across **DX12** and **Vulkan**:
 
-Standard OptiScaler uses DXGI spoofing to pretend the GPU is NVIDIA (`0x10DE`). On Linux, spoofing often causes Unreal Engine titles to crash with `D3D12 not supported` or forces games down NVIDIA-specific shader paths that reduce performance on Mesa and RADV.
+- **Three Limiter Modes (`FramerateLimitMode`)**:
+  - `0` — **Front-Edge JIT** *(default)*: Sleeps post-present minus measured CPU work lead, then trims pre-present.
+  - `1` — **Front-Edge Sync**: RTSS-style pre-present wait aligned to VBlank/compositor phase (`FramerateLimitSyncMarginMs = 0.6ms`).
+  - `2` — **Back-Edge**: Drift-free post-present sleep.
+- **Vulkan Presentation & Sync (`VulkanFrameSync`)**:
+  - Supports **`VK_EXT_present_timing`** with adaptive spin-tail pacing.
+  - Schedules `desiredPresentTime` via **`VK_GOOGLE_display_timing`** when clock offsets are calibrated.
+  - Enforces in-flight present caps via **`VK_KHR_present_wait`** (`FramerateLimitMaxInFlight`, bypassed cleanly during active FG).
+  - Calibrated **GPU completion sync** (`FramerateLimitGpuSync`) and **MMCSS thread priority boost** (`FramerateLimitPriorityBoost`).
+- **Full Vulkan Shader Parity**: Precompiled SPIR-V compute pipelines for Auto Exposure (`AE_Vk`), Bias (`Bias_Vk`), HUDless Compare Compute (`HCC_Shader_Vk`), Format Transfer, Output Scaling, and RCAS.
+- **Low-Latency Ecosystem**: Integrates **NVIDIA Reflex**, **AMD Anti-Lag 2** (DX12) & **Anti-Lag VK**, **Intel XeLL** (`libxell.dll` with `xefg_xell` FPS cap sync), and **LatencyFleX**.
 
-GNU-Upscaler bundles OptiPatcher as an ASI plugin (`plugins/OptiPatcher.asi`). Instead of spoofing your hardware, it patches the vendor check in memory on launch so the game exposes DLSS and Frame Generation toggles while continuing to run native AMD or Intel driver paths.
+---
 
-Features:
-- Built-in signatures for known titles.
-- Generic pattern scanner that identifies and patches unlisted Unreal Engine binaries.
-- Optional `patches.ini` support in the plugins folder for custom game offsets without recompilation.
+### FSR 4 Model Management & Auto-Step-Down
 
-## Recommended game engine tweaks
+- **Multi-Model Selection (`Fsr4Model`)**: Supports `FP8`, `INT8`, `INT8 RDNA2`, and `INT8 Lite` providers (including custom INT8/FP8 builds fetched via `--fetch-extras`).
+- **GPU Time Budget (`Fsr4MaxGpuMs`)**: Set a millisecond budget for the FSR 4 upscaling pass (e.g. `2.5` ms). If FSR 4 exceeds the budget, GNU-Upscaler automatically steps down to a lighter FSR 4 preset/model and steps back up when headroom returns.
 
-### Unreal Engine games
+---
 
-Unreal Engine games occasionally dilate motion vectors before sending them to upscalers, causing ghosting with XeFG or Output Scaling. To disable dilation, add the following lines to the game's `Engine.ini`:
+### Zero-Copy HUDFix, DX12 & HDR Pipeline
 
-```ini
-[SystemSettings]
-r.NGX.DLSS.DilateMotionVectors=0
-r.Streamline.DilateMotionVectors=0
-```
+- **`ZeroCopyHudless`**: Passes matching-format, swapchain-sized HUDless render targets directly to Frame Generation without a full-screen GPU copy.
+- **`HudCopyTileSkip`** *(default `true`)*: Uses a 16×16 super-tile GPU activity mask in `HudCopy` to skip static non-HUD screen regions and identical-pixel writes.
+- **`PackedBuffers`** *(default `true`)*: Allocates 32-bit `DXGI_FORMAT_R11G11B10_FLOAT` intermediate buffers instead of 64-bit `RGBA16F` when alpha isn't needed.
+- **`CmdListFastPath` & `UseShards`**: Lock-free fast bypass for D3D12 command list hooks when tracking is inactive, plus sharded mutexes for multithreaded resource tracking.
+- **XeFG HUD Mask Support & Ray Reconstruction Spoofing**: Isolates HUD masks inside XeFG to eliminate UI ghosting at 6x/10x, and exposes DLSS 3.5 Ray Reconstruction on non-NVIDIA GPUs.
+- **VKD3D-Proton & HDR Fixes**:
+  - Resolves Unreal Engine `SetColorSpace1` crashes by configuring 10-bit `DXGI_FORMAT_R10G10B10A2_UNORM` swapchains.
+  - Auto-detects **HDR10 PQ** color transfer curves and fixes output scaling compute dispatch dimensions.
+  - **RCAS Highlight Preservation**: Prevents specular highlight clipping on HDR displays.
+  - **Auto-Detect Inverted Depth**: Inspects projection matrices at runtime to detect inverted Z-buffers.
 
-If a game crashes when using FSR2 inputs in DX12 mode, add:
+---
 
-```ini
-[SystemSettings]
-r.FidelityFX.FSR2.UseNativeDX12=1
-```
+### OptiPatcher & Game-Specific Linux Fixes
 
-## Manual configuration
+Many games hide DLSS, Reflex, or Frame Generation toggles when an NVIDIA GPU isn't detected. Traditional DXGI spoofing (`0x10DE`) often crashes Unreal Engine under Proton (`D3D12 not supported`) or forces slow NVIDIA-specific shader paths on Mesa/RADV.
 
-The installer creates `OptiScaler.ini` in the game folder next to the proxy DLL. Key settings:
+**OptiPatcher** (`plugins/OptiPatcher.asi`) patches vendor checks directly in memory so games stay on native AMD/Intel driver paths:
+
+- **SIMD Pattern Scanner**: Uses hardware-accelerated `memchr` (AVX2/SSE2) scanning across executable sections.
+- **Generic Unreal Engine Scanner**: Automatically unlocks unlisted UE4/UE5 titles.
+- **External `patches.ini`**: Add custom AOB offsets in `plugins/patches.ini` without recompiling.
+- **Ratchet & Clank: Rift Apart (Nixxes) Linux Fix**: Unlocks both DLSS and Reflex vendor checks (supporting legacy and `v1.727.0.0+` binaries) **and** bypasses Nixxes' `WINELOADER` environment check that otherwise disables Streamline under Wine/Proton.
+
+---
+
+### Anti-Cheat Safety Guard
+
+Monitors running processes for active anti-cheat runtimes (such as Easy Anti-Cheat). If a protected multiplayer session is detected, GNU-Upscaler aborts DLL hooks to prevent account penalties.
+
+---
+
+## In-Game Overlay (`GnuUi`) & Hotkeys
+
+GNU-Upscaler features a redesigned, scalable ImGui overlay (`GnuUi`) with filled-track sliders, segmented toggles, inline hover advice, and 6 organized tabs:
+
+1. **Quick Start** — Live **Pipeline Status** (upscaler, scale factor, active FG multiplier, Reflex markers), **One-Click Presets** (`Quality`, `Balanced`, `Performance`, `Battery Saver`, `Native AA`), and Quick Controls.
+2. **Upscaling** — Backend selection, FSR 4 model/budget, upscale ratio, output scaling, and input settings.
+3. **Frame Gen** — Output backend (FSR-FG / XeFG / DLSS-G), Multi-Frame Gen multiplier (`2x`–`10x`), Dynamic FG, Frame Limiter mode, Low Latency, and VSync.
+4. **Image** — Sharpness (RCAS), API & texture tweaks, init flags, and magnifier.
+5. **Interface** — Performance/FPS telemetry overlay, keybinds, UI scale, and themes.
+6. **Advanced** — Game quirks, DX12/Vulkan engine tweaks, and logging.
+
+| Default Key | Action |
+| :--- | :--- |
+| **`Insert`** | Open / close the GNU-Upscaler overlay |
+| **`End`** | Quick-toggle Frame Generation |
+| **`Page Up`** | Toggle FPS & frametime telemetry HUD |
+| **`Page Down`** | Cycle FPS telemetry overlay detail |
+
+---
+
+## Configuration Reference (`OptiScaler.ini`)
+
+`install.sh` generates `OptiScaler.ini` next to your proxy DLL and preserves it on updates. Key GNU-Upscaler sections:
 
 ```ini
 [Upscalers]
@@ -187,36 +242,83 @@ Dx12Upscaler=auto
 [FSR]
 ; auto (FSR 4 on supported GPUs), 1 (forces FSR 3.1)
 UpscalerIndex=auto
+; 0=FP8, 1=INT8, 2=INT8 RDNA2, 3=INT8 Lite
+Fsr4Model=auto
+; GPU time budget in ms before auto-stepping down FSR 4 model/preset (0 = disabled)
+Fsr4MaxGpuMs=auto
 
 [FrameGen]
-; true or false
 Enabled=true
 ; auto, fsrfg, xefg, dlssg
 FGOutput=auto
 ; auto, dlssg (Streamline), upscaler (OptiFG), fsrfg
 FGInput=auto
+; Dynamic FG 2X <-> 1X modulation for FSR-FG & DLSS-G
+DynamicFG=auto
+DynamicTargetFps=auto
+MinBaseFps=45.0
 
 [XeFG]
-; 1 = 2x, 2 = 3x, 3 = 4x, 5 = 6x, 9 = 10x
+; 1=2x, 2=3x, 3=4x, 5=6x, 9=10x
 InterpolationCount=auto
-; Automatically adjust generation multiplier based on load
 DynamicMFG=false
+PaceOnSwapchain=true
+MaxWaitMs=2
+
+[Framerate]
+FramerateLimit=auto
+; 0=Front-Edge JIT, 1=Front-Edge Sync (VBlank PLL), 2=Back-Edge
+FramerateLimitMode=0
+; 0=Off, 1=Auto GPU flush, 2=Strict RTSS SyncFlush
+FramerateLimitGpuSync=1
+FramerateLimitFgSubframeMode=1
 
 [GAQ]
-; Closed-loop PID Dynamic Resolution Scaling
 Enabled=false
 TargetFps=60.0
 MinRatio=1.0
 MaxRatio=2.5
+MotionBoost=0.20
+
+[DX12]
+PackedBuffers=true
+CmdListFastPath=true
+
+[HUDFix]
+ZeroCopyHudless=false
+HudCopyTileSkip=true
+UseShards=true
 
 [Plugins]
-; Loads OptiPatcher.asi from the plugins folder
 LoadAsiPlugins=true
 ```
 
-## Building from source
+---
 
-Automated builds run on Windows using Visual Studio 2022:
+## Recommended Game Engine Tweaks
+
+### Unreal Engine (`Engine.ini`)
+
+Unreal Engine titles sometimes dilate motion vectors before passing them to upscalers, which can cause ghosting with XeFG or Output Scaling. Disable dilation in the game's `Engine.ini`:
+
+```ini
+[SystemSettings]
+r.NGX.DLSS.DilateMotionVectors=0
+r.Streamline.DilateMotionVectors=0
+```
+
+If an Unreal Engine game crashes when using FSR2 inputs in DX12 mode, add:
+
+```ini
+[SystemSettings]
+r.FidelityFX.FSR2.UseNativeDX12=1
+```
+
+---
+
+## Building from Source
+
+Automated builds compile on Windows via GitHub Actions (`.github/workflows/build.yml`) using Visual Studio 2022 (`Release | x64`) and publish `GNU-Upscaler-latest.zip` to the `latest` release.
 
 ```cmd
 :: Build OptiScaler
@@ -228,4 +330,8 @@ cd ..\OptiPatcher
 msbuild /m /p:Configuration=Release /p:Platform=x64 OptiPatcher.sln
 ```
 
-Artifacts are packaged into `GNU-Upscaler-latest.zip` and published by the repository workflow.
+---
+
+<div align="center">
+  <sub>Built on <a href="https://github.com/cdozdil/OptiScaler">OptiScaler</a> • Tailored for Linux, Proton &amp; SteamOS</sub>
+</div>
