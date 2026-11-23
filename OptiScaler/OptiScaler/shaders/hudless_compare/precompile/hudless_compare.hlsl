@@ -1,14 +1,18 @@
-Texture2D gRefTex : register(t0); 
+Texture2D gRefTex : register(t0);
 Texture2D gBackCopyTex : register(t1);
 
-SamplerState gPointClamp : register(s0); 
+SamplerState gPointClamp : register(s0);
 
 cbuffer Params : register(b0)
 {
-    float DiffThreshold; 
-    float PinkAmount; 
-    float2 InvOutputSize; 
+    float DiffThreshold;
+    float PinkAmount;
+    float2 InvOutputSize;
+    uint HudlessEncodeMode;
+    uint PresentEncodeMode;
 };
+
+#include "../../ColorSpace.hlsli"
 
 struct VSOut
 {
@@ -30,13 +34,17 @@ float4 PSMain(VSOut i) : SV_Target
     float4 refC = gRefTex.Sample(gPointClamp, i.uv);
     float4 backC = gBackCopyTex.Sample(gPointClamp, i.uv);
 
-    float3 diff = abs(refC.rgb - backC.rgb);
-    float d = max(max(diff.r, diff.g), diff.b);
+    float3 refRgb = EncodeColor(refC.rgb, HudlessEncodeMode);
+    float3 backRgb = EncodeColor(backC.rgb, PresentEncodeMode);
+
+    float3 diff = abs(refRgb - backRgb);
+    float maxPeak = max(max(refRgb.r, max(refRgb.g, refRgb.b)), max(backRgb.r, max(backRgb.g, backRgb.b)));
+    float d = max(max(diff.r, diff.g), diff.b) / max(1.0f, maxPeak);
 
     // soft threshold
-    float m = smoothstep(DiffThreshold, DiffThreshold * 2.0, d);
+    float m = smoothstep(DiffThreshold, DiffThreshold * 2.0f, d);
 
-    const float3 pink = float3(1.0, 0.4, 0.6);
-    float3 outRgb = lerp(backC.rgb, pink, m * PinkAmount);
+    const float3 pink = float3(1.0f, 0.4f, 0.6f);
+    float3 outRgb = lerp(backRgb, pink, m * PinkAmount);
     return float4(outRgb, backC.a);
 }

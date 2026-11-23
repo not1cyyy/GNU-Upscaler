@@ -59,6 +59,17 @@ class Shader_Dx12
     bool InitHeaps(ID3D12Device* InDevice, FrameDescriptorHeap* pHeaps, size_t numOFHeaps);
 
   public:
+    static int GetFormatGroup(DXGI_FORMAT format);
+    static bool AreFormatsCompatible(DXGI_FORMAT formatA, DXGI_FORMAT formatB);
+    static bool IsTypelessFormat(DXGI_FORMAT format);
+    static bool IsSrgbFormat(DXGI_FORMAT format);
+    static DXGI_FORMAT StripSrgbFormat(DXGI_FORMAT format);
+    static bool IsLinearFloatFormat(DXGI_FORMAT format);
+    static bool IsHdrPQActive();
+    static ShaderColorSpace GetSrvColorSpace(DXGI_FORMAT srvFormat, bool hdrPQ);
+    static ShaderColorSpace GetTargetStorageColorSpace(DXGI_FORMAT logicalTargetFormat, bool hdrPQ);
+    static ShaderColorSpace GetRtvColorSpace(DXGI_FORMAT rtvFormat, bool hdrPQ);
+
     bool IsInit() const { return _init; }
     std::string Name() const { return _name; }
     std::optional<double> ReadGpuTime(ID3D12CommandQueue* commandQueue) { return GpuTime->ReadGpuTime(commandQueue); }

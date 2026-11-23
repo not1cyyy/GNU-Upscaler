@@ -64,10 +64,12 @@ bool HudCopy_Vk::DispatchShader(VkCommandBuffer InCmdList, const VkImageInfo& In
                                 size_t InParamsSize)
 {
     if (!_init || InCmdList == VK_NULL_HANDLE || InHudlessInfo.Image == VK_NULL_HANDLE ||
-        InPresentInfo.Image == VK_NULL_HANDLE)
+        InPresentInfo.Image == VK_NULL_HANDLE || InHudlessInfo.Width != InPresentInfo.Width ||
+        InHudlessInfo.Height != InPresentInfo.Height)
         return false;
 
-    if (!CreateImageResource(InPresentInfo.Width, InPresentInfo.Height, InPresentInfo.Format,
+    const VkFormat storageFormat = Shader_Vk::WithoutSrgb(InPresentInfo.Format);
+    if (!CreateImageResource(InPresentInfo.Width, InPresentInfo.Height, storageFormat,
                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
     {
         LOG_ERROR("[{0}] Failed to create or resize intermediate buffer", _name);

@@ -12,6 +12,11 @@
 class FT_Dx12 : public Shader_Dx12
 {
   private:
+    struct alignas(256) InternalFormatTransferParams
+    {
+        uint32_t EncodeMode = 0;
+    };
+
     FrameDescriptorHeap _frameHeaps[FT_NUM_OF_HEAPS];
 
     ID3D12Resource* _buffer = nullptr;

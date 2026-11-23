@@ -334,6 +334,7 @@ bool DLSSG_Vk::CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* 
     _slSwapchains.insert(*pSwapchain);
     _swapchain = *pSwapchain;
     _swapchainFormat = pCreateInfo->imageFormat;
+    _swapchainColorSpace = pCreateInfo->imageColorSpace;
     _swapchainExtent = pCreateInfo->imageExtent;
 
     return true;

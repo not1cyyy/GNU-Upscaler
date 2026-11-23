@@ -57,6 +57,7 @@ bool Reprojection_Vk::CreateSwapchain(VkDevice device, const VkSwapchainCreateIn
 
     _swapchain = swapchain;
     _swapchainFormat = pCreateInfo->imageFormat;
+    _swapchainColorSpace = pCreateInfo->imageColorSpace;
     _swapchainExtent = pCreateInfo->imageExtent;
     _canReproject = canReproject;
 

@@ -35,7 +35,7 @@ bool FT_Dx12::CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InSou
     if (InSource != nullptr)
     {
         auto inFormat = InSource->GetDesc().Format;
-        createFormat = format;
+        createFormat = StripSrgbFormat(format);
         LOG_INFO("Input Format: {}, Create Format: {}", magic_enum::enum_name(inFormat),
                  magic_enum::enum_name(createFormat));
     }
@@ -80,6 +80,21 @@ bool FT_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     CreateShaderResourceView(_device, InResource, currentHeap.GetSrvCPU(0));
     CreateUnorderedAccessView(_device, OutResource, currentHeap.GetUavCPU(0), 0);
 
+    const auto inDesc = InResource->GetDesc();
+    const auto srcSrvFormat = TranslateTypelessFormats(inDesc.Format);
+    const bool hdrPQ = IsHdrPQActive();
+    const auto srcSpace = GetSrvColorSpace(srcSrvFormat, hdrPQ);
+    const auto dstSpace = GetTargetStorageColorSpace(format, hdrPQ);
+
+    InternalFormatTransferParams constants {};
+    constants.EncodeMode = GetColorEncodeMode(srcSpace, dstSpace);
+
+    if (!CreateConstantsBuffer(_device, currentHeap, constants, currentHeap.GetCbvCPU(0)))
+    {
+        LOG_ERROR("[{0}] Failed to create a constants buffer", _name);
+        return false;
+    }
+
     ID3D12DescriptorHeap* heaps[] = { currentHeap.GetHeapCSU() };
     InCmdList->SetDescriptorHeaps(_countof(heaps), heaps);
 
@@ -111,7 +126,7 @@ FT_Dx12::FT_Dx12(std::string InName, ID3D12Device* InDevice, DXGI_FORMAT InForma
 
     LOG_DEBUG("{0} start!", _name);
 
-    if (!SetupRootSignature(InDevice, 1, 1, 0))
+    if (!SetupRootSignature(InDevice, 1, 1, 1))
     {
         LOG_ERROR("Failed to setup root signature");
         return;

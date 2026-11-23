@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SysUtils.h"
+#include "Shader_Common.h"
 #include <vulkan/vulkan.h>
 #include <gpu_time/GpuTime_Vk.h>
 #include <string>
@@ -95,6 +96,14 @@ class Shader_Vk
                         VkImageSubresourceRange subresourceRange);
 
   public:
+    static VkFormat WithoutSrgb(VkFormat format);
+    static VkFormat WithSrgb(VkFormat format);
+    static bool IsSrgbFormat(VkFormat format);
+    static bool IsLinearFloatFormat(VkFormat format);
+    static bool IsHdrPQActive();
+    static ShaderColorSpace GetSrvColorSpace(VkFormat format, bool hdrPQ);
+    static ShaderColorSpace GetTargetStorageColorSpace(VkFormat format, bool hdrPQ);
+
     bool IsInit() const { return _init; }
     bool CanRender() const { return _init && _pipeline != VK_NULL_HANDLE; }
     std::string Name() const { return _name; }

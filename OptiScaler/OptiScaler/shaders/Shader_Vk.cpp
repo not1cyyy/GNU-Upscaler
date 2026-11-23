@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "Shader_Vk.h"
 #include "Util.h"
+#include <State.h>
 #include <misc/DeferredRelease.h>
 
 Shader_Vk::Shader_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalDevice)
@@ -445,4 +446,78 @@ void Shader_Vk::CreateConstantBuffer(VkDeviceSize paramsSize)
     }
 
     vkMapMemory(_device, _constantBufferMemory, 0, bufferSize, 0, &_mappedConstantBuffer);
+}
+
+VkFormat Shader_Vk::WithoutSrgb(VkFormat format)
+{
+    switch (format)
+    {
+    case VK_FORMAT_R8G8B8A8_SRGB:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_SRGB:
+        return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+        return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    default:
+        return format;
+    }
+}
+
+VkFormat Shader_Vk::WithSrgb(VkFormat format)
+{
+    switch (format)
+    {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        return VK_FORMAT_R8G8B8A8_SRGB;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        return VK_FORMAT_B8G8R8A8_SRGB;
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+        return VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+    default:
+        return format;
+    }
+}
+
+bool Shader_Vk::IsSrgbFormat(VkFormat format) { return WithoutSrgb(format) != format; }
+
+bool Shader_Vk::IsLinearFloatFormat(VkFormat format)
+{
+    switch (format)
+    {
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R32G32B32_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool Shader_Vk::IsHdrPQActive()
+{
+    return State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+}
+
+ShaderColorSpace Shader_Vk::GetSrvColorSpace(VkFormat format, bool hdrPQ)
+{
+    if (IsSrgbFormat(format) || IsLinearFloatFormat(format))
+        return ShaderColorSpace::Linear;
+
+    if (hdrPQ && (format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10R10_UNORM_PACK32))
+        return ShaderColorSpace::PQ;
+
+    return ShaderColorSpace::SrgbEncoded;
+}
+
+ShaderColorSpace Shader_Vk::GetTargetStorageColorSpace(VkFormat format, bool hdrPQ)
+{
+    if (IsLinearFloatFormat(format))
+        return ShaderColorSpace::Linear;
+
+    if (hdrPQ && (format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || format == VK_FORMAT_A2R10G10R10_UNORM_PACK32))
+        return ShaderColorSpace::PQ;
+
+    return ShaderColorSpace::SrgbEncoded;
 }

@@ -32,6 +32,7 @@ class IFGFeature_Vk : public virtual IFGFeature
         VkImageView view = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkFormat format = VK_FORMAT_UNDEFINED;
+        VkFormat imageFormat = VK_FORMAT_UNDEFINED;
         uint32_t width = 0;
         uint32_t height = 0;
     };
@@ -52,7 +53,7 @@ class IFGFeature_Vk : public virtual IFGFeature
 
     // (Re)creates the image when the format or size changed
     bool CreateCopy(ImageCopy& copy, FG_ResourceType type, VkFormat format, uint32_t width, uint32_t height,
-                    VkImageUsageFlags usage);
+                    VkImageUsageFlags usage, VkFormat imageFormat = VK_FORMAT_UNDEFINED);
 
     // Flips the copied depth or velocity of Unity games into a storage image, points the resource to it
     bool FlipResource(VkCommandBuffer cmdBuffer, VkFGResource& resource, int fIndex);
@@ -78,6 +79,7 @@ class IFGFeature_Vk : public virtual IFGFeature
     // The swapchain handle the game got from the output
     VkSwapchainKHR _swapchain = VK_NULL_HANDLE;
     VkFormat _swapchainFormat = VK_FORMAT_UNDEFINED;
+    VkColorSpaceKHR _swapchainColorSpace = VK_COLOR_SPACE_MAX_ENUM_KHR;
     VkExtent2D _swapchainExtent {};
 
     UINT64 _fgFramePresentId = 0;

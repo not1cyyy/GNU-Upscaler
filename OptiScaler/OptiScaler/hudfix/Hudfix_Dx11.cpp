@@ -12,70 +12,6 @@
 
 namespace
 {
-int GetFormatGroup(DXGI_FORMAT format)
-{
-    switch (format)
-    {
-    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-    case DXGI_FORMAT_R32G32B32A32_FLOAT:
-    case DXGI_FORMAT_R32G32B32A32_UINT:
-    case DXGI_FORMAT_R32G32B32A32_SINT:
-        return 1;
-
-    case DXGI_FORMAT_R32G32B32_TYPELESS:
-    case DXGI_FORMAT_R32G32B32_FLOAT:
-    case DXGI_FORMAT_R32G32B32_UINT:
-    case DXGI_FORMAT_R32G32B32_SINT:
-        return 2;
-
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    case DXGI_FORMAT_R16G16B16A16_UNORM:
-    case DXGI_FORMAT_R16G16B16A16_UINT:
-    case DXGI_FORMAT_R16G16B16A16_SNORM:
-    case DXGI_FORMAT_R16G16B16A16_SINT:
-        return 3;
-
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-    case DXGI_FORMAT_R10G10B10A2_UINT:
-        return 4;
-
-    case DXGI_FORMAT_R11G11B10_FLOAT:
-        return 5;
-
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-    case DXGI_FORMAT_R8G8B8A8_UINT:
-    case DXGI_FORMAT_R8G8B8A8_SNORM:
-    case DXGI_FORMAT_R8G8B8A8_SINT:
-        return 6;
-
-    case DXGI_FORMAT_B5G6R5_UNORM:
-        return 7;
-
-    case DXGI_FORMAT_B5G5R5A1_UNORM:
-        return 8;
-
-    case DXGI_FORMAT_B8G8R8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-        return 9;
-
-    case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
-        return 10;
-
-    case DXGI_FORMAT_B8G8R8X8_UNORM:
-    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
-        return 11;
-
-    default:
-        return -1;
-    }
-}
-
 static DXGI_FORMAT GetDx12InteropFormat(DXGI_FORMAT format)
 {
     switch (format)
@@ -89,16 +25,6 @@ static DXGI_FORMAT GetDx12InteropFormat(DXGI_FORMAT format)
     default:
         return format;
     }
-}
-
-bool CompareResourceFormats(DXGI_FORMAT a, DXGI_FORMAT b)
-{
-    if (a == b)
-        return true;
-
-    const auto groupA = GetFormatGroup(a);
-    const auto groupB = GetFormatGroup(b);
-    return groupA >= 0 && groupA == groupB;
 }
 
 bool CaptureDescMatches(ID3D11Texture2D* texture, const D3D11_TEXTURE2D_DESC& wanted)
@@ -425,7 +351,7 @@ bool Hudfix_Dx11::CheckResource(Dx11ResourceInfo* resource)
         resource->extended = true;
     }
 
-    if (CompareResourceFormats(desc.Format, state.currentSwapchainDesc.BufferDesc.Format))
+    if (Shader_Dx12::AreFormatsCompatible(desc.Format, state.currentSwapchainDesc.BufferDesc.Format))
         return true;
 
     return Config::Instance()->FGHUDFixExtended.value_or_default();
@@ -556,7 +482,7 @@ bool Hudfix_Dx11::PublishCaptureToFg(ID3D11DeviceContext* context, Dx11ResourceI
     setResource.frameIndex = fg->GetIndexWillBeDispatched();
     setResource.flip = flip;
 
-    if (!CompareResourceFormats(source->format, state.currentSwapchainDesc.BufferDesc.Format))
+    if (!Shader_Dx12::AreFormatsCompatible(source->format, state.currentSwapchainDesc.BufferDesc.Format))
     {
         auto* device = WithDx12::GetD3D12Device();
         if (device == nullptr)

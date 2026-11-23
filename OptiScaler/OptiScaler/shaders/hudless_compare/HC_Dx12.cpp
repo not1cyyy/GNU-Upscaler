@@ -9,80 +9,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-inline static int GetFormatGroup(DXGI_FORMAT format)
-{
-    switch (format)
-    {
 
-    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-    case DXGI_FORMAT_R32G32B32A32_FLOAT:
-    case DXGI_FORMAT_R32G32B32A32_UINT:
-    case DXGI_FORMAT_R32G32B32A32_SINT:
-        return 1;
-
-    case DXGI_FORMAT_R32G32B32_TYPELESS:
-    case DXGI_FORMAT_R32G32B32_FLOAT:
-    case DXGI_FORMAT_R32G32B32_UINT:
-    case DXGI_FORMAT_R32G32B32_SINT:
-        return 2;
-
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    case DXGI_FORMAT_R16G16B16A16_UNORM:
-    case DXGI_FORMAT_R16G16B16A16_UINT:
-    case DXGI_FORMAT_R16G16B16A16_SNORM:
-    case DXGI_FORMAT_R16G16B16A16_SINT:
-        return 3;
-
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-    case DXGI_FORMAT_R10G10B10A2_UINT:
-        return 4;
-
-    case DXGI_FORMAT_R11G11B10_FLOAT:
-        return 5;
-
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-    case DXGI_FORMAT_R8G8B8A8_UINT:
-    case DXGI_FORMAT_R8G8B8A8_SNORM:
-    case DXGI_FORMAT_R8G8B8A8_SINT:
-        return 6;
-
-    case DXGI_FORMAT_B5G6R5_UNORM:
-        return 7;
-
-    case DXGI_FORMAT_B5G5R5A1_UNORM:
-        return 8;
-
-    case DXGI_FORMAT_B8G8R8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-        return 9;
-
-    case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
-        return 10;
-
-    case DXGI_FORMAT_B8G8R8X8_UNORM:
-    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
-        return 11;
-
-    default:
-        return -1;
-    }
-}
-
-inline static bool CompareResourceFormats(DXGI_FORMAT sc, DXGI_FORMAT hudless)
-{
-    if (sc == hudless)
-        return true;
-
-    auto scGroup = GetFormatGroup(sc);
-    auto hudlessGroup = GetFormatGroup(hudless);
-    return scGroup == hudlessGroup;
-}
 
 bool HC_Dx12::CreateBufferResource(UINT index, ID3D12Device* InDevice, ID3D12Resource* InSource,
                                    D3D12_RESOURCE_STATES InState)
@@ -264,19 +191,26 @@ bool HC_Dx12::Dispatch(IDXGISwapChain3* sc, ID3D12GraphicsCommandList* cmdList, 
 
     FrameDescriptorHeap& currentHeap = _frameHeaps[_counter];
 
-    // Create views
-    // Fix for typeless formats, e.g. R8G8B8A8_TYPELESS, which can be used for both SRGB and UNORM
-    if (CompareResourceFormats(scDesc.BufferDesc.Format, hudlessDesc.Format))
-        CreateShaderResourceView(_device, hudless, currentHeap.GetSrvCPU(0), scDesc.BufferDesc.Format);
-    else
-        CreateShaderResourceView(_device, hudless, currentHeap.GetSrvCPU(0));
+    // Create views; only cast typeless resources to avoid D3D12 concrete view-cast failures
+    const DXGI_FORMAT rtvFormat = TranslateTypelessFormats(scDesc.BufferDesc.Format);
+    const DXGI_FORMAT backCopySrvFormat = TranslateTypelessFormats(_buffer[_counter]->GetDesc().Format);
+    const bool castHudless =
+        IsTypelessFormat(hudlessDesc.Format) && AreFormatsCompatible(rtvFormat, hudlessDesc.Format);
+    const DXGI_FORMAT hudlessSrvFormat = castHudless ? rtvFormat : TranslateTypelessFormats(hudlessDesc.Format);
 
+    CreateShaderResourceView(_device, hudless, currentHeap.GetSrvCPU(0),
+                             castHudless ? rtvFormat : DXGI_FORMAT_UNKNOWN);
     CreateShaderResourceView(_device, _buffer[_counter], currentHeap.GetSrvCPU(1));
     CreateRenderTargetView(_device, scBuffer.Get(), currentHeap.GetRtvCPU(0), 0);
 
+    const bool hdrPQ = IsHdrPQActive();
+    const auto targetSpace = GetRtvColorSpace(rtvFormat, hdrPQ);
+
     InternalCompareParams constants {};
-    constants.DiffThreshold = 0.003f;
+    constants.DiffThreshold = GetUiCompareDiffThreshold();
     constants.PinkAmount = 0.6f;
+    constants.HudlessEncodeMode = GetColorEncodeMode(GetSrvColorSpace(hudlessSrvFormat, hdrPQ), targetSpace);
+    constants.PresentEncodeMode = GetColorEncodeMode(GetSrvColorSpace(backCopySrvFormat, hdrPQ), targetSpace);
 
     if (!CreateConstantsBuffer(_device, currentHeap, constants, currentHeap.GetCbvCPU(0)))
     {

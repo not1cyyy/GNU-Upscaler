@@ -71,6 +71,178 @@ DXGI_FORMAT Shader_Dx12::TranslateTypelessFormats(DXGI_FORMAT format)
     }
 }
 
+int Shader_Dx12::GetFormatGroup(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_SINT:
+        return 1;
+
+    case DXGI_FORMAT_R32G32B32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32_FLOAT:
+    case DXGI_FORMAT_R32G32B32_UINT:
+    case DXGI_FORMAT_R32G32B32_SINT:
+        return 2;
+
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
+        return 3;
+
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+        return 4;
+
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return 5;
+
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
+        return 6;
+
+    case DXGI_FORMAT_B5G6R5_UNORM:
+        return 7;
+
+    case DXGI_FORMAT_B5G5R5A1_UNORM:
+        return 8;
+
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return 9;
+
+    case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
+        return 10;
+
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return 11;
+
+    default:
+        return -1;
+    }
+}
+
+bool Shader_Dx12::AreFormatsCompatible(DXGI_FORMAT formatA, DXGI_FORMAT formatB)
+{
+    if (formatA == formatB)
+        return true;
+
+    const int groupA = GetFormatGroup(formatA);
+    const int groupB = GetFormatGroup(formatB);
+    return groupA >= 0 && groupA == groupB;
+}
+
+bool Shader_Dx12::IsTypelessFormat(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool Shader_Dx12::IsSrgbFormat(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+DXGI_FORMAT Shader_Dx12::StripSrgbFormat(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8X8_UNORM;
+    default:
+        return format;
+    }
+}
+
+bool Shader_Dx12::IsLinearFloatFormat(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool Shader_Dx12::IsHdrPQActive()
+{
+    return State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+}
+
+ShaderColorSpace Shader_Dx12::GetSrvColorSpace(DXGI_FORMAT srvFormat, bool hdrPQ)
+{
+    if (IsSrgbFormat(srvFormat) || IsLinearFloatFormat(srvFormat))
+        return ShaderColorSpace::Linear;
+
+    if (hdrPQ && (srvFormat == DXGI_FORMAT_R10G10B10A2_UNORM || srvFormat == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM))
+        return ShaderColorSpace::PQ;
+
+    return ShaderColorSpace::SrgbEncoded;
+}
+
+ShaderColorSpace Shader_Dx12::GetTargetStorageColorSpace(DXGI_FORMAT logicalTargetFormat, bool hdrPQ)
+{
+    // Compute UAVs cannot apply hardware sRGB encoding on store, so both _UNORM and _UNORM_SRGB targets
+    // expect sRGB-encoded values in SDR (or PQ in HDR10).
+    if (IsLinearFloatFormat(logicalTargetFormat))
+        return ShaderColorSpace::Linear;
+
+    if (hdrPQ &&
+        (logicalTargetFormat == DXGI_FORMAT_R10G10B10A2_UNORM ||
+         logicalTargetFormat == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
+         logicalTargetFormat == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM))
+        return ShaderColorSpace::PQ;
+
+    return ShaderColorSpace::SrgbEncoded;
+}
+
+ShaderColorSpace Shader_Dx12::GetRtvColorSpace(DXGI_FORMAT rtvFormat, bool hdrPQ)
+{
+    // Render target views DO perform hardware Linear->sRGB encoding when bound with _UNORM_SRGB.
+    return GetSrvColorSpace(rtvFormat, hdrPQ);
+}
+
 bool Shader_Dx12::CreateComputeShader(ID3D12Device* device, ID3D12RootSignature* rootSignature,
                                       ID3D12PipelineState** pipelineState, ID3DBlob* shaderBlob,
                                       D3D12_SHADER_BYTECODE byteCode)

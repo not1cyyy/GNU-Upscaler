@@ -8,20 +8,7 @@
 #include <magic_enum.hpp>
 #include <bit>
 
-VkFormat IFGFeature_Vk::WithoutSrgb(VkFormat format)
-{
-    switch (format)
-    {
-    case VK_FORMAT_R8G8B8A8_SRGB:
-        return VK_FORMAT_R8G8B8A8_UNORM;
-    case VK_FORMAT_B8G8R8A8_SRGB:
-        return VK_FORMAT_B8G8R8A8_UNORM;
-    case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
-        return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
-    default:
-        return format;
-    }
-}
+VkFormat IFGFeature_Vk::WithoutSrgb(VkFormat format) { return Shader_Vk::WithoutSrgb(format); }
 
 static VkFormat VelocityFormat(VkFormat format)
 {
@@ -231,16 +218,20 @@ const IFGFeature_Vk::ImageCopy* IFGFeature_Vk::OwnCopy(const VkFGResource& resou
 }
 
 bool IFGFeature_Vk::CreateCopy(ImageCopy& copy, FG_ResourceType type, VkFormat format, uint32_t width, uint32_t height,
-                               VkImageUsageFlags usage)
+                               VkImageUsageFlags usage, VkFormat imageFormat)
 {
-    if (copy.format == format && copy.width == width && copy.height == height)
+    const VkFormat actualImageFormat = (imageFormat != VK_FORMAT_UNDEFINED) ? imageFormat : format;
+
+    if (copy.format == format && copy.imageFormat == actualImageFormat && copy.width == width && copy.height == height)
         return true;
 
     DestroyCopy(copy);
 
     VkImageCreateInfo imageInfo { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = format;
+    imageInfo.format = actualImageFormat;
+    if (actualImageFormat != format)
+        imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     imageInfo.extent = { width, height, 1 };
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
@@ -303,6 +294,7 @@ bool IFGFeature_Vk::CreateCopy(ImageCopy& copy, FG_ResourceType type, VkFormat f
     }
 
     copy.format = format;
+    copy.imageFormat = actualImageFormat;
     copy.width = width;
     copy.height = height;
 
@@ -314,8 +306,27 @@ bool IFGFeature_Vk::CreateCopy(ImageCopy& copy, FG_ResourceType type, VkFormat f
 
 bool IFGFeature_Vk::CopyImage(VkCommandBuffer cmdBuffer, VkFGResource& resource, ImageCopy& copy, VkFormat format)
 {
+    const bool needsSrgbBlitEncode =
+        Shader_Vk::WithoutSrgb(format) != Shader_Vk::WithoutSrgb(resource.format) &&
+        Shader_Vk::IsLinearFloatFormat(resource.format) && Shader_Vk::WithSrgb(format) != format &&
+        !Shader_Vk::IsHdrPQActive() && _swapchainColorSpace != VK_COLOR_SPACE_HDR10_ST2084_EXT;
+
+    VkFormat targetImageFormat = format;
+    if (needsSrgbBlitEncode)
+    {
+        const VkFormat srgbFormat = Shader_Vk::WithSrgb(format);
+        VkFormatProperties props {};
+        vkGetPhysicalDeviceFormatProperties(_physicalDevice, srgbFormat, &props);
+        if ((props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) &&
+            (props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+        {
+            targetImageFormat = srgbFormat;
+        }
+    }
+
     if (!CreateCopy(copy, resource.type, format, resource.imageWidth, resource.imageHeight,
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT))
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    targetImageFormat))
     {
         return false;
     }
@@ -325,7 +336,8 @@ bool IFGFeature_Vk::CopyImage(VkCommandBuffer cmdBuffer, VkFGResource& resource,
     // The copy reads mip 0 of layer 0, the resource's layout is the one of that view
     ImageBarrier(cmdBuffer, resource.image, resource.format, resource.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                  true);
-    ImageBarrier(cmdBuffer, copy.image, copy.format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    ImageBarrier(cmdBuffer, copy.image, copy.imageFormat, VK_IMAGE_LAYOUT_UNDEFINED,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
     // A blit would decode/encode sRGB, a copy keeps the stored values as they are
     if (WithoutSrgb(format) == WithoutSrgb(resource.format))

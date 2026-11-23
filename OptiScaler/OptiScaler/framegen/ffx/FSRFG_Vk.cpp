@@ -320,6 +320,7 @@ bool FSRFG_Vk::CreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKHR* 
     _surface = pCreateInfo->surface;
     _swapchainAllocator = pAllocator;
     _swapchainFormat = pCreateInfo->imageFormat;
+    _swapchainColorSpace = pCreateInfo->imageColorSpace;
     _swapchainExtent = pCreateInfo->imageExtent;
     *pSwapchain = _swapchain;
 
@@ -444,6 +445,8 @@ void FSRFG_Vk::ReleaseSwapchainContext()
 
     _presentViews.clear();
     _swapchain = VK_NULL_HANDLE;
+    _swapchainFormat = VK_FORMAT_UNDEFINED;
+    _swapchainColorSpace = VK_COLOR_SPACE_MAX_ENUM_KHR;
     _surface = VK_NULL_HANDLE;
     _functions = {};
 }
@@ -1069,7 +1072,8 @@ void FSRFG_Vk::DispatchHudShaders(ffxDispatchDescFrameGeneration* params)
             _hudlessCompare = std::make_unique<HCC_Vk>("HudlessCompare", _device, _physicalDevice);
 
         if (_hudlessCompare->IsInit())
-            _hudlessCompare->Dispatch(cmdBuffer, hudlessInfo, hudlessLayout, presentInfo, presentLayout);
+            _hudlessCompare->Dispatch(cmdBuffer, hudlessInfo, hudlessLayout, presentInfo, presentLayout,
+                                      _swapchainColorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT);
     }
 }
 

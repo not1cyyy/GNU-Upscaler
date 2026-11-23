@@ -19,80 +19,7 @@ struct ScopedBoolFlag
 };
 } // namespace
 
-inline static int GetFormatGroup(DXGI_FORMAT format)
-{
-    switch (format)
-    {
 
-    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-    case DXGI_FORMAT_R32G32B32A32_FLOAT:
-    case DXGI_FORMAT_R32G32B32A32_UINT:
-    case DXGI_FORMAT_R32G32B32A32_SINT:
-        return 1;
-
-    case DXGI_FORMAT_R32G32B32_TYPELESS:
-    case DXGI_FORMAT_R32G32B32_FLOAT:
-    case DXGI_FORMAT_R32G32B32_UINT:
-    case DXGI_FORMAT_R32G32B32_SINT:
-        return 2;
-
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    case DXGI_FORMAT_R16G16B16A16_UNORM:
-    case DXGI_FORMAT_R16G16B16A16_UINT:
-    case DXGI_FORMAT_R16G16B16A16_SNORM:
-    case DXGI_FORMAT_R16G16B16A16_SINT:
-        return 3;
-
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-    case DXGI_FORMAT_R10G10B10A2_UINT:
-        return 4;
-
-    case DXGI_FORMAT_R11G11B10_FLOAT:
-        return 5;
-
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-    case DXGI_FORMAT_R8G8B8A8_UINT:
-    case DXGI_FORMAT_R8G8B8A8_SNORM:
-    case DXGI_FORMAT_R8G8B8A8_SINT:
-        return 6;
-
-    case DXGI_FORMAT_B5G6R5_UNORM:
-        return 7;
-
-    case DXGI_FORMAT_B5G5R5A1_UNORM:
-        return 8;
-
-    case DXGI_FORMAT_B8G8R8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-        return 9;
-
-    case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
-        return 10;
-
-    case DXGI_FORMAT_B8G8R8X8_UNORM:
-    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
-    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
-        return 11;
-
-    default:
-        return -1;
-    }
-}
-
-inline static bool CompareResourceFormats(DXGI_FORMAT sc, DXGI_FORMAT hudless)
-{
-    if (sc == hudless)
-        return true;
-
-    auto scGroup = GetFormatGroup(sc);
-    auto hudlessGroup = GetFormatGroup(hudless);
-    return scGroup >= 0 && scGroup == hudlessGroup;
-}
 
 void Hudfix_Dx12::RemoveCaptureBuffer(ID3D12Resource** resource)
 {
@@ -368,7 +295,7 @@ bool Hudfix_Dx12::CheckResource(ResourceInfo* resource)
     auto dispatcher = resource->captureInfo & 0xFF00;
 
     // format match
-    if (CompareResourceFormats(resDesc.Format, s.currentSwapchainDesc.BufferDesc.Format))
+    if (Shader_Dx12::AreFormatsCompatible(resDesc.Format, s.currentSwapchainDesc.BufferDesc.Format))
     {
         LOG_DEBUG("{}->{} Width: {}/{}, Height: {}/{}, Format: {}/{}, Resource: {:X}, convertFormat: {} -> TRUE",
                   GetSourceString(source), GetDispatchString(dispatcher), resDesc.Width, width, resDesc.Height, height,
@@ -731,7 +658,7 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
         auto scHeight = s.currentSwapchainDesc.BufferDesc.Height;
 
         const bool matchingFormat =
-            CompareResourceFormats(resource->format, s.currentSwapchainDesc.BufferDesc.Format);
+            Shader_Dx12::AreFormatsCompatible(resource->format, s.currentSwapchainDesc.BufferDesc.Format);
         const bool matchingSize = (resource->width == scWidth && resource->height == scHeight);
         // Zero-copy aliases the HUDless resource directly when format & dimensions match cleanly
         const bool zeroCopyHudless = Config::Instance()->FGZeroCopyHudless.value_or_default() &&
@@ -854,7 +781,7 @@ bool Hudfix_Dx12::CheckForHudless(ID3D12GraphicsCommandList* cmdList, ResourceIn
                 if (buffer != _formatTransfer[fIndex]->Buffer())
                     break;
 
-                auto fgCmdList = s.currentFG->GetUICommandList();
+                auto fgCmdList = fg->GetUICommandList(fg->GetIndexWillBeDispatched());
 
                 if (fgCmdList == nullptr)
                     break;

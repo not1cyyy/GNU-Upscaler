@@ -27,6 +27,13 @@ bool HCC_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* hudl
     if (!_init || _device == nullptr || hudless == nullptr || present == nullptr || cmdList == nullptr)
         return false;
 
+    const auto pDesc = present->GetDesc();
+    const auto hDesc = hudless->GetDesc();
+    if (hDesc.Width != pDesc.Width || hDesc.Height != pDesc.Height)
+        return false;
+
+    const DXGI_FORMAT bufferFormat = StripSrgbFormat(TranslateTypelessFormats(pDesc.Format));
+
     ScopedGpuTime_Dx12 scopedGpuTime(GpuTime.get(), cmdList);
 
     _counter++;
@@ -37,7 +44,8 @@ bool HCC_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* hudl
     auto previousBuffer = _buffer;
     auto resourceFlags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
 
-    if (!Shader_Dx12::CreateBufferResource(_device, present, D3D12_RESOURCE_STATE_COPY_DEST, &_buffer, resourceFlags))
+    if (!Shader_Dx12::CreateBufferResource(_device, present, D3D12_RESOURCE_STATE_COPY_DEST, &_buffer, resourceFlags, 0,
+                                           0, bufferFormat))
         return false;
 
     if (_buffer != previousBuffer)
@@ -53,16 +61,25 @@ bool HCC_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* hudl
 
     ResourceBarrier(cmdList, hudless, hudlessState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    // Create views
-    auto pDesc = present->GetDesc();
-    // Because of HudlessTransfer, the format of hudless is the same as present
-    CreateShaderResourceView(_device, hudless, currentHeap.GetSrvCPU(0), pDesc.Format);
+    // Create views; only cast typeless resources to avoid D3D12 concrete view-cast failures
+    const bool castHudless =
+        IsTypelessFormat(hDesc.Format) && AreFormatsCompatible(bufferFormat, hDesc.Format);
+    const DXGI_FORMAT hSrvFormat = castHudless ? bufferFormat : TranslateTypelessFormats(hDesc.Format);
+    const DXGI_FORMAT pSrvFormat = TranslateTypelessFormats(pDesc.Format);
+
+    CreateShaderResourceView(_device, hudless, currentHeap.GetSrvCPU(0),
+                             castHudless ? bufferFormat : DXGI_FORMAT_UNKNOWN);
     CreateShaderResourceView(_device, present, currentHeap.GetSrvCPU(1));
     CreateUnorderedAccessView(_device, _buffer, currentHeap.GetUavCPU(0), 0);
 
+    const bool hdrPQ = IsHdrPQActive();
+    const auto targetSpace = GetTargetStorageColorSpace(bufferFormat, hdrPQ);
+
     InternalCompareParams constants {};
-    constants.DiffThreshold = 0.003f;
+    constants.DiffThreshold = GetUiCompareDiffThreshold();
     constants.PinkAmount = 0.6f;
+    constants.HudlessEncodeMode = GetColorEncodeMode(GetSrvColorSpace(hSrvFormat, hdrPQ), targetSpace);
+    constants.PresentEncodeMode = GetColorEncodeMode(GetSrvColorSpace(pSrvFormat, hdrPQ), targetSpace);
 
     if (!CreateConstantsBuffer(_device, currentHeap, constants, currentHeap.GetCbvCPU(0)))
     {

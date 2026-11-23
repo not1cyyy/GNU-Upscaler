@@ -9,8 +9,10 @@ class HCC_Vk : public HudCopy_Vk
 {
     struct alignas(256) InternalCompareParams
     {
-        float DiffThreshold = 0.003f;
+        float DiffThreshold = 0.03f;
         float PinkAmount = 0.6f;
+        uint32_t HudlessEncodeMode = 0;
+        uint32_t PresentEncodeMode = 0;
     };
 
   public:
@@ -20,9 +22,16 @@ class HCC_Vk : public HudCopy_Vk
     }
 
     bool Dispatch(VkCommandBuffer InCmdList, const VkImageInfo& InHudlessInfo, VkImageLayout HudlessState,
-                  const VkImageInfo& InPresentInfo, VkImageLayout PresentState)
+                  const VkImageInfo& InPresentInfo, VkImageLayout PresentState, bool isHdrPQ = false)
     {
+        const bool hdrPQ = isHdrPQ || IsHdrPQActive();
+        const auto targetSpace = GetTargetStorageColorSpace(InPresentInfo.Format, hdrPQ);
+
         InternalCompareParams constants {};
+        constants.DiffThreshold = GetUiCompareDiffThreshold();
+        constants.PinkAmount = 0.6f;
+        constants.HudlessEncodeMode = GetColorEncodeMode(GetSrvColorSpace(InHudlessInfo.Format, hdrPQ), targetSpace);
+        constants.PresentEncodeMode = GetColorEncodeMode(GetSrvColorSpace(InPresentInfo.Format, hdrPQ), targetSpace);
         return DispatchShader(InCmdList, InHudlessInfo, HudlessState, InPresentInfo, PresentState, &constants,
                               sizeof(constants));
     }

@@ -15,8 +15,10 @@ class HCC_Dx12 : public Shader_Dx12
   private:
     struct alignas(256) InternalCompareParams
     {
-        float DiffThreshold = 0.02f;
-        float PinkAmount = 1.0f;
+        float DiffThreshold = 0.03f;
+        float PinkAmount = 0.6f;
+        uint32_t HudlessEncodeMode = 0;
+        uint32_t PresentEncodeMode = 0;
     };
 
     FrameDescriptorHeap _frameHeaps[HCC_NUM_OF_HEAPS];
