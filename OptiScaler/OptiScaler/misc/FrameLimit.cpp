@@ -26,6 +26,7 @@
 
 typedef NTSTATUS(NTAPI* PFN_NtDelayExecution)(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval);
 typedef NTSTATUS(NTAPI* PFN_NtSetTimerResolution)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+typedef NTSTATUS(NTAPI* PFN_NtWaitForSingleObject)(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 
 namespace
 {
@@ -119,6 +120,7 @@ struct VBlankPllState
     uint64_t refreshPeriodNs = 0;
     uint64_t scanoutPeriodNs = 0;
     uint64_t anchorQpcNs = 0;
+    uint64_t displayAnchorNs = 0;
     uint64_t lastWaitScanoutQpcNs = 0;
     uint64_t lastWaitSubmitQpcNs = 0;
     uint64_t lastDisplayTimingNs = 0;
@@ -156,6 +158,8 @@ std::mutex g_pacerMutex;
 struct PacerState
 {
     uint64_t nextTargetNs = 0;
+    uint64_t currentFrameTargetNs = 0;
+    uint64_t lastFrontEdgeNs = 0;
     uint64_t lastPresentFinishNs = 0;
     uint64_t lastWakeNs = 0;
     uint64_t lastIntervalNs = 0;
@@ -225,12 +229,36 @@ uint32_t ActiveSubframeMultiplier()
     return (mult >= minMult) ? mult : 0u;
 }
 
+HANDLE GetFgWakeEvent()
+{
+    static HANDLE s_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    return s_event;
+}
+
 void ResetFgSubframeLocked()
 {
     g_fgSub.nextTargetNs = 0;
     g_fgSub.lastOutputEdgeNs = 0;
     g_fgSub.activeMult = 0;
-    g_fgSubframeActive.store(false, std::memory_order_relaxed);
+    if (g_fgSubframeActive.exchange(false, std::memory_order_release))
+    {
+        if (HANDLE ev = GetFgWakeEvent())
+            SetEvent(ev);
+    }
+}
+
+void PushFrameTimeMs(std::array<float, 120>& ring, size_t& head, size_t& count, uint64_t prevNs, uint64_t curNs)
+{
+    if (prevNs == 0 || curNs <= prevNs)
+        return;
+
+    const float frameMs = static_cast<float>(curNs - prevNs) / 1e6f;
+    if (frameMs > 0.1f && frameMs < 1000.0f)
+    {
+        ring[head] = frameMs;
+        head = (head + 1) % ring.size();
+        count = std::min(count + 1, ring.size());
+    }
 }
 
 void CopyRingFrameTimes(const std::array<float, 120>& ring, size_t head, size_t count, float* outMs, int maxCount,
@@ -436,6 +464,8 @@ void UpdateCpuWorkEma(PacerState& pacer, uint64_t sampleNs, uint64_t intervalNs)
 void ResetPacer(PacerState& pacer)
 {
     pacer.nextTargetNs = 0;
+    pacer.currentFrameTargetNs = 0;
+    pacer.lastFrontEdgeNs = 0;
     pacer.lastPresentFinishNs = 0;
     pacer.lastWakeNs = 0;
     pacer.lastIntervalNs = 0;
@@ -486,13 +516,14 @@ void UpdateGamescopeDetectorLocked(uint64_t blockNs)
     const uint64_t sleptUs = g_lastSleepWholeUs.load(std::memory_order_relaxed);
     const uint64_t intervalNs = g_activeIntervalNs.load(std::memory_order_relaxed);
 
-    if (intervalNs > 0 && sleptUs < 400 && g_pll.gamescopeBlockEmaNs > 2'000'000.0)
+    if (intervalNs > 0 && g_pll.gamescopeBlockEmaNs > 2'000'000.0 &&
+        (sleptUs < 1500 || g_pll.gamescopeBlockEmaNs > 4'000'000.0))
     {
         g_pll.gamescopeExternalStreak = std::min(g_pll.gamescopeExternalStreak + 1, 32u);
         if (g_pll.gamescopeExternalStreak >= 10)
             g_gamescopeLimiterDetected.store(true, std::memory_order_relaxed);
     }
-    else if (g_pll.gamescopeBlockEmaNs < 1'000'000.0 || sleptUs > 1500)
+    else if (g_pll.gamescopeBlockEmaNs < 1'000'000.0 || (sleptUs > 1500 && g_pll.gamescopeBlockEmaNs < 3'000'000.0))
     {
         if (g_pll.gamescopeExternalStreak > 0)
             --g_pll.gamescopeExternalStreak;
@@ -500,15 +531,16 @@ void UpdateGamescopeDetectorLocked(uint64_t blockNs)
             g_gamescopeLimiterDetected.store(false, std::memory_order_relaxed);
     }
 }
+
 void UpdateTimerOvershootEma(int64_t requestedSleepNs, int64_t actualSleepNs, int64_t overshootReserve)
 {
-    if (actualSleepNs <= requestedSleepNs)
-        return;
-
-    const int64_t sampleOvershoot = std::clamp<int64_t>(actualSleepNs - requestedSleepNs, 0, 2'000'000);
+    const int64_t sampleOvershoot =
+        (actualSleepNs > requestedSleepNs)
+            ? std::clamp<int64_t>(actualSleepNs - requestedSleepNs, 0, 1'500'000)
+            : 0;
     int64_t ema = overshootReserve;
-    ema = (sampleOvershoot > ema) ? ((ema + sampleOvershoot) / 2) : ((ema * 19 + sampleOvershoot) / 20);
-    g_timerOvershootEmaNs.store(std::clamp<int64_t>(ema, 100'000, 1'200'000), std::memory_order_relaxed);
+    ema = (sampleOvershoot > ema) ? ((ema * 3 + sampleOvershoot) / 4) : ((ema * 19 + sampleOvershoot) / 20);
+    g_timerOvershootEmaNs.store(std::clamp<int64_t>(ema, 80'000, 750'000), std::memory_order_relaxed);
 }
 
 int SleepStaggerUntilNs(uint64_t deadlineNs, uint64_t startEpoch)
@@ -516,12 +548,20 @@ int SleepStaggerUntilNs(uint64_t deadlineNs, uint64_t startEpoch)
     int status = 0;
     auto shouldAbort = [&]() -> bool
     {
-        if (State::Instance().isShuttingDown || !g_fgSubframeActive.load(std::memory_order_relaxed))
+        if (State::Instance().isShuttingDown || !g_fgSubframeActive.load(std::memory_order_acquire))
             return true;
 
         const uint64_t curEpoch = g_fgEpoch.load(std::memory_order_acquire);
         return curEpoch >= startEpoch && (curEpoch - startEpoch) >= 2ULL;
     };
+
+    static PFN_NtWaitForSingleObject pfnNtWaitForSingleObject = []() -> PFN_NtWaitForSingleObject
+    {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        return hNtdll ? reinterpret_cast<PFN_NtWaitForSingleObject>(GetProcAddress(hNtdll, "NtWaitForSingleObject"))
+                      : nullptr;
+    }();
+    const HANDLE wakeEvent = GetFgWakeEvent();
 
     while (!shouldAbort())
     {
@@ -533,27 +573,141 @@ int SleepStaggerUntilNs(uint64_t deadlineNs, uint64_t startEpoch)
         const int64_t overshootReserve = g_timerOvershootEmaNs.load(std::memory_order_relaxed);
         const int64_t tailNs = kBusywaitThresholdNs + overshootReserve;
 
-        if (remaining <= tailNs)
+        if (remaining <= tailNs + 1'000)
         {
             while (Util::GetTimestamp() < deadlineNs && !shouldAbort())
                 FL_CPU_PAUSE();
             break;
         }
 
-        const int64_t requestedSleepNs = std::min<int64_t>(remaining - tailNs, 3'500'000);
-        const uint64_t timerStart = Util::GetTimestamp();
-        status = TimerSleep(requestedSleepNs / 100);
-        if (status != 0)
-            break;
-
-        if (!shouldAbort())
+        const int64_t requestedSleepNs = remaining - tailNs;
+        if (wakeEvent != nullptr && pfnNtWaitForSingleObject != nullptr)
         {
-            const int64_t actualSleepNs = static_cast<int64_t>(Util::GetTimestamp() - timerStart);
-            UpdateTimerOvershootEma(requestedSleepNs, actualSleepNs, overshootReserve);
+            ResetEvent(wakeEvent);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (shouldAbort())
+                break;
+
+            constexpr NTSTATUS kStatusTimeout = 0x00000102L;
+            LARGE_INTEGER dueTime;
+            dueTime.QuadPart = -(requestedSleepNs / 100);
+            const uint64_t timerStart = Util::GetTimestamp();
+            const NTSTATUS waitRes = pfnNtWaitForSingleObject(wakeEvent, FALSE, &dueTime);
+            if (waitRes == kStatusTimeout)
+            {
+                const int64_t actualSleepNs = static_cast<int64_t>(Util::GetTimestamp() - timerStart);
+                UpdateTimerOvershootEma(requestedSleepNs, actualSleepNs, overshootReserve);
+            }
+            else if (waitRes < 0)
+            {
+                status = 1;
+                break;
+            }
+        }
+        else
+        {
+            const int64_t chunkSleepNs = std::min<int64_t>(requestedSleepNs, 3'500'000);
+            const uint64_t timerStart = Util::GetTimestamp();
+            status = TimerSleep(chunkSleepNs / 100);
+            if (status != 0)
+                break;
+
+            if (!shouldAbort())
+            {
+                const int64_t actualSleepNs = static_cast<int64_t>(Util::GetTimestamp() - timerStart);
+                UpdateTimerOvershootEma(chunkSleepNs, actualSleepNs, overshootReserve);
+            }
         }
     }
 
     return status;
+}
+
+void UpdatePllPhaseLocked(uint64_t& anchorNs, uint64_t sampleNs, uint64_t periodNs)
+{
+    if (periodNs == 0 || sampleNs == 0)
+        return;
+
+    if (anchorNs == 0 || sampleNs < anchorNs || (sampleNs - anchorNs) > kPauseRebaseGapNs)
+    {
+        anchorNs = sampleNs;
+        g_pll.phaseResidualEmaNs = 0.0;
+        g_pll.stableSamples = 0;
+        return;
+    }
+
+    const int64_t err = SignedPhaseError(sampleNs, anchorNs, periodNs);
+    g_pll.phaseResidualEmaNs = 0.85 * g_pll.phaseResidualEmaNs + 0.15 * static_cast<double>(std::abs(err));
+
+    const int64_t step = err / 8;
+    if (step > 0)
+        anchorNs += static_cast<uint64_t>(step);
+    else if (step < 0 && static_cast<uint64_t>(-step) < anchorNs)
+        anchorNs -= static_cast<uint64_t>(-step);
+
+    if (std::abs(err) < 800'000)
+        g_pll.stableSamples = std::min(g_pll.stableSamples + 1, 64u);
+    else if (g_pll.stableSamples > 0)
+        --g_pll.stableSamples;
+}
+
+void UpdateMaxInFlightLocked(uint64_t dt, bool isVsyncMode)
+{
+    const uint64_t activeIntervalNs = g_activeIntervalNs.load(std::memory_order_relaxed);
+    if (Config::Instance()->FramerateLimitMaxInFlight.value_or_default() != 0 || activeIntervalNs == 0)
+        return;
+
+    if (dt > activeIntervalNs + (activeIntervalNs / 12))
+        g_pll.missedTargetStreak = std::min(g_pll.missedTargetStreak + 1, 16u);
+    else
+        g_pll.missedTargetStreak = 0;
+
+    if (isVsyncMode && g_pll.vblankLocked)
+    {
+        // Keep 2 in-flight on fixed-refresh VSync so backpressure never skips a VBlank
+        g_dynamicMaxInFlight.store(2, std::memory_order_relaxed);
+        g_pll.lowGpuStreak = 0;
+        return;
+    }
+
+    const bool headroomLow =
+        (g_pll.displayTimingActive && g_pll.lastPresentMarginNs > 0)
+            ? (g_pll.lastPresentMarginNs < activeIntervalNs / 5)
+            : (g_pll.gpuLatencyEmaNs > static_cast<double>(activeIntervalNs) * 0.72);
+    const bool headroomHigh =
+        (g_pll.displayTimingActive && g_pll.lastPresentMarginNs > 0)
+            ? (g_pll.lastPresentMarginNs > (activeIntervalNs * 2) / 5)
+            : (g_pll.gpuLatencyEmaNs > 0.0 &&
+               g_pll.gpuLatencyEmaNs < static_cast<double>(activeIntervalNs) * 0.55);
+
+    const int currentMax = g_dynamicMaxInFlight.load(std::memory_order_relaxed);
+    if (currentMax == 1)
+    {
+        if (headroomLow || g_pll.missedTargetStreak >= 2)
+        {
+            g_dynamicMaxInFlight.store(2, std::memory_order_relaxed);
+            g_pll.maxInFlightCooldown = 60;
+            g_pll.lowGpuStreak = 0;
+        }
+        return;
+    }
+
+    if (g_pll.maxInFlightCooldown > 0)
+    {
+        --g_pll.maxInFlightCooldown;
+    }
+    else if (headroomHigh && g_pll.missedTargetStreak == 0)
+    {
+        if (++g_pll.lowGpuStreak >= 24)
+        {
+            g_dynamicMaxInFlight.store(1, std::memory_order_relaxed);
+            g_pll.lowGpuStreak = 0;
+        }
+    }
+    else
+    {
+        g_pll.lowGpuStreak = 0;
+    }
 }
 } // namespace
 
@@ -671,13 +825,17 @@ void FrameLimit::onSimulationStart()
     }
 }
 
-void FrameLimit::onVulkanAcquire(uint64_t acquireDurationNs)
+void FrameLimit::onVulkanAcquire(uint64_t acquireDurationNs, bool dxgiBacked)
 {
     if (acquireDurationNs > 0 && State::Instance().isGamescopeActive)
     {
         std::scoped_lock lock(g_pllMutex);
         UpdateGamescopeDetectorLocked(acquireDurationNs);
     }
+
+    // For DXVK/VKD3D-Proton, vkAcquireNextImageKHR runs on the translation backend thread, not the game's simulation thread
+    if (dxgiBacked || hasRecentDxgiPresent())
+        return;
 
     if (!isLimitingActive() || currentMode() != Mode::FrontEdgeJit)
         return;
@@ -730,7 +888,12 @@ void FrameLimit::recordPresentDuration(uint64_t presentDurationNs)
 void FrameLimit::onFgGamePresentStart()
 {
     g_fgGameThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
-    g_fgEpoch.fetch_add(1ULL, std::memory_order_release);
+    g_fgEpoch.fetch_add(1ULL, std::memory_order_seq_cst);
+    if (g_fgSubframeActive.load(std::memory_order_acquire))
+    {
+        if (HANDLE ev = GetFgWakeEvent())
+            SetEvent(ev);
+    }
 }
 
 void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
@@ -759,7 +922,7 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
         return;
     }
 
-    g_fgSubframeActive.store(true, std::memory_order_relaxed);
+    g_fgSubframeActive.store(true, std::memory_order_release);
 
     const DWORD curTid = GetCurrentThreadId();
     const DWORD gameTid = g_fgGameThreadId.load(std::memory_order_relaxed);
@@ -775,10 +938,10 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
         std::scoped_lock lock(g_fgSubMutex);
         const uint64_t now = Util::GetTimestamp();
         const double capSubNs = std::clamp(1'000'000'000.0 / static_cast<double>(capFps), 100'000.0, 100'000'000.0);
-        // Fixed open-loop Virtual VSync tick slightly ahead of real frame rate (0.96 * T_cap) so queues drain
-        // cleanly without dtReal feedback or stalling o_FGSCPresent
+        // Fixed open-loop Virtual VSync tick slightly ahead of target frame rate (0.995 * T_cap) to prevent
+        // queue stalls without overshooting the FPS cap
         const uint64_t stepNs =
-            std::min<uint64_t>(static_cast<uint64_t>(std::llround(capSubNs * 0.96)), 50'000'000ULL);
+            std::min<uint64_t>(static_cast<uint64_t>(std::llround(capSubNs * 0.995)), 50'000'000ULL);
         g_fgSub.activeMult = mult;
 
         if (!hwVsync)
@@ -813,16 +976,8 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
     {
         std::scoped_lock lock(g_fgSubMutex);
         const uint64_t edgeNow = Util::GetTimestamp();
-        if (g_fgSub.lastOutputEdgeNs > 0 && edgeNow > g_fgSub.lastOutputEdgeNs)
-        {
-            const float frameMs = static_cast<float>(edgeNow - g_fgSub.lastOutputEdgeNs) / 1e6f;
-            if (frameMs > 0.1f && frameMs < 1000.0f)
-            {
-                g_fgSub.frameTimesMs[g_fgSub.frameTimeHead] = frameMs;
-                g_fgSub.frameTimeHead = (g_fgSub.frameTimeHead + 1) % g_fgSub.frameTimesMs.size();
-                g_fgSub.frameTimeCount = std::min(g_fgSub.frameTimeCount + 1, g_fgSub.frameTimesMs.size());
-            }
-        }
+        PushFrameTimeMs(g_fgSub.frameTimesMs, g_fgSub.frameTimeHead, g_fgSub.frameTimeCount, g_fgSub.lastOutputEdgeNs,
+                        edgeNow);
         g_fgSub.lastOutputEdgeNs = edgeNow;
     }
 }
@@ -929,9 +1084,10 @@ void FrameLimit::recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, u
         if (reportedRefreshNs >= kMinValidRefreshNs && reportedRefreshNs <= kMaxValidRefreshNs)
             g_pll.refreshPeriodNs = reportedRefreshNs;
 
+        uint64_t dt = 0;
         if (g_pll.lastDisplayTimingNs > 0 && scanoutNs > g_pll.lastDisplayTimingNs)
         {
-            const uint64_t dt = scanoutNs - g_pll.lastDisplayTimingNs;
+            dt = scanoutNs - g_pll.lastDisplayTimingNs;
             if (dt >= kMinValidRefreshNs && dt <= kMaxValidRefreshNs)
             {
                 g_pll.recentDeltas[g_pll.deltaWriteIdx] = dt;
@@ -950,6 +1106,19 @@ void FrameLimit::recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, u
             g_gamescopeScanoutPeriodNs.store(med, std::memory_order_relaxed);
         }
 
+        UpdatePllPhaseLocked(g_pll.displayAnchorNs, scanoutNs, g_pll.refreshPeriodNs);
+        if (g_pll.displayClockCalibrated && g_pll.displayAnchorNs > 0)
+        {
+            const int64_t anchorQpc = static_cast<int64_t>(g_pll.displayAnchorNs) - g_pll.qpcToDisplayOffsetNs;
+            if (anchorQpc > 0)
+                g_pll.anchorQpcNs = static_cast<uint64_t>(anchorQpc);
+        }
+
+        const bool fixedCadenceLikely = isVsyncMode || State::Instance().isGamescopeActive;
+        g_pll.vblankLocked = fixedCadenceLikely && g_pll.refreshPeriodNs > 0 && g_pll.stableSamples >= 8 &&
+                             g_pll.phaseResidualEmaNs < 1'000'000.0;
+
+        UpdateMaxInFlightLocked(dt, isVsyncMode);
         return;
     }
 
@@ -982,10 +1151,13 @@ void FrameLimit::recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, u
             g_pll.refreshPeriodNs = est;
     }
 
-    if (uint64_t med = EstimateMedianDelta(g_pll); med > 0)
+    if (!g_pll.displayTimingActive)
     {
-        g_pll.scanoutPeriodNs = med;
-        g_gamescopeScanoutPeriodNs.store(med, std::memory_order_relaxed);
+        if (uint64_t med = EstimateMedianDelta(g_pll); med > 0)
+        {
+            g_pll.scanoutPeriodNs = med;
+            g_gamescopeScanoutPeriodNs.store(med, std::memory_order_relaxed);
+        }
     }
 
     // Track whether present-to-scanout latency varies (VSync quantization) vs staying fixed (VRR/Immediate)
@@ -1005,97 +1177,19 @@ void FrameLimit::recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, u
         }
     }
 
-    const uint64_t period = g_pll.refreshPeriodNs;
-    if (period > 0)
+    if (!g_pll.displayTimingActive)
     {
-        if (g_pll.anchorQpcNs == 0 || scanoutNs < g_pll.anchorQpcNs ||
-            (scanoutNs - g_pll.anchorQpcNs) > kPauseRebaseGapNs)
-        {
-            g_pll.anchorQpcNs = scanoutNs;
-            g_pll.phaseResidualEmaNs = 0.0;
-            g_pll.stableSamples = 0;
-        }
-        else
-        {
-            const int64_t err = SignedPhaseError(scanoutNs, g_pll.anchorQpcNs, period);
-            g_pll.phaseResidualEmaNs = 0.85 * g_pll.phaseResidualEmaNs + 0.15 * static_cast<double>(std::abs(err));
+        const uint64_t period = g_pll.refreshPeriodNs;
+        UpdatePllPhaseLocked(g_pll.anchorQpcNs, scanoutNs, period);
 
-            const int64_t step = err / 8;
-            if (step > 0)
-                g_pll.anchorQpcNs += static_cast<uint64_t>(step);
-            else if (step < 0 && static_cast<uint64_t>(-step) < g_pll.anchorQpcNs)
-                g_pll.anchorQpcNs -= static_cast<uint64_t>(-step);
+        const bool fixedCadenceLikely = isVsyncMode || State::Instance().isGamescopeActive;
+        const bool varianceEvidence =
+            isVsyncMode || !State::Instance().isRunningOnLinux ||
+            (g_pll.vblankLocked ? (g_pll.latencyVarianceEmaNs > 50'000.0) : (g_pll.latencyVarianceEmaNs > 150'000.0));
+        g_pll.vblankLocked = fixedCadenceLikely && period > 0 && g_pll.stableSamples >= 8 &&
+                             g_pll.phaseResidualEmaNs < 1'000'000.0 && varianceEvidence;
 
-            if (std::abs(err) < 800'000)
-                g_pll.stableSamples = std::min(g_pll.stableSamples + 1, 64u);
-            else if (g_pll.stableSamples > 0)
-                --g_pll.stableSamples;
-        }
-    }
-
-    const bool fixedCadenceLikely = isVsyncMode || State::Instance().isGamescopeActive;
-    g_pll.vblankLocked = fixedCadenceLikely && period > 0 && g_pll.stableSamples >= 8 &&
-                         g_pll.phaseResidualEmaNs < 1'000'000.0 &&
-                         (g_pll.displayTimingActive || g_pll.latencyVarianceEmaNs > 150'000.0 ||
-                          !State::Instance().isRunningOnLinux);
-
-    // Dynamic GPU-load-aware MaxInFlight (1 <-> 2 switching when Auto)
-    const uint64_t activeIntervalNs = g_activeIntervalNs.load(std::memory_order_relaxed);
-    if (Config::Instance()->FramerateLimitMaxInFlight.value_or_default() == 0 && activeIntervalNs > 0)
-    {
-        if (dt > activeIntervalNs + (activeIntervalNs / 12))
-            g_pll.missedTargetStreak = std::min(g_pll.missedTargetStreak + 1, 16u);
-        else
-            g_pll.missedTargetStreak = 0;
-
-        if (isVsyncMode && g_pll.vblankLocked)
-        {
-            // Keep 2 in-flight on fixed-refresh VSync so backpressure never skips a VBlank
-            g_dynamicMaxInFlight.store(2, std::memory_order_relaxed);
-            g_pll.lowGpuStreak = 0;
-        }
-        else
-        {
-            const bool headroomLow =
-                (g_pll.displayTimingActive && g_pll.lastPresentMarginNs > 0)
-                    ? (g_pll.lastPresentMarginNs < activeIntervalNs / 5)
-                    : (g_pll.gpuLatencyEmaNs > static_cast<double>(activeIntervalNs) * 0.72);
-            const bool headroomHigh =
-                (g_pll.displayTimingActive && g_pll.lastPresentMarginNs > 0)
-                    ? (g_pll.lastPresentMarginNs > (activeIntervalNs * 2) / 5)
-                    : (g_pll.gpuLatencyEmaNs > 0.0 &&
-                       g_pll.gpuLatencyEmaNs < static_cast<double>(activeIntervalNs) * 0.55);
-
-            const int currentMax = g_dynamicMaxInFlight.load(std::memory_order_relaxed);
-            if (currentMax == 1)
-            {
-                if (headroomLow || g_pll.missedTargetStreak >= 2)
-                {
-                    g_dynamicMaxInFlight.store(2, std::memory_order_relaxed);
-                    g_pll.maxInFlightCooldown = 60;
-                    g_pll.lowGpuStreak = 0;
-                }
-            }
-            else
-            {
-                if (g_pll.maxInFlightCooldown > 0)
-                {
-                    --g_pll.maxInFlightCooldown;
-                }
-                else if (headroomHigh && g_pll.missedTargetStreak == 0)
-                {
-                    if (++g_pll.lowGpuStreak >= 24)
-                    {
-                        g_dynamicMaxInFlight.store(1, std::memory_order_relaxed);
-                        g_pll.lowGpuStreak = 0;
-                    }
-                }
-                else
-                {
-                    g_pll.lowGpuStreak = 0;
-                }
-            }
-        }
+        UpdateMaxInFlightLocked(dt, isVsyncMode);
     }
 
     g_pll.lastWaitScanoutQpcNs = scanoutNs;
@@ -1124,7 +1218,15 @@ void FrameLimit::calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanou
         g_pll.qpcToDisplayOffsetNs += err / 4;
         g_pll.offsetStableCount = std::min(g_pll.offsetStableCount + 1, 32u);
         if (g_pll.offsetStableCount >= 4)
+        {
             g_pll.displayClockCalibrated = true;
+            if (g_pll.displayAnchorNs > 0)
+            {
+                const int64_t anchorQpc = static_cast<int64_t>(g_pll.displayAnchorNs) - g_pll.qpcToDisplayOffsetNs;
+                if (anchorQpc > 0)
+                    g_pll.anchorQpcNs = static_cast<uint64_t>(anchorQpc);
+            }
+        }
     }
     else
     {
@@ -1135,7 +1237,7 @@ void FrameLimit::calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanou
     }
 }
 
-uint64_t FrameLimit::getDesiredDisplayTimeNs()
+uint64_t FrameLimit::getDesiredDisplayTimeNs(bool useActiveDxgiFrame)
 {
     if (!Config::Instance()->FramerateLimitDisplayTimingSchedule.value_or_default() || !isLimitingActive() ||
         currentMode() == Mode::BackEdge)
@@ -1156,8 +1258,9 @@ uint64_t FrameLimit::getDesiredDisplayTimeNs()
     std::scoped_lock pacerLock(g_pacerMutex);
     std::scoped_lock pllLock(g_pllMutex);
 
+    const uint64_t frameTargetQpc = useActiveDxgiFrame ? g_pacer.currentFrameTargetNs : g_pacer.nextTargetNs;
     if (!g_pll.displayTimingActive || !g_pll.displayClockCalibrated || !g_pll.vblankLocked ||
-        g_pacer.nextTargetNs == 0 || g_pll.lastDisplayTimingNs == 0)
+        frameTargetQpc == 0 || g_pll.lastDisplayTimingNs == 0)
     {
         g_pll.displayTimingScheduleActive = false;
         return 0;
@@ -1166,7 +1269,7 @@ uint64_t FrameLimit::getDesiredDisplayTimeNs()
     // Hold a 1.0ms safety cushion ahead of the deadline so wakeup jitter never misses a compositor VBlank
     constexpr uint64_t kScheduleCushionNs = 1'000'000ULL;
     const uint64_t targetQpc =
-        (g_pacer.nextTargetNs > kScheduleCushionNs) ? (g_pacer.nextTargetNs - kScheduleCushionNs) : g_pacer.nextTargetNs;
+        (frameTargetQpc > kScheduleCushionNs) ? (frameTargetQpc - kScheduleCushionNs) : frameTargetQpc;
 
     const int64_t converted = static_cast<int64_t>(targetQpc) + g_pll.qpcToDisplayOffsetNs;
     if (converted <= 0)
@@ -1284,10 +1387,13 @@ void FrameLimit::prePresent(bool fgActive)
         if (mode == static_cast<int>(Mode::BackEdge) || g_pacer.nextTargetNs == 0 || modeOrFgChanged ||
             intervalChanged || ShouldYieldToGamescopeLimiter(intervalNs))
         {
+            g_pacer.currentFrameTargetNs = 0;
+            g_pacer.lastFrontEdgeNs = 0;
             g_pacer.preSleptMs = 0.0;
             return;
         }
 
+        g_pacer.currentFrameTargetNs = g_pacer.nextTargetNs;
         if (g_pacer.nextTargetNs > now)
         {
             const uint64_t delta = g_pacer.nextTargetNs - now;
@@ -1296,6 +1402,7 @@ void FrameLimit::prePresent(bool fgActive)
         }
     }
 
+    double preSleptMs = 0.0;
     if (sleepNs > 0)
     {
         const uint64_t sleepStart = Util::GetTimestamp();
@@ -1308,14 +1415,22 @@ void FrameLimit::prePresent(bool fgActive)
                 errorLogged = true;
             }
         }
-        const double sleptMs = static_cast<double>(Util::GetTimestamp() - sleepStart) / 1e6;
-        std::scoped_lock lock(g_pacerMutex);
-        g_pacer.preSleptMs = sleptMs > 0.0 ? sleptMs : 0.0;
+        const double measuredMs = static_cast<double>(Util::GetTimestamp() - sleepStart) / 1e6;
+        if (measuredMs > 0.0)
+            preSleptMs = measuredMs;
     }
-    else
+
     {
         std::scoped_lock lock(g_pacerMutex);
-        g_pacer.preSleptMs = 0.0;
+        const uint64_t edgeNow = Util::GetTimestamp();
+        if (g_pacer.lastFrontEdgeNs > 0 && edgeNow > g_pacer.lastFrontEdgeNs &&
+            (edgeNow - g_pacer.lastFrontEdgeNs) <= kPauseRebaseGapNs)
+        {
+            PushFrameTimeMs(g_pacer.frameTimesMs, g_pacer.frameTimeHead, g_pacer.frameTimeCount,
+                            g_pacer.lastFrontEdgeNs, edgeNow);
+        }
+        g_pacer.lastFrontEdgeNs = edgeNow;
+        g_pacer.preSleptMs = preSleptMs;
     }
 }
 
@@ -1342,17 +1457,6 @@ void FrameLimit::postPresent(bool fgActive)
         std::scoped_lock lock(g_pacerMutex);
         const uint64_t now = Util::GetTimestamp();
 
-        if (g_pacer.lastPresentFinishNs > 0 && now > g_pacer.lastPresentFinishNs)
-        {
-            const float frameMs = static_cast<float>(now - g_pacer.lastPresentFinishNs) / 1e6f;
-            if (frameMs > 0.1f && frameMs < 1000.0f)
-            {
-                g_pacer.frameTimesMs[g_pacer.frameTimeHead] = frameMs;
-                g_pacer.frameTimeHead = (g_pacer.frameTimeHead + 1) % g_pacer.frameTimesMs.size();
-                g_pacer.frameTimeCount = std::min(g_pacer.frameTimeCount + 1, g_pacer.frameTimesMs.size());
-            }
-        }
-
         const bool pauseOrWrap =
             g_pacer.lastPresentFinishNs > 0 &&
             (now <= g_pacer.lastPresentFinishNs || (now - g_pacer.lastPresentFinishNs) > kPauseRebaseGapNs);
@@ -1363,6 +1467,12 @@ void FrameLimit::postPresent(bool fgActive)
                 static_cast<int64_t>(g_pacer.lastIntervalNs / 4);
 
         const bool isBackEdge = mode == static_cast<int>(Mode::BackEdge);
+        if (isBackEdge || g_pacer.lastFrontEdgeNs == 0)
+        {
+            PushFrameTimeMs(g_pacer.frameTimesMs, g_pacer.frameTimeHead, g_pacer.frameTimeCount,
+                            g_pacer.lastPresentFinishNs, now);
+        }
+
         bool skipSleepThisFrame = false;
 
         if (g_pacer.nextTargetNs == 0 || pauseOrWrap || modeOrFgChanged || intervalChanged)
@@ -1391,10 +1501,14 @@ void FrameLimit::postPresent(bool fgActive)
             g_pacer.nextTargetNs += intervalNs;
             g_pacer.nextTargetNs = ApplyVBlankPhaseNudge(g_pacer.nextTargetNs, intervalNs, false);
 
-            // Prevent catch-up bursts after GPU bottlenecks or stalls
+            // Prevent catch-up bursts after bottlenecks/stalls without penalizing Present() duration or snapping phase hard
             if (g_pacer.nextTargetNs <= now || (g_pacer.nextTargetNs - now) > intervalNs * 2)
             {
-                g_pacer.nextTargetNs = ApplyVBlankPhaseNudge(now + intervalNs, intervalNs, true);
+                const uint64_t rebaseBase =
+                    (g_pacer.lastFrontEdgeNs > 0 && g_pacer.lastFrontEdgeNs + intervalNs > now)
+                        ? (g_pacer.lastFrontEdgeNs + intervalNs)
+                        : (now + intervalNs);
+                g_pacer.nextTargetNs = ApplyVBlankPhaseNudge(rebaseBase, intervalNs, false);
                 skipSleepThisFrame = true;
             }
         }

@@ -786,16 +786,9 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
         Hudfix_Vk::HookDevice(*pDevice);
     }
 
-    if (result == VK_SUCCESS && !State::Instance().vulkanSkipHooks &&
-        (Config::Instance()->OverlayMenu.value_or_default() ||
-         Config::Instance()->FramerateLimit.value_or_default() > 0.0f ||
-         Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0))
-    {
-        HookDevice(*pDevice);
-    }
-
     if (result == VK_SUCCESS && !State::Instance().vulkanSkipHooks)
     {
+        HookDevice(*pDevice);
         const auto getDevProc = o_vkGetDeviceProcAddr != nullptr ? o_vkGetDeviceProcAddr : vkGetDeviceProcAddr;
         VulkanFrameSync::OnDeviceCreated(*pDevice, preparedFrameSync.caps, getDevProc, o_WaitForPresentKHR);
     }
@@ -1006,7 +999,7 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
 
     VulkanFrameSync::PresentScope frameSyncScope {};
     if (trackFrameSync)
-        VulkanFrameSync::PreparePresent(&localPresentInfo, fgPresent, frameSyncScope);
+        VulkanFrameSync::PreparePresent(&localPresentInfo, fgPresent, dxgiPacingActive, frameSyncScope);
 
     if (limitActive)
         FrameLimit::prePresent(fgActive);
@@ -1387,13 +1380,15 @@ static VkResult hkvkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchai
         return fg->AcquireNextImage(device, swapchain, timeout, semaphore, fence, pImageIndex);
     }
 
-    const bool trackAcquire = !FromFGOutput(_ReturnAddress()) && !IsPassThroughSwapchain(device, swapchain) &&
-                              (State::Instance().isGamescopeActive || FrameLimit::isLimitingActive());
+    const void* retAddr = _ReturnAddress();
+    const bool dxgiBacked = IsDxgiBackedCaller(retAddr);
+    const bool trackAcquire = !FromFGOutput(retAddr) && !IsPassThroughSwapchain(device, swapchain) &&
+                              (State::Instance().isGamescopeActive || (!dxgiBacked && FrameLimit::isLimitingActive()));
     const uint64_t acquireStart = trackAcquire ? Util::GetTimestamp() : 0ULL;
 
     const VkResult result = o_AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
     if (trackAcquire && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR))
-        FrameLimit::onVulkanAcquire(Util::GetTimestamp() - acquireStart);
+        FrameLimit::onVulkanAcquire(Util::GetTimestamp() - acquireStart, dxgiBacked);
 
     return result;
 }
@@ -1416,14 +1411,16 @@ static VkResult hkvkAcquireNextImage2KHR(VkDevice device, const VkAcquireNextIma
                                     pAcquireInfo->fence, pImageIndex);
     }
 
-    const bool trackAcquire = pAcquireInfo != nullptr && !FromFGOutput(_ReturnAddress()) &&
+    const void* retAddr = _ReturnAddress();
+    const bool dxgiBacked = IsDxgiBackedCaller(retAddr);
+    const bool trackAcquire = pAcquireInfo != nullptr && !FromFGOutput(retAddr) &&
                               !IsPassThroughSwapchain(device, pAcquireInfo->swapchain) &&
-                              (State::Instance().isGamescopeActive || FrameLimit::isLimitingActive());
+                              (State::Instance().isGamescopeActive || (!dxgiBacked && FrameLimit::isLimitingActive()));
     const uint64_t acquireStart = trackAcquire ? Util::GetTimestamp() : 0ULL;
 
     const VkResult result = o_AcquireNextImage2KHR(device, pAcquireInfo, pImageIndex);
     if (trackAcquire && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR))
-        FrameLimit::onVulkanAcquire(Util::GetTimestamp() - acquireStart);
+        FrameLimit::onVulkanAcquire(Util::GetTimestamp() - acquireStart, dxgiBacked);
 
     return result;
 }

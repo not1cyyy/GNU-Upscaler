@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <thread>
 #include <unordered_map>
 
@@ -28,15 +29,19 @@ std::mutex g_registryMutex;
 std::unordered_map<uint64_t, DeviceSyncInfo> g_devices;
 std::vector<std::shared_ptr<VulkanFrameSync::SwapchainSyncState>> g_swapchains;
 
+struct ObserverProbe
+{
+    std::shared_ptr<VulkanFrameSync::SwapchainSyncState> state;
+    uint64_t presentId = 0;
+    uint64_t submitNs = 0;
+};
+
+constexpr size_t kMaxPendingProbes = 8;
 std::mutex g_observerMutex;
 std::condition_variable g_observerCv;
 bool g_observerStarted = false;
 bool g_observerStop = false;
-bool g_observerBusy = false;
-bool g_hasPendingProbe = false;
-std::shared_ptr<VulkanFrameSync::SwapchainSyncState> g_pendingState;
-uint64_t g_pendingPresentId = 0;
-uint64_t g_pendingSubmitNs = 0;
+std::deque<ObserverProbe> g_pendingProbes;
 std::thread g_observerThread;
 
 bool IsVsyncPresentMode(VkPresentModeKHR mode)
@@ -75,18 +80,14 @@ void WaitForSwapchainIdle(const std::shared_ptr<VulkanFrameSync::SwapchainSyncSt
 
     {
         std::scoped_lock obsLock(g_observerMutex);
-        if (g_pendingState == entry)
-        {
-            g_hasPendingProbe = false;
-            g_pendingState.reset();
-        }
+        std::erase_if(g_pendingProbes, [&entry](const ObserverProbe& probe) { return probe.state == entry; });
     }
 
     if (State::Instance().isShuttingDown)
         return;
 
     std::unique_lock waitLock(entry->waitMutex);
-    entry->waitDoneCv.wait_for(waitLock, std::chrono::milliseconds(100),
+    entry->waitDoneCv.wait_for(waitLock, std::chrono::milliseconds(150),
                                [&entry]() { return entry->inWait.load(std::memory_order_acquire) == 0; });
 }
 
@@ -94,23 +95,22 @@ void ObserverLoop()
 {
     while (true)
     {
-        std::shared_ptr<VulkanFrameSync::SwapchainSyncState> state;
-        uint64_t presentId = 0;
-        uint64_t submitNs = 0;
+        ObserverProbe probe {};
 
         {
             std::unique_lock lock(g_observerMutex);
-            g_observerCv.wait(lock, []() { return g_observerStop || g_hasPendingProbe; });
+            g_observerCv.wait(lock, []() { return g_observerStop || !g_pendingProbes.empty(); });
 
             if (g_observerStop)
                 break;
 
-            state = std::move(g_pendingState);
-            presentId = g_pendingPresentId;
-            submitNs = g_pendingSubmitNs;
-            g_hasPendingProbe = false;
-            g_observerBusy = true;
+            probe = std::move(g_pendingProbes.front());
+            g_pendingProbes.pop_front();
         }
+
+        const auto& state = probe.state;
+        const uint64_t presentId = probe.presentId;
+        const uint64_t submitNs = probe.submitNs;
 
         if (state && state->waitForPresent != nullptr && presentId > 0 && !State::Instance().isShuttingDown &&
             !state->destroying.load(std::memory_order_acquire))
@@ -127,7 +127,7 @@ void ObserverLoop()
 
             if (enterWait)
             {
-                const VkResult res = state->waitForPresent(state->device, state->swapchain, presentId, 35'000'000ULL);
+                const VkResult res = state->waitForPresent(state->device, state->swapchain, presentId, 100'000'000ULL);
                 const uint64_t scanoutNs = Util::GetTimestamp();
 
                 {
@@ -156,11 +156,6 @@ void ObserverLoop()
                 }
             }
         }
-
-        {
-            std::scoped_lock lock(g_observerMutex);
-            g_observerBusy = false;
-        }
     }
 }
 
@@ -185,13 +180,13 @@ void SubmitObserverProbe(const std::shared_ptr<VulkanFrameSync::SwapchainSyncSta
 
     {
         std::scoped_lock lock(g_observerMutex);
-        if (g_observerStop || g_observerBusy || g_hasPendingProbe)
+        if (g_observerStop)
             return;
 
-        g_pendingState = state;
-        g_pendingPresentId = presentId;
-        g_pendingSubmitNs = submitNs;
-        g_hasPendingProbe = true;
+        if (g_pendingProbes.size() >= kMaxPendingProbes)
+            g_pendingProbes.pop_front();
+
+        g_pendingProbes.push_back({ state, presentId, submitNs });
     }
     g_observerCv.notify_one();
 }
@@ -489,7 +484,8 @@ void VulkanFrameSync::OnSwapchainDestroyed(VkDevice device, VkSwapchainKHR swapc
     WaitForSwapchainIdle(removed);
 }
 
-void VulkanFrameSync::PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPresent, PresentScope& scope)
+void VulkanFrameSync::PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPresent, bool dxgiBacked,
+                                     PresentScope& scope)
 {
     scope = {};
     if (fgPresent || pPresentInfo == nullptr || pPresentInfo->swapchainCount != 1 || pPresentInfo->pSwapchains == nullptr)
@@ -565,7 +561,7 @@ void VulkanFrameSync::PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPres
 
             scope.usedTimingId = tid;
             scope.presentTime.presentID = tid;
-            scope.presentTime.desiredPresentTime = FrameLimit::getDesiredDisplayTimeNs();
+            scope.presentTime.desiredPresentTime = FrameLimit::getDesiredDisplayTimeNs(dxgiBacked);
             scope.presentTimesInfo.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
             scope.presentTimesInfo.pNext = pPresentInfo->pNext;
             scope.presentTimesInfo.swapchainCount = 1;
@@ -677,8 +673,7 @@ void VulkanFrameSync::Shutdown(bool canJoinThreads)
     {
         std::scoped_lock lock(g_observerMutex);
         g_observerStop = true;
-        g_hasPendingProbe = false;
-        g_pendingState.reset();
+        g_pendingProbes.clear();
         if (g_observerStarted && g_observerThread.joinable())
         {
             threadToJoin = std::move(g_observerThread);

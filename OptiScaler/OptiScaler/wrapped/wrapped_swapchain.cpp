@@ -342,6 +342,26 @@ void ReportD3D12LiveObjects(ID3D12Device* device)
 #endif
 #endif
 
+static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT syncInterval, uint64_t submitNs)
+{
+    if (swapChain == nullptr || State::Instance().isRunningOnLinux)
+        return;
+
+    DXGI_FRAME_STATISTICS stats {};
+    if (SUCCEEDED(swapChain->GetFrameStatistics(&stats)) && stats.SyncQPCTime.QuadPart > 0)
+    {
+        static UINT lastSyncCount = 0;
+        if (stats.SyncRefreshCount != lastSyncCount)
+        {
+            lastSyncCount = stats.SyncRefreshCount;
+            const uint64_t syncNs = Util::QpcToNs(stats.SyncQPCTime.QuadPart);
+            const int hz = Util::GetActiveRefreshRate(hwnd);
+            const uint64_t refreshNs = hz > 0 ? (1'000'000'000ULL / static_cast<uint64_t>(hz)) : 0ULL;
+            FrameLimit::recordScanoutTimestamp(submitNs, syncNs, refreshNs, 0, syncInterval > 0, false);
+        }
+    }
+}
+
 static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags,
                             const DXGI_PRESENT_PARAMETERS* pPresentParameters, IUnknown* pDevice, HWND hWnd, bool isUWP,
                             bool isCurrent)
@@ -600,13 +620,28 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             State::Instance().frameCount++;
     }
 
+    const bool shouldLimit = willPresent && isCurrent && !State::Instance().reflexLimitsFps &&
+                             State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();
+
+    if (shouldLimit)
+        FrameLimit::prePresent(false);
+
     LOG_DEBUG("Calling original present");
+
+    const uint64_t submitNs =
+        (shouldLimit && !State::Instance().isRunningOnLinux) ? Util::GetTimestamp() : 0ULL;
 
     // swapchain present
     if (pPresentParameters == nullptr)
         presentResult = pSwapChain->Present(SyncInterval, Flags);
     else
         presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
+
+    if (shouldLimit && !State::Instance().isRunningOnLinux && SUCCEEDED(presentResult))
+        RecordDxgiFrameStats(pSwapChain, hWnd, SyncInterval, submitNs);
+
+    if (shouldLimit)
+        FrameLimit::postPresent(false);
 
     DeferredRelease::Process();
 
@@ -978,26 +1013,6 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetDevice(REFIID riid, void** 
     return _real->GetDevice(riid, ppDevice);
 }
 
-static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT syncInterval, uint64_t submitNs)
-{
-    if (swapChain == nullptr || State::Instance().isRunningOnLinux)
-        return;
-
-    DXGI_FRAME_STATISTICS stats {};
-    if (SUCCEEDED(swapChain->GetFrameStatistics(&stats)) && stats.SyncQPCTime.QuadPart > 0)
-    {
-        static UINT lastSyncCount = 0;
-        if (stats.SyncRefreshCount != lastSyncCount)
-        {
-            lastSyncCount = stats.SyncRefreshCount;
-            const uint64_t syncNs = Util::QpcToNs(stats.SyncQPCTime.QuadPart);
-            const int hz = Util::GetActiveRefreshRate(hwnd);
-            const uint64_t refreshNs = hz > 0 ? (1'000'000'000ULL / static_cast<uint64_t>(hz)) : 0ULL;
-            FrameLimit::recordScanoutTimestamp(submitNs, syncNs, refreshNs, 0, syncInterval > 0, false);
-        }
-    }
-}
-
 //
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UINT Flags)
 {
@@ -1019,21 +1034,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
             FrameLimit::onFgOutputPresent();
         }
 
-        const bool shouldLimit = isCurrent && !State::Instance().reflexLimitsFps &&
-                                 State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();
-
-        if (shouldLimit)
-            FrameLimit::prePresent(false);
-
-        const uint64_t submitNs =
-            (shouldLimit && !State::Instance().isRunningOnLinux) ? Util::GetTimestamp() : 0ULL;
         result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp, isCurrent);
-
-        if (shouldLimit && !State::Instance().isRunningOnLinux && SUCCEEDED(result))
-            RecordDxgiFrameStats(_real, _handle, SyncInterval, submitNs);
-
-        if (shouldLimit)
-            FrameLimit::postPresent(false);
     }
     else
     {
@@ -1348,21 +1349,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
             FrameLimit::onFgOutputPresent();
         }
 
-        const bool shouldLimit = isCurrent && !State::Instance().reflexLimitsFps &&
-                                 State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();
-
-        if (shouldLimit)
-            FrameLimit::prePresent(false);
-
-        const uint64_t submitNs =
-            (shouldLimit && !State::Instance().isRunningOnLinux) ? Util::GetTimestamp() : 0ULL;
         result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp, isCurrent);
-
-        if (shouldLimit && !State::Instance().isRunningOnLinux && SUCCEEDED(result))
-            RecordDxgiFrameStats(_real1, _handle, SyncInterval, submitNs);
-
-        if (shouldLimit)
-            FrameLimit::postPresent(false);
     }
     else
     {

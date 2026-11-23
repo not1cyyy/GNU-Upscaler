@@ -36,7 +36,7 @@ class FrameLimit
     static bool isTrackedWaitable(HANDLE handle);
 
     static void onSimulationStart();
-    static void onVulkanAcquire(uint64_t acquireDurationNs);
+    static void onVulkanAcquire(uint64_t acquireDurationNs, bool dxgiBacked = false);
     static void recordPresentDuration(uint64_t presentDurationNs);
 
     static void onFgGamePresentStart();
@@ -63,7 +63,7 @@ class FrameLimit
     static void recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, uint64_t reportedRefreshNs,
                                        uint64_t presentMarginNs, bool isVsyncMode, bool fromDisplayTiming);
     static void calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanoutQpcNs);
-    static uint64_t getDesiredDisplayTimeNs();
+    static uint64_t getDesiredDisplayTimeNs(bool useActiveDxgiFrame = false);
     static uint64_t alignDeadlineToVBlank(uint64_t deadlineNs, uint64_t intervalNs);
     static void getRecentFrameTimes(float* outMs, int maxCount, int& outCount, float& outMinMs, float& outMaxMs);
     static SyncStats getStats();

@@ -91,7 +91,7 @@ class VulkanFrameSync
                                    VkSwapchainKHR oldSwapchain);
     static void OnSwapchainDestroyed(VkDevice device, VkSwapchainKHR swapchain);
 
-    static void PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPresent, PresentScope& scope);
+    static void PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPresent, bool dxgiBacked, PresentScope& scope);
     static void PostPresent(const PresentScope& scope, VkResult presentResult, uint64_t submitNs);
 
     static void Shutdown(bool canJoinThreads);
