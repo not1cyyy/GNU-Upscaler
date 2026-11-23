@@ -596,6 +596,9 @@ bool MenuOverlayVk::QueuePresent(VkQueue queue, VkPresentInfoKHR* pPresentInfo)
     if (!cleanLock.owns_lock() || !_vulkanObjectsCreated || pPresentInfo->pSwapchains[0] != _menuSwapchain)
         return true;
 
+    if (!MenuOverlayBase::PrepareFrame())
+        return true;
+
     LOG_DEBUG("rendering menu, swapchain count: {0}", pPresentInfo->swapchainCount);
 
     ImGuiIO& io = ImGui::GetIO();
@@ -622,9 +625,9 @@ bool MenuOverlayVk::QueuePresent(VkQueue queue, VkPresentInfoKHR* pPresentInfo)
         ImGui_ImplVulkan_SetQueue(menuQueue);
         ImGui_ImplVulkan_NewFrame();
 
-        // Blur images are only created once the menu is opened, menu decides if they are used
+        // Blur images are only prepared while the menu is visible
         bool blurReady = false;
-        if (_menuBlur || MenuOverlayBase::IsVisible())
+        if (MenuOverlayBase::IsVisible())
         {
             if (!_menuBlur)
                 _menuBlur = new MenuBlur_Vk("MenuBlur", _ImVulkan_Info.Device, _ImVulkan_Info.PhysicalDevice);

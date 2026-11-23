@@ -96,160 +96,25 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
     // Order is important as that's the order of shader dispatch
-    std::vector<ShaderPass> pipeline;
+    struct PostPass
+    {
+        PostPassStage stage;
+        VkImageInfo inputBuffer {};
+        VkImageInfo outputBuffer {};
+    };
+
+    std::array<PostPass, 3> pipeline {};
+    size_t passCount = 0;
 
     if (useOutputScaling)
-    {
-        pipeline.push_back(
-            { // Setup
-              [&](const VkImageInfo& nextOutput) -> VkImageInfo
-              {
-                  if (OutputScaler->CreateImageResource(Device, PhysicalDevice, TargetWidth(), TargetHeight(),
-                                                        nextOutput.Format, intermediateUsage))
-                  {
-                      OutputScaler->SetImageLayout(InCmdBuffer, OutputScaler->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
-                                                   VK_IMAGE_LAYOUT_GENERAL, nextOutput.SubresourceRange);
-
-                      // TODO: improve query of the output info
-                      VkImageInfo info = nextOutput;
-                      info.Image = OutputScaler->GetImage();
-                      info.ImageView = OutputScaler->GetImageView();
-                      info.Width = TargetWidth();
-                      info.Height = TargetHeight();
-                      return info;
-                  }
-                  return VkImageInfo {}; // Returns null handle
-              },
-
-              // Dispatch
-              [&](const VkImageInfo& input, const VkImageInfo& output) -> bool
-              {
-                  LOG_DEBUG("Scaling output...");
-                  OutputScaler->SetImageLayout(InCmdBuffer, input.Image, VK_IMAGE_LAYOUT_GENERAL,
-                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, input.SubresourceRange);
-
-                  if (!OutputScaler->Dispatch(InCmdBuffer, input, output))
-                  {
-                      Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
-                      State::Instance().changeBackend[Handle()->Id] = true;
-                      return false;
-                  }
-                  return true;
-              } });
-    }
+        pipeline[passCount++].stage = PostPassStage::OutputScaling;
 
     _actualSharpness.reset();
     if (useRcas)
-    {
-        pipeline.push_back(
-            { // Setup
-              [&](const VkImageInfo& nextOutput) -> VkImageInfo
-              {
-                  // Same checks as Dispatch, a skipped pass must not take over the output
-                  if (paramMotion && paramOutput && RCAS->CanRender() &&
-                      RCAS->CreateImageResource(Device, PhysicalDevice, nextOutput.Width, nextOutput.Height,
-                                                nextOutput.Format, intermediateUsage))
-                  {
-                      // Disable any built-in sharpness shaders
-                      InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
-                      _actualSharpness = _sharpness;
-                      _sharpness = 0.0f;
-
-                      RCAS->SetImageLayout(InCmdBuffer, RCAS->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
-                                           VK_IMAGE_LAYOUT_GENERAL, nextOutput.SubresourceRange);
-
-                      VkImageInfo info = nextOutput;
-                      info.Image = RCAS->GetImage();
-                      info.ImageView = RCAS->GetImageView();
-                      return info;
-                  }
-                  return VkImageInfo {};
-              },
-
-              // Dispatch
-              [&](const VkImageInfo& input, const VkImageInfo& output) -> bool
-              {
-                  if (!RCAS->CanRender() || !paramMotion || !paramOutput)
-                      return true;
-
-                  RCAS->SetImageLayout(InCmdBuffer, input.Image, VK_IMAGE_LAYOUT_GENERAL,
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, input.SubresourceRange);
-
-                  RcasConstants rcasConstants {};
-                  rcasConstants.Sharpness = _actualSharpness.value_or(_sharpness);
-                  rcasConstants.DepthIsLinear = DepthLinear();
-                  rcasConstants.DepthIsReversed = DepthInverted();
-                  rcasConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
-                                        State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
-
-                  _sharpness = _actualSharpness.value_or(_sharpness);
-                  _actualSharpness.reset();
-
-                  InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &rcasConstants.MvScaleX);
-                  InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &rcasConstants.MvScaleY);
-
-                  float nearPlane = 0.0f;
-                  float farPlane = 0.0f;
-
-                  if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
-                      InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
-                  {
-                      rcasConstants.CameraNear = nearPlane;
-                      rcasConstants.CameraFar = farPlane;
-                  }
-                  else
-                  {
-                      rcasConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
-                      rcasConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
-                  }
-
-                  // In Vulkan we pass the Info structs instead of raw resources
-                  VkImageInfo mvInfo = *(VkImageInfo*) &paramMotion->Resource.ImageViewInfo;
-                  VkImageInfo* depthInfo = paramDepth ? (VkImageInfo*) &paramDepth->Resource.ImageViewInfo : nullptr;
-
-                  if (!RCAS->Dispatch(Device, InCmdBuffer, rcasConstants, input, mvInfo, output, depthInfo))
-                  {
-                      Config::Instance()->RcasEnabled.set_volatile_value(false);
-                      return false;
-                  }
-                  return true;
-              } });
-    }
+        pipeline[passCount++].stage = PostPassStage::Rcas;
 
     if (Magnifier->ShouldRun())
-    {
-        pipeline.push_back(
-            { // Setup
-              [&](const VkImageInfo& nextOutput) -> VkImageInfo
-              {
-                  // Same checks as Dispatch, a skipped pass must not take over the output
-                  if (paramMotion && paramOutput && Magnifier->CanRender() &&
-                      Magnifier->CreateImageResource(Device, PhysicalDevice, nextOutput.Width, nextOutput.Height,
-                                                     nextOutput.Format, intermediateUsage))
-                  {
-                      Magnifier->SetImageLayout(InCmdBuffer, Magnifier->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
-                                                VK_IMAGE_LAYOUT_GENERAL, nextOutput.SubresourceRange);
-
-                      VkImageInfo info = nextOutput;
-                      info.Image = Magnifier->GetImage();
-                      info.ImageView = Magnifier->GetImageView();
-                      return info;
-                  }
-                  return VkImageInfo {};
-              },
-
-              // Dispatch
-              [&](const VkImageInfo& input, const VkImageInfo& output) -> bool
-              {
-                  if (!Magnifier->CanRender() || !paramMotion || !paramOutput)
-                      return true;
-
-                  Magnifier->SetImageLayout(InCmdBuffer, input.Image, VK_IMAGE_LAYOUT_GENERAL,
-                                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, input.SubresourceRange);
-
-                  return Magnifier->Dispatch(InCmdBuffer, input, output);
-              } });
-    }
+        pipeline[passCount++].stage = PostPassStage::Magnifier;
 
     // RCAS setup and DLSS zero the game's sharpness, restored after EvaluateInternal
     float originalSharpness = 0.0f;
@@ -258,13 +123,72 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
 
     // Iterate BACKWARDS to establish where each shader needs to pull its input from
     VkImageInfo currentTarget = originalOutput;
-    for (auto it = pipeline.rbegin(); it != pipeline.rend(); ++it)
+    for (size_t i = passCount; i-- > 0;)
     {
-        VkImageInfo requiredInput = it->Setup(currentTarget);
+        auto& pass = pipeline[i];
+        VkImageInfo requiredInput {};
+
+        switch (pass.stage)
+        {
+        case PostPassStage::OutputScaling:
+            if (OutputScaler->CreateImageResource(Device, PhysicalDevice, TargetWidth(), TargetHeight(),
+                                                  currentTarget.Format, intermediateUsage))
+            {
+                OutputScaler->SetImageLayout(InCmdBuffer, OutputScaler->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
+                                             VK_IMAGE_LAYOUT_GENERAL, currentTarget.SubresourceRange);
+
+                // TODO: improve query of the output info
+                VkImageInfo info = currentTarget;
+                info.Image = OutputScaler->GetImage();
+                info.ImageView = OutputScaler->GetImageView();
+                info.Width = TargetWidth();
+                info.Height = TargetHeight();
+                requiredInput = info;
+            }
+            break;
+
+        case PostPassStage::Rcas:
+            // Same checks as Dispatch, a skipped pass must not take over the output
+            if (paramMotion && paramOutput && RCAS->CanRender() &&
+                RCAS->CreateImageResource(Device, PhysicalDevice, currentTarget.Width, currentTarget.Height,
+                                          currentTarget.Format, intermediateUsage))
+            {
+                // Disable any built-in sharpness shaders
+                InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
+                _actualSharpness = _sharpness;
+                _sharpness = 0.0f;
+
+                RCAS->SetImageLayout(InCmdBuffer, RCAS->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
+                                     VK_IMAGE_LAYOUT_GENERAL, currentTarget.SubresourceRange);
+
+                VkImageInfo info = currentTarget;
+                info.Image = RCAS->GetImage();
+                info.ImageView = RCAS->GetImageView();
+                requiredInput = info;
+            }
+            break;
+
+        case PostPassStage::Magnifier:
+            // Same checks as Dispatch, a skipped pass must not take over the output
+            if (paramMotion && paramOutput && Magnifier->CanRender() &&
+                Magnifier->CreateImageResource(Device, PhysicalDevice, currentTarget.Width, currentTarget.Height,
+                                               currentTarget.Format, intermediateUsage))
+            {
+                Magnifier->SetImageLayout(InCmdBuffer, Magnifier->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
+                                          VK_IMAGE_LAYOUT_GENERAL, currentTarget.SubresourceRange);
+
+                VkImageInfo info = currentTarget;
+                info.Image = Magnifier->GetImage();
+                info.ImageView = Magnifier->GetImageView();
+                requiredInput = info;
+            }
+            break;
+        }
+
         if (requiredInput.Image != VK_NULL_HANDLE)
         {
-            it->outputBuffer = currentTarget;
-            it->inputBuffer = requiredInput;
+            pass.outputBuffer = currentTarget;
+            pass.inputBuffer = requiredInput;
             currentTarget = requiredInput; // Shift the target back for the next previous stage
         }
     }
@@ -305,14 +229,89 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
         return false;
 
     // Iterate FORWARDS to execute the shaders in the defined order
-    for (auto& pass : pipeline)
+    for (size_t i = 0; i < passCount; ++i)
     {
-        if (pass.inputBuffer.Image != VK_NULL_HANDLE && pass.outputBuffer.Image != VK_NULL_HANDLE)
+        const auto& pass = pipeline[i];
+        if (pass.inputBuffer.Image == VK_NULL_HANDLE || pass.outputBuffer.Image == VK_NULL_HANDLE)
+            continue;
+
+        bool ok = true;
+        switch (pass.stage)
         {
-            // Upscale succeeded, a failed pass only drops the remaining passes
-            if (!pass.Dispatch(pass.inputBuffer, pass.outputBuffer))
-                break;
+        case PostPassStage::OutputScaling:
+            LOG_DEBUG("Scaling output...");
+            OutputScaler->SetImageLayout(InCmdBuffer, pass.inputBuffer.Image, VK_IMAGE_LAYOUT_GENERAL,
+                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, pass.inputBuffer.SubresourceRange);
+
+            if (!OutputScaler->Dispatch(InCmdBuffer, pass.inputBuffer, pass.outputBuffer))
+            {
+                Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
+                State::Instance().changeBackend[Handle()->Id] = true;
+                ok = false;
+            }
+            break;
+
+        case PostPassStage::Rcas:
+            if (RCAS->CanRender() && paramMotion && paramOutput)
+            {
+                RCAS->SetImageLayout(InCmdBuffer, pass.inputBuffer.Image, VK_IMAGE_LAYOUT_GENERAL,
+                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, pass.inputBuffer.SubresourceRange);
+
+                RcasConstants rcasConstants {};
+                rcasConstants.Sharpness = _actualSharpness.value_or(_sharpness);
+                rcasConstants.DepthIsLinear = DepthLinear();
+                rcasConstants.DepthIsReversed = DepthInverted();
+                rcasConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
+                                      State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+
+                _sharpness = _actualSharpness.value_or(_sharpness);
+                _actualSharpness.reset();
+
+                InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &rcasConstants.MvScaleX);
+                InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &rcasConstants.MvScaleY);
+
+                float nearPlane = 0.0f;
+                float farPlane = 0.0f;
+
+                if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
+                    InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
+                {
+                    rcasConstants.CameraNear = nearPlane;
+                    rcasConstants.CameraFar = farPlane;
+                }
+                else
+                {
+                    rcasConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+                    rcasConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+                }
+
+                // In Vulkan we pass the Info structs instead of raw resources
+                VkImageInfo mvInfo = *(VkImageInfo*) &paramMotion->Resource.ImageViewInfo;
+                VkImageInfo* depthInfo = paramDepth ? (VkImageInfo*) &paramDepth->Resource.ImageViewInfo : nullptr;
+
+                if (!RCAS->Dispatch(Device, InCmdBuffer, rcasConstants, pass.inputBuffer, mvInfo, pass.outputBuffer,
+                                    depthInfo))
+                {
+                    Config::Instance()->RcasEnabled.set_volatile_value(false);
+                    ok = false;
+                }
+            }
+            break;
+
+        case PostPassStage::Magnifier:
+            if (Magnifier->CanRender() && paramMotion && paramOutput)
+            {
+                Magnifier->SetImageLayout(InCmdBuffer, pass.inputBuffer.Image, VK_IMAGE_LAYOUT_GENERAL,
+                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, pass.inputBuffer.SubresourceRange);
+
+                ok = Magnifier->Dispatch(InCmdBuffer, pass.inputBuffer, pass.outputBuffer);
+            }
+            break;
         }
+
+        // Upscale succeeded, a failed pass only drops the remaining passes
+        if (!ok)
+            break;
     }
 
     _frameCount++;

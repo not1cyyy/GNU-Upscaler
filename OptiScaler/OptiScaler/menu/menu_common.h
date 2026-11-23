@@ -227,9 +227,12 @@ class MenuCommon
                               const std::vector<MenuOption<T>>& options);
 
     struct RenderMenuContext;
+    static std::unique_ptr<RenderMenuContext> _preparedMenuCtx;
 
     // RenderMenu orchestration helpers. These keep the public RenderMenu() flow short
     // while preserving the original ImGui layout and draw order.
+    static bool NeedsMenuFrame(const RenderMenuContext& ctx);
+    static bool PrepareMenuFrameInternal(RenderMenuContext& ctx);
     static void UpdateRenderTiming(RenderMenuContext& ctx);
     static void UpdateMenuInputMode(RenderMenuContext& ctx);
     static void HandleMenuShortcuts(RenderMenuContext& ctx);
@@ -319,6 +322,7 @@ class MenuCommon
     // True if the last RenderMenu call drew the blur texture, so the renderer needs to update it
     static bool BackgroundBlurUsed() { return _bgBlurUsed; }
 
+    static bool PrepareFrame();
     static bool RenderMenu();
     static void Init(HWND InHwnd, bool isUWP);
     static void Shutdown();

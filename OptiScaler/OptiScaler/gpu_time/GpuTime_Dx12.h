@@ -8,6 +8,9 @@ class GpuTime_Dx12
 
     ID3D12QueryHeap* _queryHeap = nullptr;
     ID3D12Resource* _readbackBuffer = nullptr;
+    UINT64* _mappedTimestamps = nullptr;
+    ID3D12CommandQueue* _cachedQueue = nullptr;
+    UINT64 _cachedFrequency = 0;
     std::array<bool, QUERY_BUFFER_COUNT> _trigger {};
 
     int _currentFrameIndex = 0;

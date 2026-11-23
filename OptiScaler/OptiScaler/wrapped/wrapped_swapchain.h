@@ -12,6 +12,7 @@ using Microsoft::WRL::ComPtr;
 #define USE_LOCAL_MUTEX
 
 struct DxSwapchainGpuSync;
+struct ID3D11Device;
 
 class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChain4 final : public IDXGISwapChain4
 {
@@ -82,6 +83,32 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChai
     // implement IDXGISwapChain4
     HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void* pMetaData) override;
 
+  public:
+    struct PresentCache
+    {
+        IUnknown* sourceDevice = nullptr;
+        ID3D11Device* d3d11Device = nullptr;
+        ID3D12CommandQueue* d3d12RawQueue = nullptr;
+        ID3D12CommandQueue* d3d12Queue = nullptr;
+        ID3D12Device* d3d12Device = nullptr;
+        bool isD3D11 = false;
+        bool deviceResolved = false;
+        bool d3d12Hooked = false;
+
+        DXGI_SWAP_CHAIN_DESC desc {};
+        bool hasDesc = false;
+
+        bool isWaitable = false;
+        bool hasGameLatency = false;
+        UINT gameRequestedLatency = 3;
+        UINT appliedLatency = 0;
+
+        void ResetDevice();
+    };
+
+    void ApplyWaitableLatencyClamp(bool isCurrent);
+    PresentCache& GetPresentCache() { return _presentCache; }
+
   private:
     IDXGISwapChain* _real = nullptr;
 
@@ -106,6 +133,7 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChai
 #endif
 
     DxSwapchainGpuSync* _gpuSync = nullptr;
+    PresentCache _presentCache {};
 
     void CheckForHdrOutput()
     {

@@ -210,110 +210,25 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     InParameters->Get(NVSDK_NGX_Parameter_Depth, &paramDepth);
 
     // Order is important as that's the order of shader dispatch
-    std::vector<ShaderPass> pipeline;
+    struct PostPass
+    {
+        PostPassStage stage;
+        ID3D12Resource* inputBuffer = nullptr;
+        ID3D12Resource* outputBuffer = nullptr;
+    };
+
+    std::array<PostPass, 3> pipeline {};
+    size_t passCount = 0;
 
     if (useOutputScaling)
-    {
-        pipeline.push_back(
-            { // Setup
-              [&](ID3D12Resource* nextOutput) -> ID3D12Resource*
-              {
-                  if (OutputScaler->CreateBufferResource(Device, nextOutput, TargetWidth(), TargetHeight(),
-                                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
-                  {
-                      OutputScaler->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                      return OutputScaler->Buffer();
-                  }
-                  return nullptr;
-              },
-
-              // Dispatch
-              [&](ID3D12Resource* input, ID3D12Resource* output) -> bool
-              {
-                  LOG_DEBUG("Scaling output...");
-                  OutputScaler->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-                  if (!OutputScaler->Dispatch(InCommandList, input, output))
-                  {
-                      Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
-                      State::Instance().changeBackend[Handle()->Id] = true;
-                      return false;
-                  }
-                  return true;
-              } });
-    }
+        pipeline[passCount++].stage = PostPassStage::OutputScaling;
 
     _actualSharpness.reset();
     if (useRcas)
-    {
-        pipeline.push_back(
-            { // Setup
-              [&](ID3D12Resource* nextOutput) -> ID3D12Resource*
-              {
-                  // Same checks as Dispatch, a skipped pass must not take over the output
-                  if (paramMotion && paramOutput &&
-                      RCAS->CreateBufferResource(Device, nextOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
-                      RCAS->CanRender())
-                  {
-                      // Disable any built-in sharpness shaders
-                      InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
-                      _actualSharpness = _sharpness;
-                      _sharpness = 0.0f;
-
-                      RCAS->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                      return RCAS->Buffer();
-                  }
-                  return nullptr;
-              },
-
-              // Dispatch
-              [&](ID3D12Resource* input, ID3D12Resource* output) -> bool
-              {
-                  if (!RCAS->CanRender() || !paramMotion || !paramOutput)
-                      return true;
-
-                  RCAS->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-                  RcasConstants rcasConstants = BuildRcasConstants(InParameters);
-
-                  if (!RCAS->Dispatch(InCommandList, input, paramMotion, rcasConstants, output, paramDepth))
-                  {
-                      Config::Instance()->RcasEnabled.set_volatile_value(false);
-                      return false;
-                  }
-                  return true;
-              } });
-    }
+        pipeline[passCount++].stage = PostPassStage::Rcas;
 
     if (Magnifier->ShouldRun())
-    {
-        pipeline.push_back(
-            { // Setup
-              [&](ID3D12Resource* nextOutput) -> ID3D12Resource*
-              {
-                  // Same checks as Dispatch, a skipped pass must not take over the output
-                  if (paramMotion && paramOutput &&
-                      Magnifier->CreateBufferResource(Device, nextOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
-                      Magnifier->CanRender())
-                  {
-                      Magnifier->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                      return Magnifier->Buffer();
-                  }
-
-                  return nullptr;
-              },
-
-              // Dispatch
-              [&](ID3D12Resource* input, ID3D12Resource* output) -> bool
-              {
-                  if (!Magnifier->CanRender() || !paramMotion || !paramOutput)
-                      return true;
-
-                  Magnifier->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-                  return Magnifier->Dispatch(InCommandList, input, output);
-              } });
-    }
+        pipeline[passCount++].stage = PostPassStage::Magnifier;
 
     // RCAS setup and DLSS zero the game's sharpness, restored after EvaluateInternal
     float originalSharpness = 0.0f;
@@ -322,13 +237,54 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
 
     // Iterate BACKWARDS to establish where each shader needs to pull its input from
     ID3D12Resource* currentTarget = paramOutput;
-    for (auto it = pipeline.rbegin(); it != pipeline.rend(); ++it)
+    for (size_t i = passCount; i-- > 0;)
     {
-        ID3D12Resource* requiredInput = it->Setup(currentTarget);
+        auto& pass = pipeline[i];
+        ID3D12Resource* requiredInput = nullptr;
+
+        switch (pass.stage)
+        {
+        case PostPassStage::OutputScaling:
+            if (OutputScaler->CreateBufferResource(Device, currentTarget, TargetWidth(), TargetHeight(),
+                                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+            {
+                OutputScaler->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                requiredInput = OutputScaler->Buffer();
+            }
+            break;
+
+        case PostPassStage::Rcas:
+            // Same checks as Dispatch, a skipped pass must not take over the output
+            if (paramMotion && paramOutput &&
+                RCAS->CreateBufferResource(Device, currentTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
+                RCAS->CanRender())
+            {
+                // Disable any built-in sharpness shaders
+                InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
+                _actualSharpness = _sharpness;
+                _sharpness = 0.0f;
+
+                RCAS->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                requiredInput = RCAS->Buffer();
+            }
+            break;
+
+        case PostPassStage::Magnifier:
+            // Same checks as Dispatch, a skipped pass must not take over the output
+            if (paramMotion && paramOutput &&
+                Magnifier->CreateBufferResource(Device, currentTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
+                Magnifier->CanRender())
+            {
+                Magnifier->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                requiredInput = Magnifier->Buffer();
+            }
+            break;
+        }
+
         if (requiredInput)
         {
-            it->outputBuffer = currentTarget;
-            it->inputBuffer = requiredInput;
+            pass.outputBuffer = currentTarget;
+            pass.inputBuffer = requiredInput;
             currentTarget = requiredInput; // Shift the target back for the next previous stage
         }
     }
@@ -365,7 +321,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
         return false;
     }
 
-    const bool deferToAsyncQueue = _deferPostPasses && !pipeline.empty() && !outputBarrier.has_value() &&
+    const bool deferToAsyncQueue = _deferPostPasses && passCount > 0 && !outputBarrier.has_value() &&
                                    (Config::Instance()->OverlayMenu.value_or_default() || _frameCount <= 30) &&
                                    Config::Instance()->Dx12AsyncCompute.value_or_default() &&
                                    AsyncCompute != nullptr && AsyncCompute->IsInit();
@@ -376,33 +332,44 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
         pending.paramMotion = paramMotion;
         pending.paramDepth = paramDepth;
 
-        for (auto& pass : pipeline)
+        for (size_t i = 0; i < passCount; ++i)
         {
+            const auto& pass = pipeline[i];
             if (!pass.inputBuffer || !pass.outputBuffer)
                 continue;
 
-            if (OutputScaler && pass.inputBuffer == OutputScaler->Buffer())
+            switch (pass.stage)
             {
-                pending.runOutputScaler = true;
-                pending.osInput = pass.inputBuffer;
-                pending.osOutput = pass.outputBuffer;
-                pending.active = true;
-            }
-            else if (RCAS && pass.inputBuffer == RCAS->Buffer() && RCAS->CanRender() && paramMotion && paramOutput)
-            {
-                pending.runRcas = true;
-                pending.rcasInput = pass.inputBuffer;
-                pending.rcasOutput = pass.outputBuffer;
-                pending.rcasConstants = BuildRcasConstants(InParameters);
-                pending.active = true;
-            }
-            else if (Magnifier && pass.inputBuffer == Magnifier->Buffer() && Magnifier->CanRender() && paramMotion &&
-                     paramOutput)
-            {
-                pending.runMagnifier = true;
-                pending.magInput = pass.inputBuffer;
-                pending.magOutput = pass.outputBuffer;
-                pending.active = true;
+            case PostPassStage::OutputScaling:
+                if (OutputScaler)
+                {
+                    pending.runOutputScaler = true;
+                    pending.osInput = pass.inputBuffer;
+                    pending.osOutput = pass.outputBuffer;
+                    pending.active = true;
+                }
+                break;
+
+            case PostPassStage::Rcas:
+                if (RCAS && RCAS->CanRender() && paramMotion && paramOutput)
+                {
+                    pending.runRcas = true;
+                    pending.rcasInput = pass.inputBuffer;
+                    pending.rcasOutput = pass.outputBuffer;
+                    pending.rcasConstants = BuildRcasConstants(InParameters);
+                    pending.active = true;
+                }
+                break;
+
+            case PostPassStage::Magnifier:
+                if (Magnifier && Magnifier->CanRender() && paramMotion && paramOutput)
+                {
+                    pending.runMagnifier = true;
+                    pending.magInput = pass.inputBuffer;
+                    pending.magOutput = pass.outputBuffer;
+                    pending.active = true;
+                }
+                break;
             }
         }
 
@@ -415,15 +382,55 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     }
 
     // Iterate FORWARDS to execute the shaders in the defined order
-    for (auto& pass : pipeline)
+    for (size_t i = 0; i < passCount; ++i)
     {
-        if (pass.inputBuffer && pass.outputBuffer)
+        const auto& pass = pipeline[i];
+        if (!pass.inputBuffer || !pass.outputBuffer)
+            continue;
+
+        bool ok = true;
+        switch (pass.stage)
         {
-            if (!pass.Dispatch(pass.inputBuffer, pass.outputBuffer))
+        case PostPassStage::OutputScaling:
+            LOG_DEBUG("Scaling output...");
+            OutputScaler->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            if (!OutputScaler->Dispatch(InCommandList, pass.inputBuffer, pass.outputBuffer))
             {
-                RestoreBarriers(InCommandList);
-                return true;
+                Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
+                State::Instance().changeBackend[Handle()->Id] = true;
+                ok = false;
             }
+            break;
+
+        case PostPassStage::Rcas:
+            if (RCAS->CanRender() && paramMotion && paramOutput)
+            {
+                RCAS->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                const RcasConstants rcasConstants = BuildRcasConstants(InParameters);
+
+                if (!RCAS->Dispatch(InCommandList, pass.inputBuffer, paramMotion, rcasConstants, pass.outputBuffer,
+                                    paramDepth))
+                {
+                    Config::Instance()->RcasEnabled.set_volatile_value(false);
+                    ok = false;
+                }
+            }
+            break;
+
+        case PostPassStage::Magnifier:
+            if (Magnifier->CanRender() && paramMotion && paramOutput)
+            {
+                Magnifier->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                ok = Magnifier->Dispatch(InCommandList, pass.inputBuffer, pass.outputBuffer);
+            }
+            break;
+        }
+
+        if (!ok)
+        {
+            RestoreBarriers(InCommandList);
+            return true;
         }
     }
 

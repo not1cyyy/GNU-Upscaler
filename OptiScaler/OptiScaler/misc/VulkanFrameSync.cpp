@@ -299,6 +299,38 @@ std::shared_ptr<VulkanFrameSync::SwapchainSyncState> FindSwapchainLocked(VkSwapc
     }
     return nullptr;
 }
+
+std::shared_ptr<VulkanFrameSync::SwapchainSyncState> ResolveSwapchain(VkSwapchainKHR swapchain)
+{
+    thread_local VkSwapchainKHR t_lastSwapchain = VK_NULL_HANDLE;
+    thread_local std::weak_ptr<VulkanFrameSync::SwapchainSyncState> t_lastState;
+
+    if (swapchain == VK_NULL_HANDLE || State::Instance().isShuttingDown)
+    {
+        t_lastSwapchain = VK_NULL_HANDLE;
+        t_lastState.reset();
+        return nullptr;
+    }
+
+    if (swapchain == t_lastSwapchain)
+    {
+        if (auto cached = t_lastState.lock();
+            cached && cached->swapchain == swapchain && !cached->destroying.load(std::memory_order_acquire))
+        {
+            return cached;
+        }
+    }
+
+    std::shared_ptr<VulkanFrameSync::SwapchainSyncState> state;
+    {
+        std::scoped_lock lock(g_registryMutex);
+        state = FindSwapchainLocked(swapchain);
+    }
+
+    t_lastSwapchain = state ? swapchain : VK_NULL_HANDLE;
+    t_lastState = state;
+    return state;
+}
 uint64_t LookupTimingRingQpc(VulkanFrameSync::SwapchainSyncState& state, uint64_t presentId, uint32_t timingId)
 {
     std::scoped_lock tlock(state.timingRingMutex);
@@ -1101,11 +1133,7 @@ void VulkanFrameSync::SyncGpu(VkQueue queue, const VkPresentInfoKHR* pPresentInf
     }
 
     const VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[0];
-    std::shared_ptr<SwapchainSyncState> state;
-    {
-        std::scoped_lock lock(g_registryMutex);
-        state = FindSwapchainLocked(swapchain);
-    }
+    std::shared_ptr<SwapchainSyncState> state = ResolveSwapchain(swapchain);
 
     if (!state || state->createFence == nullptr || state->waitForFences == nullptr ||
         state->getFenceStatus == nullptr || state->resetFences == nullptr || state->queueSubmit == nullptr)
@@ -1182,11 +1210,7 @@ void VulkanFrameSync::PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPres
         return;
 
     const VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[0];
-    std::shared_ptr<SwapchainSyncState> state;
-    {
-        std::scoped_lock lock(g_registryMutex);
-        state = FindSwapchainLocked(swapchain);
-    }
+    std::shared_ptr<SwapchainSyncState> state = ResolveSwapchain(swapchain);
 
     if (!state || state->destroying.load(std::memory_order_acquire))
         return;

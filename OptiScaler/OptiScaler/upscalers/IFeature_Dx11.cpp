@@ -139,128 +139,25 @@ bool IFeature_Dx11::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Par
     InParameters->Get(NVSDK_NGX_Parameter_Depth, &paramDepth);
 
     // Order is important as that's the order of shader dispatch
-    std::vector<ShaderPass> pipeline;
+    struct PostPass
+    {
+        PostPassStage stage;
+        ID3D11Resource* inputBuffer = nullptr;
+        ID3D11Resource* outputBuffer = nullptr;
+    };
+
+    std::array<PostPass, 3> pipeline {};
+    size_t passCount = 0;
 
     if (useOutputScaling)
-    {
-        pipeline.push_back(
-            { // Setup
-              [&](ID3D11Resource* nextOutput) -> ID3D11Resource*
-              {
-                  if (OutputScaler->CreateBufferResource(Device, nextOutput, TargetWidth(), TargetHeight()))
-                  {
-                      return OutputScaler->Buffer();
-                  }
-                  return nullptr;
-              },
-
-              // Dispatch
-              [&](ID3D11Resource* input, ID3D11Resource* output) -> bool
-              {
-                  LOG_DEBUG("Scaling output...");
-
-                  if (!OutputScaler->Dispatch(Device, InDeviceContext, (ID3D11Texture2D*) input,
-                                              (ID3D11Texture2D*) output))
-                  {
-                      Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
-                      State::Instance().changeBackend[Handle()->Id] = true;
-                      return false;
-                  }
-                  return true;
-              } });
-    }
+        pipeline[passCount++].stage = PostPassStage::OutputScaling;
 
     _actualSharpness.reset();
     if (useRcas)
-    {
-        pipeline.push_back(
-            { // Setup
-              [&](ID3D11Resource* nextOutput) -> ID3D11Resource*
-              {
-                  // Same checks as Dispatch, a skipped pass must not take over the output
-                  if (paramMotion && paramOutput && RCAS->CreateBufferResource(Device, nextOutput) && RCAS->CanRender())
-                  {
-                      // Disable any built-in sharpness shaders
-                      InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
-                      _actualSharpness = _sharpness;
-                      _sharpness = 0.0f;
-
-                      return RCAS->Buffer();
-                  }
-                  return nullptr;
-              },
-
-              // Dispatch
-              [&](ID3D11Resource* input, ID3D11Resource* output) -> bool
-              {
-                  if (!RCAS->CanRender() || !paramMotion || !paramOutput)
-                      return true;
-
-                  RcasConstants rcasConstants {};
-
-                  rcasConstants.Sharpness = _actualSharpness.value_or(_sharpness);
-                  rcasConstants.DepthIsLinear = DepthLinear();
-                  rcasConstants.DepthIsReversed = DepthInverted();
-                  rcasConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
-                                        State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
-
-                  // Restore value
-                  _sharpness = _actualSharpness.value_or(_sharpness);
-                  _actualSharpness.reset();
-
-                  InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &rcasConstants.MvScaleX);
-                  InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &rcasConstants.MvScaleY);
-
-                  float nearPlane = 0.0f;
-                  float farPlane = 0.0f;
-
-                  // We need camera near and far for DLSSD
-                  // We passthrough those values from the DLSSG params onto the upscaler's params
-                  if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
-                      InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
-                  {
-                      rcasConstants.CameraNear = nearPlane;
-                      rcasConstants.CameraFar = farPlane;
-                  }
-                  else
-                  {
-                      rcasConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
-                      rcasConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
-                  }
-
-                  if (!RCAS->Dispatch(Device, InDeviceContext, (ID3D11Texture2D*) input, (ID3D11Texture2D*) paramMotion,
-                                      rcasConstants, (ID3D11Texture2D*) output, (ID3D11Texture2D*) paramDepth))
-                  {
-                      Config::Instance()->RcasEnabled.set_volatile_value(false);
-                      return false;
-                  }
-                  return true;
-              } });
-    }
+        pipeline[passCount++].stage = PostPassStage::Rcas;
 
     if (Magnifier->ShouldRun())
-    {
-        pipeline.push_back({ // Setup
-                             [&](ID3D11Resource* nextOutput) -> ID3D11Resource*
-                             {
-                                 // Same checks as Dispatch, a skipped pass must not take over the output
-                                 if (paramMotion && paramOutput &&
-                                     Magnifier->CreateBufferResource(Device, nextOutput) && Magnifier->CanRender())
-                                     return Magnifier->Buffer();
-
-                                 return nullptr;
-                             },
-
-                             // Dispatch
-                             [&](ID3D11Resource* input, ID3D11Resource* output) -> bool
-                             {
-                                 if (!Magnifier->CanRender() || !paramMotion || !paramOutput)
-                                     return true;
-
-                                 return Magnifier->Dispatch(Device, InDeviceContext, (ID3D11Texture2D*) input,
-                                                            (ID3D11Texture2D*) output);
-                             } });
-    }
+        pipeline[passCount++].stage = PostPassStage::Magnifier;
 
     // RCAS setup and DLSS zero the game's sharpness, restored after EvaluateInternal
     float originalSharpness = 0.0f;
@@ -269,13 +166,43 @@ bool IFeature_Dx11::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Par
 
     // Iterate BACKWARDS to establish where each shader needs to pull its input from
     ID3D11Resource* currentTarget = paramOutput;
-    for (auto it = pipeline.rbegin(); it != pipeline.rend(); ++it)
+    for (size_t i = passCount; i-- > 0;)
     {
-        ID3D11Resource* requiredInput = it->Setup(currentTarget);
+        auto& pass = pipeline[i];
+        ID3D11Resource* requiredInput = nullptr;
+
+        switch (pass.stage)
+        {
+        case PostPassStage::OutputScaling:
+            if (OutputScaler->CreateBufferResource(Device, currentTarget, TargetWidth(), TargetHeight()))
+                requiredInput = OutputScaler->Buffer();
+            break;
+
+        case PostPassStage::Rcas:
+            // Same checks as Dispatch, a skipped pass must not take over the output
+            if (paramMotion && paramOutput && RCAS->CreateBufferResource(Device, currentTarget) && RCAS->CanRender())
+            {
+                // Disable any built-in sharpness shaders
+                InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
+                _actualSharpness = _sharpness;
+                _sharpness = 0.0f;
+
+                requiredInput = RCAS->Buffer();
+            }
+            break;
+
+        case PostPassStage::Magnifier:
+            // Same checks as Dispatch, a skipped pass must not take over the output
+            if (paramMotion && paramOutput && Magnifier->CreateBufferResource(Device, currentTarget) &&
+                Magnifier->CanRender())
+                requiredInput = Magnifier->Buffer();
+            break;
+        }
+
         if (requiredInput)
         {
-            it->outputBuffer = currentTarget;
-            it->inputBuffer = requiredInput;
+            pass.outputBuffer = currentTarget;
+            pass.inputBuffer = requiredInput;
             currentTarget = requiredInput; // Shift the target back for the next previous stage
         }
     }
@@ -300,15 +227,85 @@ bool IFeature_Dx11::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Par
     bool pipelineFailed = false;
 
     // Iterate FORWARDS to execute the shaders in the defined order
-    for (auto& pass : pipeline)
+    for (size_t i = 0; i < passCount; ++i)
     {
-        if (pass.inputBuffer && pass.outputBuffer)
+        const auto& pass = pipeline[i];
+        if (!pass.inputBuffer || !pass.outputBuffer)
+            continue;
+
+        bool ok = true;
+        switch (pass.stage)
         {
-            if (!pass.Dispatch(pass.inputBuffer, pass.outputBuffer))
+        case PostPassStage::OutputScaling:
+            LOG_DEBUG("Scaling output...");
+
+            if (!OutputScaler->Dispatch(Device, InDeviceContext, (ID3D11Texture2D*) pass.inputBuffer,
+                                        (ID3D11Texture2D*) pass.outputBuffer))
             {
-                pipelineFailed = true;
-                break;
+                Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
+                State::Instance().changeBackend[Handle()->Id] = true;
+                ok = false;
             }
+            break;
+
+        case PostPassStage::Rcas:
+            if (RCAS->CanRender() && paramMotion && paramOutput)
+            {
+                RcasConstants rcasConstants {};
+
+                rcasConstants.Sharpness = _actualSharpness.value_or(_sharpness);
+                rcasConstants.DepthIsLinear = DepthLinear();
+                rcasConstants.DepthIsReversed = DepthInverted();
+                rcasConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
+                                      State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+
+                // Restore value
+                _sharpness = _actualSharpness.value_or(_sharpness);
+                _actualSharpness.reset();
+
+                InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &rcasConstants.MvScaleX);
+                InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &rcasConstants.MvScaleY);
+
+                float nearPlane = 0.0f;
+                float farPlane = 0.0f;
+
+                // We need camera near and far for DLSSD
+                // We passthrough those values from the DLSSG params onto the upscaler's params
+                if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
+                    InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
+                {
+                    rcasConstants.CameraNear = nearPlane;
+                    rcasConstants.CameraFar = farPlane;
+                }
+                else
+                {
+                    rcasConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+                    rcasConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+                }
+
+                if (!RCAS->Dispatch(Device, InDeviceContext, (ID3D11Texture2D*) pass.inputBuffer,
+                                    (ID3D11Texture2D*) paramMotion, rcasConstants, (ID3D11Texture2D*) pass.outputBuffer,
+                                    (ID3D11Texture2D*) paramDepth))
+                {
+                    Config::Instance()->RcasEnabled.set_volatile_value(false);
+                    ok = false;
+                }
+            }
+            break;
+
+        case PostPassStage::Magnifier:
+            if (Magnifier->CanRender() && paramMotion && paramOutput)
+            {
+                ok = Magnifier->Dispatch(Device, InDeviceContext, (ID3D11Texture2D*) pass.inputBuffer,
+                                         (ID3D11Texture2D*) pass.outputBuffer);
+            }
+            break;
+        }
+
+        if (!ok)
+        {
+            pipelineFailed = true;
+            break;
         }
     }
 

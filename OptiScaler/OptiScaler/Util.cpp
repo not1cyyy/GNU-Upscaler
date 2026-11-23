@@ -343,24 +343,22 @@ std::optional<std::filesystem::path> Util::NvngxPath()
     return result;
 }
 
+static const uint64_t g_qpcFrequency = []() -> uint64_t
+{
+    LARGE_INTEGER freq {};
+    return (QueryPerformanceFrequency(&freq) && freq.QuadPart > 0) ? static_cast<uint64_t>(freq.QuadPart) : 0ULL;
+}();
+
 double Util::MillisecondsNow()
 {
-    static LARGE_INTEGER s_frequency;
-    static BOOL s_use_qpc = QueryPerformanceFrequency(&s_frequency);
-    double milliseconds = 0;
-
-    if (s_use_qpc)
+    if (g_qpcFrequency > 0)
     {
         LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        milliseconds = double(1000.0 * now.QuadPart) / s_frequency.QuadPart;
-    }
-    else
-    {
-        milliseconds = double(GetTickCount64());
+        if (QueryPerformanceCounter(&now))
+            return static_cast<double>(now.QuadPart) * 1000.0 / static_cast<double>(g_qpcFrequency);
     }
 
-    return milliseconds;
+    return static_cast<double>(GetTickCount64());
 }
 
 std::filesystem::path Util::ExePath()
@@ -1124,20 +1122,16 @@ std::map<Util::Luid, std::filesystem::path> Util::GetDriverStore()
 
 uint64_t Util::QpcToNs(int64_t ticks)
 {
-    static LARGE_INTEGER s_frequency;
-    static BOOL s_use_qpc = QueryPerformanceFrequency(&s_frequency);
-
-    if (s_use_qpc && s_frequency.QuadPart > 0)
+    if (g_qpcFrequency > 0)
     {
         const uint64_t q = ticks > 0 ? static_cast<uint64_t>(ticks) : 0ULL;
-        const uint64_t f = static_cast<uint64_t>(s_frequency.QuadPart);
-        const uint64_t whole = (q / f) * 1'000'000'000ULL;
-        const uint64_t rem = q % f;
+        const uint64_t whole = (q / g_qpcFrequency) * 1'000'000'000ULL;
+        const uint64_t rem = q % g_qpcFrequency;
 
-        if (f <= 18'000'000'000ULL)
-            return whole + (rem * 1'000'000'000ULL) / f;
+        if (g_qpcFrequency <= 18'000'000'000ULL)
+            return whole + (rem * 1'000'000'000ULL) / g_qpcFrequency;
 
-        return whole + static_cast<uint64_t>(static_cast<long double>(rem) * 1'000'000'000.0L / f);
+        return whole + static_cast<uint64_t>(static_cast<long double>(rem) * 1'000'000'000.0L / g_qpcFrequency);
     }
 
     return 0ULL;
@@ -1145,19 +1139,15 @@ uint64_t Util::QpcToNs(int64_t ticks)
 
 uint64_t Util::NsToQpc(uint64_t ns)
 {
-    static LARGE_INTEGER s_frequency;
-    static BOOL s_use_qpc = QueryPerformanceFrequency(&s_frequency);
-
-    if (s_use_qpc && s_frequency.QuadPart > 0)
+    if (g_qpcFrequency > 0)
     {
-        const uint64_t f = static_cast<uint64_t>(s_frequency.QuadPart);
-        const uint64_t whole = (ns / 1'000'000'000ULL) * f;
+        const uint64_t whole = (ns / 1'000'000'000ULL) * g_qpcFrequency;
         const uint64_t rem = ns % 1'000'000'000ULL;
 
-        if (f <= 18'000'000'000ULL)
-            return whole + (rem * f) / 1'000'000'000ULL;
+        if (g_qpcFrequency <= 18'000'000'000ULL)
+            return whole + (rem * g_qpcFrequency) / 1'000'000'000ULL;
 
-        return whole + static_cast<uint64_t>(static_cast<long double>(rem) * f / 1'000'000'000.0L);
+        return whole + static_cast<uint64_t>(static_cast<long double>(rem) * g_qpcFrequency / 1'000'000'000.0L);
     }
 
     return 0ULL;
@@ -1174,6 +1164,31 @@ uint64_t Util::GetTimestamp()
     }
 
     return GetTickCount64() * 1'000'000ULL;
+}
+
+uint64_t Util::GetTimestampAndQpc(int64_t& outQpcTicks)
+{
+    LARGE_INTEGER now;
+    if (QueryPerformanceCounter(&now))
+    {
+        outQpcTicks = now.QuadPart;
+        const uint64_t ns = QpcToNs(now.QuadPart);
+        if (ns > 0)
+            return ns;
+    }
+
+    outQpcTicks = 0;
+    return GetTickCount64() * 1'000'000ULL;
+}
+
+bool Util::ShouldSampleUpscalerGpuTime(bool menuVisible)
+{
+    if (menuVisible)
+        return true;
+
+    auto* config = Config::Instance();
+    return config->ShowFps.value_or_default() || config->GaqEnabled.value_or_default() ||
+           config->Fsr4MaxGpuMs.value_or_default() > 0.0f;
 }
 
 void Util::SetFlagEnvVar(const wchar_t* name, bool enabled)

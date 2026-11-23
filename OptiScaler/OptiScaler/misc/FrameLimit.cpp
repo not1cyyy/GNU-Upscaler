@@ -193,12 +193,30 @@ inline int TimerSleep(int64_t hundredNs)
     return 0;
 }
 
-inline int BusywaitUntil(uint64_t deadlineNs)
+inline int BusywaitUntilTicks(int64_t targetTicks)
 {
-    while (Util::GetTimestamp() < deadlineNs)
+    if (targetTicks <= 0)
+        return 0;
+
+    LARGE_INTEGER now;
+    while (QueryPerformanceCounter(&now) && now.QuadPart < targetTicks)
         FL_CPU_PAUSE();
 
     return 0;
+}
+
+inline int BusywaitUntil(uint64_t deadlineNs)
+{
+    int64_t curTicks = 0;
+    const uint64_t curNs = Util::GetTimestampAndQpc(curTicks);
+    if (deadlineNs <= curNs || curTicks <= 0)
+        return 0;
+
+    const int64_t deltaTicks = static_cast<int64_t>(Util::NsToQpc(deadlineNs - curNs));
+    if (deltaTicks <= 0)
+        return 0;
+
+    return BusywaitUntilTicks(curTicks + deltaTicks);
 }
 
 // Leaf lock: never acquires g_pacerMutex or g_pllMutex
@@ -297,6 +315,8 @@ std::atomic<uint64_t> g_gamescopeScanoutPeriodNs { 0 };
 std::atomic<uint64_t> g_lastSleepWholeUs { 0 };
 std::atomic<uint64_t> g_measuredGpuWorkNs { 0 };
 std::atomic<bool> g_gpuSyncStrictActive { false };
+std::atomic<uint64_t> g_pendingFrontEdgeNs { 0 };
+std::atomic<uint64_t> g_pendingPreSleptNs { 0 };
 
 // Leaf lock: never acquires g_pacerMutex or g_pllMutex
 std::mutex g_fgSubMutex;
@@ -651,6 +671,8 @@ void ResetPacer(PacerState& pacer)
     g_measuredGpuWorkNs.store(0, std::memory_order_relaxed);
     g_gpuSyncStrictActive.store(false, std::memory_order_relaxed);
     g_priorityBoostActive.store(false, std::memory_order_relaxed);
+    g_pendingFrontEdgeNs.store(0, std::memory_order_relaxed);
+    g_pendingPreSleptNs.store(0, std::memory_order_relaxed);
 }
 
 bool ShouldYieldToGamescopeLimiter(uint64_t intervalNs)
@@ -775,7 +797,8 @@ int SleepStaggerUntilNs(uint64_t deadlineNs, uint64_t startEpoch)
 
     while (!shouldAbort())
     {
-        const uint64_t now = Util::GetTimestamp();
+        int64_t nowTicks = 0;
+        const uint64_t now = Util::GetTimestampAndQpc(nowTicks);
         if (now >= deadlineNs)
             break;
 
@@ -785,7 +808,10 @@ int SleepStaggerUntilNs(uint64_t deadlineNs, uint64_t startEpoch)
 
         if (remaining <= tailNs + 1'000)
         {
-            while (Util::GetTimestamp() < deadlineNs && !shouldAbort())
+            const int64_t deltaTicks = static_cast<int64_t>(Util::NsToQpc(static_cast<uint64_t>(remaining)));
+            const int64_t targetTicks = nowTicks + deltaTicks;
+            LARGE_INTEGER qpcNow;
+            while (deltaTicks > 0 && QueryPerformanceCounter(&qpcNow) && qpcNow.QuadPart < targetTicks && !shouldAbort())
                 FL_CPU_PAUSE();
             break;
         }
@@ -924,7 +950,8 @@ void UpdateMaxInFlightLocked(uint64_t dt, bool isVsyncMode)
 
 int FrameLimit::sleepUntilNs(uint64_t deadlineNs)
 {
-    const uint64_t startNow = Util::GetTimestamp();
+    int64_t startTicks = 0;
+    const uint64_t startNow = Util::GetTimestampAndQpc(startTicks);
     if (deadlineNs <= startNow)
         return 0;
 
@@ -934,20 +961,28 @@ int FrameLimit::sleepUntilNs(uint64_t deadlineNs)
     const int64_t tailNs = ComputeSleepTailNs(overshootReserve);
 
     if (totalNs <= tailNs + 1000)
-        return BusywaitUntil(deadlineNs);
+    {
+        const int64_t deltaTicks = static_cast<int64_t>(Util::NsToQpc(static_cast<uint64_t>(totalNs)));
+        return deltaTicks > 0 ? BusywaitUntilTicks(startTicks + deltaTicks) : 0;
+    }
 
     const int64_t requestedSleepNs = totalNs - tailNs;
-    const uint64_t timerStart = Util::GetTimestamp();
+    const uint64_t timerStart = startNow;
     status = TimerSleep(requestedSleepNs / 100);
-    const uint64_t afterTimer = Util::GetTimestamp();
+    int64_t afterTicks = 0;
+    const uint64_t afterTimer = Util::GetTimestampAndQpc(afterTicks);
     const int64_t actualSleepNs = static_cast<int64_t>(afterTimer - timerStart);
 
     if (status == 0)
         UpdateTimerOvershootEma(requestedSleepNs, actualSleepNs, overshootReserve);
 
-    // Fine-grained busy wait completes the remaining sub-millisecond precision to exact deadline
+    // Fine-grained busy wait completes the remaining sub-millisecond precision to exact deadline using raw QPC ticks
     if (afterTimer < deadlineNs)
-        BusywaitUntil(deadlineNs);
+    {
+        const int64_t remTicks = static_cast<int64_t>(Util::NsToQpc(deadlineNs - afterTimer));
+        if (remTicks > 0)
+            BusywaitUntilTicks(afterTicks + remTicks);
+    }
 
     return status;
 }
@@ -1631,10 +1666,14 @@ uint64_t FrameLimit::getDesiredDisplayTimeNs(bool useActiveDxgiFrame, bool targe
         return 0;
     }
 
-    // Hold a 1.0ms safety cushion ahead of the deadline so wakeup jitter never misses a compositor VBlank
-    constexpr uint64_t kScheduleCushionNs = 1'000'000ULL;
+    // Adaptive safety cushion ahead of deadline so tight RT/POSIX wakeups don't waste up to 1.0ms of lead margin
+    const int64_t osOvershoot = g_timerOvershootEmaNs.load(std::memory_order_relaxed);
+    const uint64_t scheduleCushionNs = std::clamp<uint64_t>(
+        static_cast<uint64_t>(std::max<int64_t>(0, osOvershoot) * 2) +
+            static_cast<uint64_t>(std::max(0.0, g_pacer.cpuJitterEmaNs * 1.5)) + 150'000ULL,
+        250'000ULL, 1'000'000ULL);
     const uint64_t targetQpc =
-        (frameTargetQpc > kScheduleCushionNs) ? (frameTargetQpc - kScheduleCushionNs) : frameTargetQpc;
+        (frameTargetQpc > scheduleCushionNs) ? (frameTargetQpc - scheduleCushionNs) : frameTargetQpc;
 
     if (targetQpcDomain)
     {
@@ -1761,6 +1800,18 @@ FrameLimit::SyncStats FrameLimit::getStats()
     return stats;
 }
 
+static void RecordFrontEdgeLocked(uint64_t edgeNs, double preSleptMs)
+{
+    if (g_pacer.lastFrontEdgeNs > 0 && edgeNs > g_pacer.lastFrontEdgeNs &&
+        (edgeNs - g_pacer.lastFrontEdgeNs) <= kPauseRebaseGapNs)
+    {
+        PushFrameTimeMs(g_pacer.frameTimesMs, g_pacer.frameTimeHead, g_pacer.frameTimeCount, g_pacer.lastFrontEdgeNs,
+                        edgeNs);
+    }
+    g_pacer.lastFrontEdgeNs = edgeNs;
+    g_pacer.preSleptMs = preSleptMs;
+}
+
 void FrameLimit::prePresent(bool fgActive)
 {
     const uint64_t intervalNs = ComputeIntervalNs(fgActive);
@@ -1807,6 +1858,8 @@ void FrameLimit::prePresent(bool fgActive)
             g_pacer.currentFrameTargetNs = 0;
             g_pacer.lastFrontEdgeNs = 0;
             g_pacer.preSleptMs = 0.0;
+            g_pendingFrontEdgeNs.store(0, std::memory_order_relaxed);
+            g_pendingPreSleptNs.store(0, std::memory_order_relaxed);
             return;
         }
 
@@ -1817,38 +1870,28 @@ void FrameLimit::prePresent(bool fgActive)
             if (delta <= intervalNs * 2)
                 sleepDeadlineNs = g_pacer.nextTargetNs;
         }
+        if (sleepDeadlineNs == 0)
+        {
+            RecordFrontEdgeLocked(now, 0.0);
+            g_pendingFrontEdgeNs.store(0, std::memory_order_relaxed);
+            g_pendingPreSleptNs.store(0, std::memory_order_relaxed);
+            return;
+        }
     }
 
-    double preSleptMs = 0.0;
-    if (sleepDeadlineNs > 0)
+    const uint64_t sleepStart = Util::GetTimestamp();
+    if (const int res = sleepUntilNs(sleepDeadlineNs); res != 0)
     {
-        const uint64_t sleepStart = Util::GetTimestamp();
-        if (const int res = sleepUntilNs(sleepDeadlineNs); res != 0)
+        static bool errorLogged = false;
+        if (!errorLogged)
         {
-            static bool errorLogged = false;
-            if (!errorLogged)
-            {
-                LOG_ERROR("Sleep command failed: {}", res);
-                errorLogged = true;
-            }
+            LOG_ERROR("Sleep command failed: {}", res);
+            errorLogged = true;
         }
-        const double measuredMs = static_cast<double>(Util::GetTimestamp() - sleepStart) / 1e6;
-        if (measuredMs > 0.0)
-            preSleptMs = measuredMs;
     }
-
-    {
-        std::scoped_lock lock(g_pacerMutex);
-        const uint64_t edgeNow = Util::GetTimestamp();
-        if (g_pacer.lastFrontEdgeNs > 0 && edgeNow > g_pacer.lastFrontEdgeNs &&
-            (edgeNow - g_pacer.lastFrontEdgeNs) <= kPauseRebaseGapNs)
-        {
-            PushFrameTimeMs(g_pacer.frameTimesMs, g_pacer.frameTimeHead, g_pacer.frameTimeCount,
-                            g_pacer.lastFrontEdgeNs, edgeNow);
-        }
-        g_pacer.lastFrontEdgeNs = edgeNow;
-        g_pacer.preSleptMs = preSleptMs;
-    }
+    const uint64_t edgeNow = Util::GetTimestamp();
+    g_pendingFrontEdgeNs.store(edgeNow, std::memory_order_relaxed);
+    g_pendingPreSleptNs.store(edgeNow > sleepStart ? (edgeNow - sleepStart) : 0ULL, std::memory_order_relaxed);
 }
 
 void FrameLimit::postPresent(bool fgActive)
@@ -1878,6 +1921,12 @@ void FrameLimit::postPresent(bool fgActive)
         std::scoped_lock lock(g_pacerMutex);
         const uint64_t now = Util::GetTimestamp();
         g_pacer.cpuWorkCapturedThisFrame = false;
+
+        if (const uint64_t pendingEdge = g_pendingFrontEdgeNs.exchange(0, std::memory_order_relaxed); pendingEdge > 0)
+        {
+            const uint64_t preSleptNs = g_pendingPreSleptNs.exchange(0, std::memory_order_relaxed);
+            RecordFrontEdgeLocked(pendingEdge, preSleptNs > 0 ? (static_cast<double>(preSleptNs) / 1e6) : 0.0);
+        }
 
         if (fgActive || gpuSyncCfg == 0)
         {

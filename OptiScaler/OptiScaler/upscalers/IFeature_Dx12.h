@@ -15,19 +15,6 @@
 class IFeature_Dx12 : public virtual IFeature
 {
   private:
-    struct ShaderPass
-    {
-        // Requests the target buffer it needs to write to. Returns the buffer the PREVIOUS stage must write to
-        std::function<ID3D12Resource*(ID3D12Resource* nextOutput)> Setup;
-
-        // Runs the shader
-        std::function<bool(ID3D12Resource* input, ID3D12Resource* output)> Dispatch;
-
-        // Internal state tracked by the pipeline setup loop
-        ID3D12Resource* inputBuffer = nullptr;
-        ID3D12Resource* outputBuffer = nullptr;
-    };
-
     struct PendingAsyncPostPasses
     {
         bool active = false;

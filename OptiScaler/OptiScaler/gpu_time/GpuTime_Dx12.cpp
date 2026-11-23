@@ -42,11 +42,21 @@ GpuTime_Dx12::GpuTime_Dx12(ID3D12Device* device)
         return;
     }
 
+    if (FAILED(_readbackBuffer->Map(0, nullptr, reinterpret_cast<void**>(&_mappedTimestamps))))
+        _mappedTimestamps = nullptr;
+
     _init = true;
 }
 
 GpuTime_Dx12::~GpuTime_Dx12()
 {
+    if (_readbackBuffer != nullptr && _mappedTimestamps != nullptr)
+    {
+        const D3D12_RANGE emptyWriteRange = { 0, 0 };
+        _readbackBuffer->Unmap(0, &emptyWriteRange);
+        _mappedTimestamps = nullptr;
+    }
+
     DeferredRelease::Release(_queryHeap);
     DeferredRelease::Release(_readbackBuffer);
 }
@@ -87,9 +97,34 @@ std::optional<double> GpuTime_Dx12::ReadGpuTime(ID3D12CommandQueue* commandQueue
     if (!_trigger[previousFrameIndex])
         return elapsedTimeMs;
 
+    if (commandQueue == nullptr)
+        return elapsedTimeMs;
+
+    if (commandQueue != _cachedQueue || _cachedFrequency == 0)
+    {
+        UINT64 freq = 0;
+        if (FAILED(commandQueue->GetTimestampFrequency(&freq)) || freq == 0)
+            return elapsedTimeMs;
+        _cachedFrequency = freq;
+        _cachedQueue = commandQueue;
+    }
+
+    if (_mappedTimestamps != nullptr)
+    {
+        const UINT64 startTime = _mappedTimestamps[previousFrameIndex * 2];
+        const UINT64 endTime = _mappedTimestamps[previousFrameIndex * 2 + 1];
+
+        if (endTime < startTime)
+            return elapsedTimeMs;
+
+        elapsedTimeMs = (endTime - startTime) / static_cast<double>(_cachedFrequency) * 1000.0;
+        _trigger[previousFrameIndex] = false;
+        return elapsedTimeMs;
+    }
+
     UINT64* timestampData {};
 
-    // Tell it which timestamps we will be reading
+    // Fallback temporary map if persistent map failed
     D3D12_RANGE readRange = { previousFrameIndex * 2 * sizeof(UINT64), (previousFrameIndex * 2 + 2) * sizeof(UINT64) };
     _readbackBuffer->Map(0, &readRange, reinterpret_cast<void**>(&timestampData));
 
@@ -98,10 +133,6 @@ std::optional<double> GpuTime_Dx12::ReadGpuTime(ID3D12CommandQueue* commandQueue
 
     if (timestampData != nullptr)
     {
-        // Get the GPU timestamp frequency (ticks per second)
-        UINT64 gpuFrequency;
-        commandQueue->GetTimestampFrequency(&gpuFrequency);
-
         // Calculate elapsed time in milliseconds
         UINT64 startTime = timestampData[previousFrameIndex * 2];
         UINT64 endTime = timestampData[previousFrameIndex * 2 + 1];
@@ -112,7 +143,7 @@ std::optional<double> GpuTime_Dx12::ReadGpuTime(ID3D12CommandQueue* commandQueue
             return elapsedTimeMs;
         }
 
-        elapsedTimeMs = (endTime - startTime) / static_cast<double>(gpuFrequency) * 1000.0;
+        elapsedTimeMs = (endTime - startTime) / static_cast<double>(_cachedFrequency) * 1000.0;
     }
     else
     {

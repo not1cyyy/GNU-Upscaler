@@ -9,20 +9,6 @@
 
 class IFeature_Vk : public virtual IFeature
 {
-  private:
-    struct ShaderPass
-    {
-        // Requests the target image it needs to write to. Returns the image the PREVIOUS stage must write to.
-        std::function<VkImageInfo(const VkImageInfo& nextOutput)> Setup;
-
-        // Runs the shader
-        std::function<bool(const VkImageInfo& input, const VkImageInfo& output)> Dispatch;
-
-        // Internal state tracked by the pipeline setup loop
-        VkImageInfo inputBuffer {};
-        VkImageInfo outputBuffer {};
-    };
-
   protected:
     VkInstance Instance = nullptr;
     VkPhysicalDevice PhysicalDevice = nullptr;

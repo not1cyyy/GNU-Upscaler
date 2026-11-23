@@ -19,6 +19,7 @@
 #include <misc/IdentifyGpu.h>
 #include <hooks/Reflex_Hooks.h>
 #include <low_latency/input/input_common.h>
+#include <menu/menu_overlay_base.h>
 #include <menu/menu_overlay_dx.h>
 #include <imgui/ImGuiNotify.hpp>
 
@@ -1389,7 +1390,10 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
 
     IFGFeature* fg = state.currentFG;
 
-    if (fg != nullptr && willPresent && fg->IsActive() && !fg->IsPaused())
+    const bool needDetailedTimes = MenuOverlayBase::IsVisible();
+    const bool needUpscalerTime = Util::ShouldSampleUpscalerGpuTime(needDetailedTimes);
+
+    if (fg != nullptr && willPresent && fg->IsActive() && !fg->IsPaused() && needUpscalerTime)
     {
         if (auto currentFeature = State::Instance().currentFeature; currentFeature != nullptr)
         {
@@ -1401,7 +1405,10 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
                 state.currentD3D11Device->GetImmediateContext(&context);
 
                 if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(context); upscalerTimeOpt.has_value())
-                    currentFeature->ReadDetailedGpuTimes(context, state.detailedGpuTimes);
+                {
+                    if (needDetailedTimes)
+                        currentFeature->ReadDetailedGpuTimes(context, state.detailedGpuTimes);
+                }
 
                 context->Release();
             }
@@ -1410,12 +1417,16 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
                 if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(currentCommandQueue);
                     upscalerTimeOpt.has_value())
                 {
-                    currentFeature->ReadDetailedGpuTimes(currentCommandQueue, state.detailedGpuTimes);
+                    if (needDetailedTimes)
+                        currentFeature->ReadDetailedGpuTimes(currentCommandQueue, state.detailedGpuTimes);
                 }
 
-                if (auto fgGpuTime = fg->ReadGpuTime(currentCommandQueue))
+                if (needDetailedTimes)
                 {
-                    state.detailedGpuTimes.emplace_back(DetailedGpuTime { fg->Name(), fgGpuTime.value(), false });
+                    if (auto fgGpuTime = fg->ReadGpuTime(currentCommandQueue))
+                    {
+                        state.detailedGpuTimes.emplace_back(DetailedGpuTime { fg->Name(), fgGpuTime.value(), false });
+                    }
                 }
             }
 

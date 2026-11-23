@@ -2437,6 +2437,8 @@ struct MenuCommon::RenderMenuContext
     std::unique_ptr<std::decay_t<decltype(IdentifyGpu::getPrimaryGpu())>> primaryGpu;
 };
 
+std::unique_ptr<MenuCommon::RenderMenuContext> MenuCommon::_preparedMenuCtx {};
+
 static std::string splashMessage;
 
 void MenuCommon::UpdateRenderTiming(RenderMenuContext& ctx)
@@ -2732,8 +2734,7 @@ void MenuCommon::BeginMenuFrameIfNeeded(RenderMenuContext& ctx)
     auto& newFrame = ctx.newFrame;
 
     // New frame check
-    if ((!config->DisableSplash.value_or_default() && now > splashStart && now < splashLimit) ||
-        config->ShowFps.value_or_default() || _isVisible || ImGui::notifications.size() > 0)
+    if (NeedsMenuFrame(ctx))
     {
         if (!_isUWP)
         {
@@ -11579,15 +11580,14 @@ void KeyUp(UINT vKey)
     inputFpsCycle = vKey == Config::Instance()->FpsCycleShortcutKey.value_or_default();
 }
 
-bool MenuCommon::RenderMenu()
+bool MenuCommon::NeedsMenuFrame(const RenderMenuContext& ctx)
 {
-    if (!_isInited)
-        return false;
+    return (!ctx.config->DisableSplash.value_or_default() && ctx.now > splashStart && ctx.now < splashLimit) ||
+           ctx.config->ShowFps.value_or_default() || _isVisible || !ImGui::notifications.empty();
+}
 
-    RenderMenuContext ctx { State::Instance(), Config::Instance(), ImGui::GetIO() };
-    ctx.now = Util::MillisecondsNow();
-    ctx.currentFeature = ctx.state.currentFeature;
-
+bool MenuCommon::PrepareMenuFrameInternal(RenderMenuContext& ctx)
+{
     // Applied here, the feature isn't safe to read from the plugin's thread, kept until there is one
     if (ctx.currentFeature != nullptr && PluginApi::TakeReInitRequest())
         ReInitUpscaler();
@@ -11597,12 +11597,52 @@ bool MenuCommon::RenderMenu()
     UpdateMenuInputMode(ctx);
     HandleMenuShortcuts(ctx);
 
-    // 2) Prepare one-shot notifications and start a new ImGui frame only when needed.
+    // 2) Prepare one-shot notifications and check whether any overlay or UI needs an ImGui frame.
     UpdateVersionAndStartupNotifications(ctx);
+    return NeedsMenuFrame(ctx);
+}
+
+bool MenuCommon::PrepareFrame()
+{
+    _preparedMenuCtx.reset();
+
+    if (!_isInited)
+        return false;
+
+    auto ctx =
+        std::unique_ptr<RenderMenuContext>(new RenderMenuContext { State::Instance(), Config::Instance(), ImGui::GetIO() });
+    ctx->now = Util::MillisecondsNow();
+    ctx->currentFeature = ctx->state.currentFeature;
+
+    if (!PrepareMenuFrameInternal(*ctx))
+    {
+        OptiInput::EndFrame(_isVisible);
+        return false;
+    }
+
+    _preparedMenuCtx = std::move(ctx);
+    return true;
+}
+
+bool MenuCommon::RenderMenu()
+{
+    if (!_isInited)
+    {
+        _preparedMenuCtx.reset();
+        return false;
+    }
+
+    if (!_preparedMenuCtx && !PrepareFrame())
+        return false;
+
+    auto preparedCtx = std::move(_preparedMenuCtx);
+    RenderMenuContext& ctx = *preparedCtx;
+
+    // 3) Start the ImGui frame after the backend *_NewFrame() has run.
     BeginMenuFrameIfNeeded(ctx);
     OptiInput::EndFrame(_isVisible);
 
-    // 3) Draw lightweight overlay windows first, preserving the original order.
+    // 4) Draw lightweight overlay windows first, preserving the original order.
     ctx.menuResScale = MenuResolutionScale(ctx.io);
 
     // The overlays share the style with the menu, so it's scaled before them even when the menu is closed
@@ -11740,6 +11780,8 @@ void MenuCommon::Init(HWND InHwnd, bool isUWP)
 
 void MenuCommon::Shutdown()
 {
+    _preparedMenuCtx.reset();
+
     if (!MenuCommon::_isInited)
         return;
 

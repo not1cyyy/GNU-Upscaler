@@ -316,14 +316,11 @@ static void RenderImGui_DX11(IDXGISwapChain* pSwapChain)
         if (ImGui::GetCurrentContext() && g_pd3dRenderTarget)
         {
             ImGui_ImplDX11_NewFrame();
-            ImGui_ImplWin32_NewFrame();
 
             ID3D11Texture2D* backBuffer = nullptr;
-            pSwapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-
-            // Blur textures are only created once the menu is opened, menu decides if they are used
             bool blurReady = false;
-            if (backBuffer != nullptr && (g_menuBlurDx11 || MenuOverlayBase::IsVisible()))
+            if (MenuOverlayBase::IsVisible() && pSwapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)) == S_OK &&
+                backBuffer != nullptr)
             {
                 if (!g_menuBlurDx11)
                     g_menuBlurDx11 = std::make_unique<MenuBlur_Dx11>("MenuBlur", g_pd3dDevice);
@@ -575,9 +572,9 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
 
             ImGui_ImplDX12_NewFrame();
 
-            // Blur textures are only created once the menu is opened, menu decides if they are used
+            // Blur textures are only prepared while the menu is visible
             bool blurReady = false;
-            if (g_menuBlur || MenuOverlayBase::IsVisible())
+            if (MenuOverlayBase::IsVisible())
             {
                 if (!g_menuBlur)
                     g_menuBlur = std::make_unique<MenuBlur_Dx12>("MenuBlur", device, &g_pd3dSrvDescHeapAlloc);
@@ -724,6 +721,11 @@ void MenuOverlayDx::Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         MenuOverlayBase::Present();
         return;
     }
+
+    const bool ready = _isInited && MenuOverlayBase::IsInited() && MenuOverlayBase::Handle() == hWnd &&
+                       ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().BackendRendererUserData != nullptr;
+    if (ready && !MenuOverlayBase::PrepareFrame())
+        return;
 
     LOG_DEBUG("");
 

@@ -30,6 +30,8 @@ void MenuOverlayBase::Init(HWND InHandle, bool isUWP)
     MenuCommon::Init(InHandle, isUWP);
 }
 
+bool MenuOverlayBase::PrepareFrame() { return MenuCommon::PrepareFrame(); }
+
 bool MenuOverlayBase::RenderMenu()
 {
     if (!Config::Instance()->OverlayMenu.value_or_default())

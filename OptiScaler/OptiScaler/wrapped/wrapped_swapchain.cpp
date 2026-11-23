@@ -497,7 +497,8 @@ struct DxSwapchainGpuSync
 
         const uint64_t submitNs = Util::GetTimestamp();
         ctx11->End(curQuery.Get());
-        ctx11->Flush();
+        if (syncDepth == 0)
+            ctx11->Flush();
 
         auto waitQuery = [this](ID3D11Query* q, bool& outBusy) -> bool
         {
@@ -583,9 +584,62 @@ static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT sync
     }
 }
 
+void WrappedIDXGISwapChain4::PresentCache::ResetDevice()
+{
+    if (d3d11Device != nullptr)
+    {
+        d3d11Device->Release();
+        d3d11Device = nullptr;
+    }
+
+    if (d3d12Device != nullptr)
+    {
+        d3d12Device->Release();
+        d3d12Device = nullptr;
+    }
+
+    if (d3d12RawQueue != nullptr)
+    {
+        d3d12RawQueue->Release();
+        d3d12RawQueue = nullptr;
+    }
+
+    d3d12Queue = nullptr;
+    sourceDevice = nullptr;
+    isD3D11 = false;
+    deviceResolved = false;
+    d3d12Hooked = false;
+}
+
+void WrappedIDXGISwapChain4::ApplyWaitableLatencyClamp(bool isCurrent)
+{
+    if (!_presentCache.isWaitable || _real2 == nullptr)
+        return;
+
+    const int maxInFlight =
+        (isCurrent && State::Instance().activeFgOutput == FGOutput::NoFG) ? FrameLimit::maxInFlightPresents() : 0;
+    if (maxInFlight > 0)
+    {
+        const UINT gameMax = _presentCache.hasGameLatency ? _presentCache.gameRequestedLatency : 3u;
+        const UINT desired =
+            std::min(gameMax > 0 ? gameMax : static_cast<UINT>(maxInFlight), static_cast<UINT>(maxInFlight));
+        if (desired != _presentCache.appliedLatency)
+        {
+            if (SUCCEEDED(_real2->SetMaximumFrameLatency(desired)))
+                _presentCache.appliedLatency = desired;
+        }
+    }
+    else if (_presentCache.appliedLatency != 0)
+    {
+        const UINT restore = _presentCache.hasGameLatency ? std::max(1u, _presentCache.gameRequestedLatency) : 3u;
+        if (SUCCEEDED(_real2->SetMaximumFrameLatency(restore)))
+            _presentCache.appliedLatency = 0;
+    }
+}
+
 static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags,
                             const DXGI_PRESENT_PARAMETERS* pPresentParameters, IUnknown* pDevice, HWND hWnd, bool isUWP,
-                            bool isCurrent, DxSwapchainGpuSync* gpuSync)
+                            bool isCurrent, DxSwapchainGpuSync* gpuSync, WrappedIDXGISwapChain4* ownerSC)
 {
     if (State::Instance().isShuttingDown)
     {
@@ -636,66 +690,107 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
         LOG_DEBUG("SyncInterval: {}, Flags: {:X}, Frametime: {:0.3f} ms", SyncInterval, Flags, ftDelta);
 
-        // Update swapchain info evey frame
-        if (isCurrent && pSwapChain->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
-            LOG_WARN("Can't get swapchain desc!");
-    }
-
-    ID3D11Device* device = nullptr;
-    ID3D12Device* device12 = nullptr;
-    ID3D12CommandQueue* cq = nullptr;
-
-    bool isD3D11 = false;
-
-    // try to obtain directx objects and find the path
-    if (pDevice->QueryInterface(IID_PPV_ARGS(&device)) == S_OK)
-    {
-        isD3D11 = true;
-        device->Release();
-
-        if (!_dx11Device)
-            LOG_DEBUG("D3D11Device captured");
-
-        _dx11Device = true;
-
-        if (isCurrent)
+        // Cache swapchain desc once per resize instead of calling DXGI GetDesc every frame
+        if (ownerSC != nullptr)
         {
-            State::Instance().swapchainApi = DX11;
-            State::Instance().currentD3D11Device = device;
-        }
-    }
-    else if (pDevice->QueryInterface(IID_PPV_ARGS(&cq)) == S_OK)
-    {
-        cq->Release();
-
-        if (!_dx12Device)
-            LOG_DEBUG("D3D12CommandQueue captured");
-
-        ID3D12CommandQueue* realQueue = nullptr;
-        if (Util::CheckForRealObject(__FUNCTION__, cq, (IUnknown**) &realQueue))
-            cq = realQueue;
-
-        if (isCurrent)
-        {
-            State::Instance().swapchainApi = DX12;
-
-            if (State::Instance().currentCommandQueue == nullptr)
-                State::Instance().currentCommandQueue = cq;
-        }
-
-        if (cq->GetDevice(IID_PPV_ARGS(&device12)) == S_OK)
-        {
-            device12->Release();
-
-            if (!_dx12Device)
-                LOG_DEBUG("D3D12Device captured");
-
-            _dx12Device = true;
+            auto& cache = ownerSC->GetPresentCache();
+            if (!cache.hasDesc && pSwapChain->GetDesc(&cache.desc) == S_OK)
+                cache.hasDesc = true;
 
             if (isCurrent)
-                State::Instance().currentD3D12Device = device12;
+            {
+                if (cache.hasDesc)
+                    State::Instance().currentSwapchainDesc = cache.desc;
+                else
+                    LOG_WARN("Can't get swapchain desc!");
+            }
+        }
+        else if (isCurrent && pSwapChain->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
+        {
+            LOG_WARN("Can't get swapchain desc!");
+        }
+    }
 
-            D3D12Hooks::HookDevice(device12);
+    auto* cache = ownerSC != nullptr ? &ownerSC->GetPresentCache() : nullptr;
+    if (cache != nullptr && (!cache->deviceResolved || cache->sourceDevice != pDevice))
+    {
+        cache->ResetDevice();
+        cache->sourceDevice = pDevice;
+        cache->deviceResolved = true;
+
+        ID3D11Device* qDevice = nullptr;
+        ID3D12CommandQueue* qQueue = nullptr;
+        if (pDevice != nullptr && pDevice->QueryInterface(IID_PPV_ARGS(&qDevice)) == S_OK)
+        {
+            cache->isD3D11 = true;
+            cache->d3d11Device = qDevice;
+
+            if (!_dx11Device)
+                LOG_DEBUG("D3D11Device captured");
+
+            _dx11Device = true;
+        }
+        else if (pDevice != nullptr && pDevice->QueryInterface(IID_PPV_ARGS(&qQueue)) == S_OK)
+        {
+            cache->d3d12RawQueue = qQueue;
+
+            if (!_dx12Device)
+                LOG_DEBUG("D3D12CommandQueue captured");
+
+            ID3D12CommandQueue* realQueue = nullptr;
+            if (Util::CheckForRealObject(__FUNCTION__, qQueue, (IUnknown**) &realQueue))
+                cache->d3d12Queue = realQueue;
+            else
+                cache->d3d12Queue = qQueue;
+
+            ID3D12Device* qDevice12 = nullptr;
+            if (cache->d3d12Queue->GetDevice(IID_PPV_ARGS(&qDevice12)) == S_OK)
+            {
+                cache->d3d12Device = qDevice12;
+
+                if (!_dx12Device)
+                    LOG_DEBUG("D3D12Device captured");
+
+                _dx12Device = true;
+                D3D12Hooks::HookDevice(qDevice12);
+                cache->d3d12Hooked = true;
+            }
+        }
+    }
+
+    ID3D11Device* device = cache != nullptr ? cache->d3d11Device : nullptr;
+    ID3D12Device* device12 = cache != nullptr ? cache->d3d12Device : nullptr;
+    ID3D12CommandQueue* cq = cache != nullptr ? cache->d3d12Queue : nullptr;
+    bool isD3D11 = cache != nullptr ? cache->isD3D11 : false;
+
+    if (cache != nullptr)
+    {
+        if (isD3D11)
+        {
+            if (isCurrent)
+            {
+                State::Instance().swapchainApi = DX11;
+                State::Instance().currentD3D11Device = device;
+            }
+        }
+        else if (cq != nullptr)
+        {
+            if (isCurrent)
+            {
+                State::Instance().swapchainApi = DX12;
+
+                if (State::Instance().currentCommandQueue == nullptr)
+                    State::Instance().currentCommandQueue = cq;
+
+                if (device12 != nullptr)
+                    State::Instance().currentD3D12Device = device12;
+            }
+
+            if (device12 != nullptr && !cache->d3d12Hooked)
+            {
+                D3D12Hooks::HookDevice(device12);
+                cache->d3d12Hooked = true;
+            }
         }
     }
 
@@ -708,7 +803,9 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     InputCommon::update();
 
     // Upscaler GPU time computation
-    if (willPresent && (fg == nullptr || !fg->IsActive() || fg->IsPaused()))
+    const bool needDetailedTimes = MenuOverlayBase::IsVisible();
+    if (willPresent && (fg == nullptr || !fg->IsActive() || fg->IsPaused()) &&
+        Util::ShouldSampleUpscalerGpuTime(needDetailedTimes))
     {
         if (auto currentFeature = State::Instance().currentFeature; currentFeature != nullptr)
         {
@@ -723,7 +820,8 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                     ID3D11DeviceContext* context = nullptr;
                     State::Instance().currentD3D11Device->GetImmediateContext(&context);
 
-                    if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(context); upscalerTimeOpt.has_value())
+                    if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(context);
+                        upscalerTimeOpt.has_value() && needDetailedTimes)
                         currentFeature->ReadDetailedGpuTimes(context, State::Instance().detailedGpuTimes);
 
                     context->Release();
@@ -732,7 +830,8 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             // If DX12
             else if (cq != nullptr && currentFeature->Api() == API::DX12 && !currentFeature->IsWithDx12())
             {
-                if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(cq); upscalerTimeOpt.has_value())
+                if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(cq);
+                    upscalerTimeOpt.has_value() && needDetailedTimes)
                     currentFeature->ReadDetailedGpuTimes(cq, State::Instance().detailedGpuTimes);
             }
             // If DX11
@@ -741,7 +840,8 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                 ID3D11DeviceContext* context = nullptr;
                 device->GetImmediateContext(&context);
 
-                if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(context); upscalerTimeOpt.has_value())
+                if (upscalerTimeOpt = currentFeature->ReadUpscalerTime(context);
+                    upscalerTimeOpt.has_value() && needDetailedTimes)
                     currentFeature->ReadDetailedGpuTimes(context, State::Instance().detailedGpuTimes);
 
                 context->Release();
@@ -776,9 +876,17 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             SyncInterval = 0;
 
             // This swapchain's flags, the global ones can belong to a released or another swapchain
-            DXGI_SWAP_CHAIN_DESC scDesc {};
-            bool allowTearing = pSwapChain->GetDesc(&scDesc) == S_OK &&
-                                (scDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0 && scDesc.Windowed;
+            bool allowTearing = false;
+            if (cache != nullptr && cache->hasDesc)
+            {
+                allowTearing = (cache->desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0 && cache->desc.Windowed;
+            }
+            else
+            {
+                DXGI_SWAP_CHAIN_DESC scDesc {};
+                allowTearing = pSwapChain->GetDesc(&scDesc) == S_OK &&
+                               (scDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0 && scDesc.Windowed;
+            }
 
             if (allowTearing)
             {
@@ -825,8 +933,9 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
             // For the Reflex output (and AntiLag 2 with XeFG), the generated and real frames' presents as DLSSG
             // reports them
-            if (fgIsActive && pDevice != nullptr && pDevice->QueryInterface(IID_PPV_ARGS(&fgPresentQueue)) == S_OK)
+            if (fgIsActive && cache != nullptr && cache->d3d12RawQueue != nullptr)
             {
+                fgPresentQueue = cache->d3d12RawQueue;
                 fgFrameMultiplier = fg->GetInterpolatedFrameCount() + 1;
                 InputCommon::fg_output_present(fgPresentQueue, false, fgFrameMultiplier);
             }
@@ -840,6 +949,9 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         if (isCurrent)
             State::Instance().frameCount++;
     }
+
+    if (willPresent && ownerSC != nullptr)
+        ownerSC->ApplyWaitableLatencyClamp(isCurrent);
 
     const bool shouldLimit = willPresent && isCurrent && !State::Instance().reflexLimitsFps &&
                              State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();
@@ -878,10 +990,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     DeferredRelease::Process();
 
     if (fgPresentQueue != nullptr)
-    {
         InputCommon::fg_output_present(fgPresentQueue, true, fgFrameMultiplier);
-        fgPresentQueue->Release();
-    }
 
     // DXGI_STATUS_OCCLUDED etc. are not errors
     if (SUCCEEDED(presentResult))
@@ -997,6 +1106,7 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* p
 {
     _id = ++scCount;
     _lastFlags = flags;
+    _presentCache.isWaitable = (flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
     _gpuSync = new DxSwapchainGpuSync();
 
     _real->QueryInterface(IID_PPV_ARGS(&_real1));
@@ -1025,6 +1135,8 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* p
 
 WrappedIDXGISwapChain4::~WrappedIDXGISwapChain4()
 {
+    _presentCache.ResetDevice();
+
     if (_gpuSync != nullptr)
     {
         delete _gpuSync;
@@ -1190,6 +1302,8 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
                     State::Instance().currentFGSwapchain = nullptr;
             }
 
+            _presentCache.ResetDevice();
+
             if (_gpuSync != nullptr)
             {
                 delete _gpuSync;
@@ -1280,7 +1394,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
             FrameLimit::onFgOutputPresent();
         }
 
-        result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp, isCurrent, _gpuSync);
+        result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp, isCurrent, _gpuSync, this);
     }
     else
     {
@@ -1497,9 +1611,15 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
     }
 
     // Game recreates its views before the next present, resource tracking filters them by swapchain size
-    if (SUCCEEDED(result) && IsCurrentSwapchain(this) &&
-        _real->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
-        LOG_WARN("Can't get swapchain desc!");
+    if (SUCCEEDED(result))
+    {
+        _presentCache.hasDesc = false;
+        _presentCache.isWaitable = (_lastFlags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+        _presentCache.appliedLatency = 0;
+
+        if (IsCurrentSwapchain(this) && _real->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
+            LOG_WARN("Can't get swapchain desc!");
+    }
 
     if (result == DXGI_ERROR_DEVICE_REMOVED && State::Instance().currentD3D12Device != nullptr)
         Util::GetDeviceRemovedReason(State::Instance().currentD3D12Device);
@@ -1540,7 +1660,10 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters)
 {
-    return _real->ResizeTarget(pNewTargetParameters);
+    const HRESULT result = _real->ResizeTarget(pNewTargetParameters);
+    if (SUCCEEDED(result))
+        _presentCache.hasDesc = false;
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetContainingOutput(IDXGIOutput** ppOutput)
@@ -1597,8 +1720,8 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
             FrameLimit::onFgOutputPresent();
         }
 
-        result =
-            LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp, isCurrent, _gpuSync);
+        result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp, isCurrent,
+                              _gpuSync, this);
     }
     else
     {
@@ -1651,7 +1774,24 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetSourceSize(UINT* pWidth, UI
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetMaximumFrameLatency(UINT MaxLatency)
 {
-    return _real2->SetMaximumFrameLatency(MaxLatency);
+    _presentCache.hasGameLatency = true;
+    _presentCache.gameRequestedLatency = MaxLatency;
+
+    const int maxInFlight = (State::Instance().activeFgOutput == FGOutput::NoFG && IsCurrentSwapchain(this))
+                                ? FrameLimit::maxInFlightPresents()
+                                : 0;
+    UINT effective = MaxLatency;
+    if (maxInFlight > 0)
+        effective = std::min(MaxLatency > 0 ? MaxLatency : static_cast<UINT>(maxInFlight),
+                             static_cast<UINT>(maxInFlight));
+
+    const HRESULT hr = _real2->SetMaximumFrameLatency(effective);
+    if (SUCCEEDED(hr))
+    {
+        _presentCache.isWaitable = true;
+        _presentCache.appliedLatency = (maxInFlight > 0) ? effective : 0;
+    }
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetMaximumFrameLatency(UINT* pMaxLatency)
@@ -1662,6 +1802,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetMaximumFrameLatency(UINT* p
 HANDLE STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetFrameLatencyWaitableObject(void)
 {
     HANDLE handle = _real2->GetFrameLatencyWaitableObject();
+    if (handle != nullptr)
+    {
+        _presentCache.isWaitable = true;
+        ApplyWaitableLatencyClamp(IsCurrentSwapchain(this));
+    }
     FrameLimit::registerWaitableHandle(handle);
     return handle;
 }
@@ -1912,6 +2057,9 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
         if (!Util::CheckForRealObject(__FUNCTION__, *ppPresentQueue, &realQueue))
             realQueue = *ppPresentQueue;
 
+        if (_device != realQueue)
+            _presentCache.ResetDevice();
+
         _device = realQueue;
 
         if (IsCurrentSwapchain(this))
@@ -1919,9 +2067,15 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
     }
 
     // Game recreates its views before the next present, resource tracking filters them by swapchain size
-    if (SUCCEEDED(result) && IsCurrentSwapchain(this) &&
-        _real->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
-        LOG_WARN("Can't get swapchain desc!");
+    if (SUCCEEDED(result))
+    {
+        _presentCache.hasDesc = false;
+        _presentCache.isWaitable = (_lastFlags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+        _presentCache.appliedLatency = 0;
+
+        if (IsCurrentSwapchain(this) && _real->GetDesc(&State::Instance().currentSwapchainDesc) != S_OK)
+            LOG_WARN("Can't get swapchain desc!");
+    }
 
     if (result == DXGI_ERROR_DEVICE_REMOVED && State::Instance().currentD3D12Device != nullptr)
         Util::GetDeviceRemovedReason(State::Instance().currentD3D12Device);

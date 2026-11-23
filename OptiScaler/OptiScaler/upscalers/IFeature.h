@@ -4,12 +4,20 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_defs.h>
 
+#include <array>
 #include <unordered_set>
 #include <Util.h>
 
 #define DLSS_MOD_ID_OFFSET 1000000
 
 inline static unsigned int handleCounter = DLSS_MOD_ID_OFFSET;
+
+enum class PostPassStage : uint8_t
+{
+    OutputScaling,
+    Rcas,
+    Magnifier,
+};
 
 struct InitFlags
 {

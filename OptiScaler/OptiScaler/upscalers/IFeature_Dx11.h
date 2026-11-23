@@ -10,20 +10,6 @@
 
 class IFeature_Dx11 : public virtual IFeature
 {
-  private:
-    struct ShaderPass
-    {
-        // Requests the target buffer it needs to write to. Returns the buffer the PREVIOUS stage must write to
-        std::function<ID3D11Resource*(ID3D11Resource* nextOutput)> Setup;
-
-        // Runs the shader
-        std::function<bool(ID3D11Resource* input, ID3D11Resource* output)> Dispatch;
-
-        // Internal state tracked by the pipeline setup loop
-        ID3D11Resource* inputBuffer = nullptr;
-        ID3D11Resource* outputBuffer = nullptr;
-    };
-
   protected:
     ID3D11Device* Device = nullptr;
     ID3D11DeviceContext* DeviceContext = nullptr;

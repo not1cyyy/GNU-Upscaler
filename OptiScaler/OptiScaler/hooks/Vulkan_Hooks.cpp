@@ -67,6 +67,7 @@ static std::unordered_map<VkSurfaceKHR, HWND> _surfaceWindows;
 // Overlay and probe swapchains passed to the driver, swapchain handles are only unique per device
 static std::mutex _passThroughSwapchainsMutex;
 static std::vector<std::pair<VkDevice, VkSwapchainKHR>> _passThroughSwapchains;
+static std::atomic<bool> _hasPassThroughSwapchains { false };
 
 PFN_vkCreateDevice o_vkCreateDevice = nullptr;
 PFN_vkCreateInstance o_vkCreateInstance = nullptr;
@@ -132,7 +133,8 @@ static VkResult FGOutputQueuePresent(VkQueue queue, const VkPresentInfoKHR* pPre
 // The present has no device, the handles are matched on their own like the menu's
 static bool IsPassThroughPresent(const VkPresentInfoKHR* pPresentInfo)
 {
-    if (pPresentInfo == nullptr || pPresentInfo->swapchainCount == 0)
+    if (!_hasPassThroughSwapchains.load(std::memory_order_acquire) || pPresentInfo == nullptr ||
+        pPresentInfo->swapchainCount == 0)
         return false;
 
     std::scoped_lock lock(_passThroughSwapchainsMutex);
@@ -151,14 +153,22 @@ static bool IsPassThroughPresent(const VkPresentInfoKHR* pPresentInfo)
 
 static bool IsPassThroughSwapchain(VkDevice device, VkSwapchainKHR swapchain)
 {
+    if (!_hasPassThroughSwapchains.load(std::memory_order_acquire))
+        return false;
+
     std::scoped_lock lock(_passThroughSwapchainsMutex);
     return std::ranges::find(_passThroughSwapchains, std::pair(device, swapchain)) != _passThroughSwapchains.end();
 }
 
 static bool ForgetPassThroughSwapchain(VkDevice device, VkSwapchainKHR swapchain)
 {
+    if (!_hasPassThroughSwapchains.load(std::memory_order_acquire))
+        return false;
+
     std::scoped_lock lock(_passThroughSwapchainsMutex);
-    return std::erase(_passThroughSwapchains, std::pair(device, swapchain)) > 0;
+    const bool removed = std::erase(_passThroughSwapchains, std::pair(device, swapchain)) > 0;
+    _hasPassThroughSwapchains.store(!_passThroughSwapchains.empty(), std::memory_order_release);
+    return removed;
 }
 
 // OptiScaler's Streamline calls the driver's swapchain functions directly. Overlays like RTSS hook the same ones on top
@@ -671,6 +681,7 @@ static void hkvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAll
 
         std::scoped_lock lock(_passThroughSwapchainsMutex);
         std::erase_if(_passThroughSwapchains, [device](const auto& entry) { return entry.first == device; });
+        _hasPassThroughSwapchains.store(!_passThroughSwapchains.empty(), std::memory_order_release);
     }
 
     VulkanFrameSync::OnDeviceDestroyed(device);
@@ -901,11 +912,14 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     LOG_FUNC();
 
     // Upscaler GPU time computation
-    if (auto vkFeature = dynamic_cast<IFeature_Vk*>(State::Instance().currentFeature); vkFeature != nullptr)
+    if (auto* feature = State::Instance().currentFeature;
+        Util::ShouldSampleUpscalerGpuTime(MenuCommon::IsVisible()) && feature != nullptr &&
+        (feature->Api() == API::Vulkan || feature->IsWithDx12()))
     {
-        if (auto upscalerTimeOpt = vkFeature->ReadUpscalerTime(nullptr); upscalerTimeOpt.has_value())
+        if (auto upscalerTimeOpt = feature->ReadUpscalerTime(nullptr); upscalerTimeOpt.has_value())
         {
-            vkFeature->ReadDetailedGpuTimes(nullptr, State::Instance().detailedGpuTimes);
+            if (MenuCommon::IsVisible())
+                feature->ReadDetailedGpuTimes(nullptr, State::Instance().detailedGpuTimes);
 
             auto upscalerTime = upscalerTimeOpt.value();
             // filter out possibly wrong measured high values
@@ -1090,6 +1104,7 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
         {
             std::scoped_lock lock(_passThroughSwapchainsMutex);
             _passThroughSwapchains.emplace_back(device, *pSwapchain);
+            _hasPassThroughSwapchains.store(true, std::memory_order_release);
         }
 
         return result;
