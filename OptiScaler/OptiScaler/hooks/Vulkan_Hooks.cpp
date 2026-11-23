@@ -997,6 +997,16 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
         }
     }
 
+    if (limitActive && !fgActive && !dxgiBacked)
+    {
+        const int gpuSyncDepth = FrameLimit::activeGpuSyncDepth(false);
+        if (gpuSyncDepth >= 0)
+        {
+            FrameLimit::markCpuWorkEnd();
+            VulkanFrameSync::SyncGpu(queue, &localPresentInfo, gpuSyncDepth);
+        }
+    }
+
     VulkanFrameSync::PresentScope frameSyncScope {};
     if (trackFrameSync)
         VulkanFrameSync::PreparePresent(&localPresentInfo, fgPresent, dxgiPacingActive, frameSyncScope);

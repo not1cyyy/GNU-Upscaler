@@ -807,6 +807,7 @@ class Config
     CustomOptional<float> FramerateLimitSyncMarginMs { 0.6f };
     CustomOptional<bool> FramerateLimitDisplayTimingSchedule { true };
     CustomOptional<int> FramerateLimitFgSubframeMode { 1 };
+    CustomOptional<int> FramerateLimitGpuSync { 1 };
 
     // HDR
     CustomOptional<bool> ForceHDR { false };

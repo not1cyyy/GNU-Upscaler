@@ -20,9 +20,18 @@ struct DeviceSyncInfo
     PFN_vkWaitForPresentKHR waitForPresent = nullptr;
     PFN_vkGetRefreshCycleDurationGOOGLE getRefreshCycleDuration = nullptr;
     PFN_vkGetPastPresentationTimingGOOGLE getPastPresentationTiming = nullptr;
+    PFN_vkGetCalibratedTimestampsKHR getCalibratedTimestamps = nullptr;
+    PFN_vkCreateFence createFence = nullptr;
+    PFN_vkDestroyFence destroyFence = nullptr;
+    PFN_vkWaitForFences waitForFences = nullptr;
+    PFN_vkGetFenceStatus getFenceStatus = nullptr;
+    PFN_vkResetFences resetFences = nullptr;
+    PFN_vkQueueSubmit queueSubmit = nullptr;
     bool hasPresentId = false;
     bool hasPresentWait = false;
     bool hasDisplayTiming = false;
+    bool hasCalibratedTimestamps = false;
+    bool hasCalibratedQpc = false;
 };
 
 std::mutex g_registryMutex;
@@ -71,6 +80,56 @@ template <typename T> const T* FindStructInPNext(const void* pNext, VkStructureT
     return nullptr;
 }
 
+struct SwapchainWaitGuard
+{
+    std::shared_ptr<VulkanFrameSync::SwapchainSyncState> state;
+    bool active = false;
+
+    explicit SwapchainWaitGuard(const std::shared_ptr<VulkanFrameSync::SwapchainSyncState>& s) : state(s)
+    {
+        if (!state)
+            return;
+        std::scoped_lock waitLock(state->waitMutex);
+        if (!state->destroying.load(std::memory_order_acquire))
+        {
+            state->inWait.fetch_add(1, std::memory_order_acq_rel);
+            active = true;
+        }
+    }
+
+    ~SwapchainWaitGuard()
+    {
+        if (!active || !state)
+            return;
+        {
+            std::scoped_lock waitLock(state->waitMutex);
+            state->inWait.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        state->waitDoneCv.notify_all();
+    }
+};
+
+void DestroySwapchainGpuFences(const std::shared_ptr<VulkanFrameSync::SwapchainSyncState>& entry)
+{
+    if (!entry || entry->destroyFence == nullptr || entry->device == VK_NULL_HANDLE ||
+        State::Instance().isShuttingDown || entry->inWait.load(std::memory_order_acquire) != 0)
+    {
+        return;
+    }
+
+    std::scoped_lock flock(entry->gpuFenceMutex);
+    for (auto& slot : entry->gpuFences)
+    {
+        if (slot.fence != VK_NULL_HANDLE)
+        {
+            if (slot.pending && entry->waitForFences != nullptr)
+                entry->waitForFences(entry->device, 1, &slot.fence, VK_TRUE, 50'000'000ULL);
+            entry->destroyFence(entry->device, slot.fence, nullptr);
+            slot = {};
+        }
+    }
+}
+
 void WaitForSwapchainIdle(const std::shared_ptr<VulkanFrameSync::SwapchainSyncState>& entry)
 {
     if (!entry)
@@ -86,9 +145,53 @@ void WaitForSwapchainIdle(const std::shared_ptr<VulkanFrameSync::SwapchainSyncSt
     if (State::Instance().isShuttingDown)
         return;
 
-    std::unique_lock waitLock(entry->waitMutex);
-    entry->waitDoneCv.wait_for(waitLock, std::chrono::milliseconds(150),
-                               [&entry]() { return entry->inWait.load(std::memory_order_acquire) == 0; });
+    {
+        std::unique_lock waitLock(entry->waitMutex);
+        entry->waitDoneCv.wait_for(waitLock, std::chrono::milliseconds(150),
+                                   [&entry]() { return entry->inWait.load(std::memory_order_acquire) == 0; });
+    }
+
+    DestroySwapchainGpuFences(entry);
+}
+
+void CalibrateClockFromSwapchain(const VulkanFrameSync::SwapchainSyncState& state)
+{
+    if (!state.hasCalibratedTimestamps || state.getCalibratedTimestamps == nullptr || state.device == VK_NULL_HANDLE)
+        return;
+
+    if (state.hasCalibratedQpc)
+    {
+        const VkCalibratedTimestampInfoKHR infos[2] = {
+            { VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR },
+            { VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR },
+        };
+        uint64_t timestamps[2] {};
+        uint64_t maxDeviation = 0;
+        if (state.getCalibratedTimestamps(state.device, 2, infos, timestamps, &maxDeviation) == VK_SUCCESS &&
+            timestamps[0] > 0 && timestamps[1] > 0 && maxDeviation < 1'000'000ULL)
+        {
+            const uint64_t qpcNs = Util::QpcToNs(static_cast<int64_t>(timestamps[1]));
+            if (qpcNs > 0)
+            {
+                FrameLimit::calibrateDisplayClock(timestamps[0], qpcNs, true);
+                return;
+            }
+        }
+    }
+
+    const VkCalibratedTimestampInfoKHR info {
+        VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR
+    };
+    uint64_t monoNs = 0;
+    uint64_t maxDeviation = 0;
+    const uint64_t beforeQpc = Util::GetTimestamp();
+    const VkResult res = state.getCalibratedTimestamps(state.device, 1, &info, &monoNs, &maxDeviation);
+    const uint64_t afterQpc = Util::GetTimestamp();
+    if (res == VK_SUCCESS && monoNs > 0 && afterQpc >= beforeQpc && (afterQpc - beforeQpc) < 250'000ULL)
+    {
+        const uint64_t midQpc = beforeQpc + (afterQpc - beforeQpc) / 2ULL;
+        FrameLimit::calibrateDisplayClock(monoNs, midQpc, true);
+    }
 }
 
 void ObserverLoop()
@@ -115,45 +218,33 @@ void ObserverLoop()
         if (state && state->waitForPresent != nullptr && presentId > 0 && !State::Instance().isShuttingDown &&
             !state->destroying.load(std::memory_order_acquire))
         {
-            bool enterWait = false;
+            VkResult res = VK_ERROR_UNKNOWN;
+            uint64_t scanoutNs = 0;
             {
-                std::scoped_lock waitLock(state->waitMutex);
-                if (!state->destroying.load(std::memory_order_acquire))
-                {
-                    state->inWait.fetch_add(1, std::memory_order_acq_rel);
-                    enterWait = true;
-                }
+                SwapchainWaitGuard waitGuard(state);
+                if (!waitGuard.active)
+                    continue;
+                res = state->waitForPresent(state->device, state->swapchain, presentId, 100'000'000ULL);
+                scanoutNs = Util::GetTimestamp();
             }
 
-            if (enterWait)
+            if (res == VK_SUCCESS && !state->destroying.load(std::memory_order_acquire) &&
+                !State::Instance().isShuttingDown)
             {
-                const VkResult res = state->waitForPresent(state->device, state->swapchain, presentId, 100'000'000ULL);
-                const uint64_t scanoutNs = Util::GetTimestamp();
-
                 {
-                    std::scoped_lock waitLock(state->waitMutex);
-                    state->inWait.fetch_sub(1, std::memory_order_acq_rel);
-                }
-                state->waitDoneCv.notify_all();
-
-                if (res == VK_SUCCESS && !state->destroying.load(std::memory_order_acquire) &&
-                    !State::Instance().isShuttingDown)
-                {
+                    std::scoped_lock tlock(state->timingRingMutex);
+                    for (auto& link : state->timingRing)
                     {
-                        std::scoped_lock tlock(state->timingRingMutex);
-                        for (auto& link : state->timingRing)
+                        if (link.presentId == presentId)
                         {
-                            if (link.presentId == presentId)
-                            {
-                                link.scanoutQpcNs = scanoutNs;
-                                break;
-                            }
+                            link.scanoutQpcNs = scanoutNs;
+                            break;
                         }
                     }
-
-                    FrameLimit::recordScanoutTimestamp(submitNs, scanoutNs, 0, 0,
-                                                       IsVsyncPresentMode(state->presentMode), false);
                 }
+
+                FrameLimit::recordScanoutTimestamp(submitNs, scanoutNs, 0, 0,
+                                                   IsVsyncPresentMode(state->presentMode), false);
             }
         }
     }
@@ -224,6 +315,10 @@ void VulkanFrameSync::PrepareDeviceExtensions(VkPhysicalDevice physicalDevice, V
     bool hasDisplayTiming = HasExtensionName(outPrepared.extensions, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
     bool hasPresentId = HasExtensionName(outPrepared.extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME);
     bool hasPresentWait = HasExtensionName(outPrepared.extensions, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+    bool hasCalibratedTimestamps =
+        HasExtensionName(outPrepared.extensions, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ||
+        HasExtensionName(outPrepared.extensions, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    bool hasCalibratedQpc = false;
 
     PFN_vkEnumerateDeviceExtensionProperties enumDeviceExtensions = nullptr;
     if (physicalDeviceInstance != VK_NULL_HANDLE && getInstanceProcAddr != nullptr)
@@ -338,6 +433,71 @@ void VulkanFrameSync::PrepareDeviceExtensions(VkPhysicalDevice physicalDevice, V
                 }
             }
         }
+
+        const bool supportsCalibratedKhr =
+            SupportsDeviceExtension(supported, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        const bool supportsCalibratedExt =
+            SupportsDeviceExtension(supported, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        if (hasCalibratedTimestamps || supportsCalibratedKhr || supportsCalibratedExt)
+        {
+            PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR getTimeDomains = nullptr;
+            if (physicalDeviceInstance != VK_NULL_HANDLE && getInstanceProcAddr != nullptr)
+            {
+                getTimeDomains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
+                    getInstanceProcAddr(physicalDeviceInstance, "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR"));
+                if (getTimeDomains == nullptr)
+                {
+                    getTimeDomains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(
+                        getInstanceProcAddr(physicalDeviceInstance, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
+                }
+            }
+
+            bool hasMonotonicDomain = false;
+            if (getTimeDomains != nullptr)
+            {
+                uint32_t domainCount = 0;
+                if (getTimeDomains(physicalDevice, &domainCount, nullptr) == VK_SUCCESS && domainCount > 0)
+                {
+                    std::vector<VkTimeDomainKHR> domains(domainCount);
+                    if (getTimeDomains(physicalDevice, &domainCount, domains.data()) == VK_SUCCESS)
+                    {
+                        for (uint32_t i = 0; i < domainCount; ++i)
+                        {
+                            if (domains[i] == VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR)
+                                hasMonotonicDomain = true;
+                            else if (domains[i] == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR)
+                                hasCalibratedQpc = true;
+                        }
+                    }
+                }
+            }
+
+            if (hasMonotonicDomain)
+            {
+                if (!hasCalibratedTimestamps)
+                {
+                    if (supportsCalibratedKhr)
+                    {
+                        outPrepared.extensions.push_back(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+                        hasCalibratedTimestamps = true;
+                    }
+                    else if (supportsCalibratedExt)
+                    {
+                        outPrepared.extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+                        hasCalibratedTimestamps = true;
+                    }
+                }
+            }
+            else
+            {
+                hasCalibratedTimestamps = false;
+                hasCalibratedQpc = false;
+            }
+        }
+    }
+    else
+    {
+        hasCalibratedTimestamps = false;
     }
 
     if (outPrepared.extensions.size() != createInfo->enabledExtensionCount)
@@ -349,6 +509,8 @@ void VulkanFrameSync::PrepareDeviceExtensions(VkPhysicalDevice physicalDevice, V
     outPrepared.caps.hasPresentId = hasPresentId;
     outPrepared.caps.hasPresentWait = hasPresentWait;
     outPrepared.caps.hasDisplayTiming = hasDisplayTiming;
+    outPrepared.caps.hasCalibratedTimestamps = hasCalibratedTimestamps;
+    outPrepared.caps.hasCalibratedQpc = hasCalibratedQpc;
 }
 
 void VulkanFrameSync::OnDeviceCreated(VkDevice device, const DeviceCaps& caps, PFN_vkGetDeviceProcAddr getDeviceProc,
@@ -361,6 +523,8 @@ void VulkanFrameSync::OnDeviceCreated(VkDevice device, const DeviceCaps& caps, P
     info.hasPresentId = caps.hasPresentId;
     info.hasPresentWait = caps.hasPresentWait;
     info.hasDisplayTiming = caps.hasDisplayTiming;
+    info.hasCalibratedTimestamps = caps.hasCalibratedTimestamps;
+    info.hasCalibratedQpc = caps.hasCalibratedQpc;
 
     if (caps.hasPresentWait)
     {
@@ -383,11 +547,31 @@ void VulkanFrameSync::OnDeviceCreated(VkDevice device, const DeviceCaps& caps, P
             info.hasDisplayTiming = false;
     }
 
-    if (info.hasPresentId || info.hasPresentWait || info.hasDisplayTiming)
+    if (caps.hasCalibratedTimestamps)
     {
-        LOG_INFO("VulkanFrameSync device {:X}: present_id={}, present_wait={}, display_timing={}",
+        info.getCalibratedTimestamps = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+            getDeviceProc(device, "vkGetCalibratedTimestampsKHR"));
+        if (info.getCalibratedTimestamps == nullptr)
+        {
+            info.getCalibratedTimestamps = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+                getDeviceProc(device, "vkGetCalibratedTimestampsEXT"));
+        }
+        if (info.getCalibratedTimestamps == nullptr)
+            info.hasCalibratedTimestamps = false;
+    }
+
+    info.createFence = reinterpret_cast<PFN_vkCreateFence>(getDeviceProc(device, "vkCreateFence"));
+    info.destroyFence = reinterpret_cast<PFN_vkDestroyFence>(getDeviceProc(device, "vkDestroyFence"));
+    info.waitForFences = reinterpret_cast<PFN_vkWaitForFences>(getDeviceProc(device, "vkWaitForFences"));
+    info.getFenceStatus = reinterpret_cast<PFN_vkGetFenceStatus>(getDeviceProc(device, "vkGetFenceStatus"));
+    info.resetFences = reinterpret_cast<PFN_vkResetFences>(getDeviceProc(device, "vkResetFences"));
+    info.queueSubmit = reinterpret_cast<PFN_vkQueueSubmit>(getDeviceProc(device, "vkQueueSubmit"));
+
+    if (info.hasPresentId || info.hasPresentWait || info.hasDisplayTiming || info.hasCalibratedTimestamps)
+    {
+        LOG_INFO("VulkanFrameSync device {:X}: present_id={}, present_wait={}, display_timing={}, calibrated_ts={}",
                  static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device)), info.hasPresentId, info.hasPresentWait,
-                 info.hasDisplayTiming);
+                 info.hasDisplayTiming, info.hasCalibratedTimestamps);
     }
 
     std::scoped_lock lock(g_registryMutex);
@@ -447,9 +631,21 @@ void VulkanFrameSync::OnSwapchainCreated(VkDevice device, VkSwapchainKHR swapcha
     state->waitForPresent = devInfo.waitForPresent;
     state->getRefreshCycleDuration = devInfo.getRefreshCycleDuration;
     state->getPastPresentationTiming = devInfo.getPastPresentationTiming;
+    state->getCalibratedTimestamps = devInfo.getCalibratedTimestamps;
+    state->createFence = devInfo.createFence;
+    state->destroyFence = devInfo.destroyFence;
+    state->waitForFences = devInfo.waitForFences;
+    state->getFenceStatus = devInfo.getFenceStatus;
+    state->resetFences = devInfo.resetFences;
+    state->queueSubmit = devInfo.queueSubmit;
     state->hasPresentId = devInfo.hasPresentId;
     state->hasPresentWait = devInfo.hasPresentWait;
     state->hasDisplayTiming = devInfo.hasDisplayTiming;
+    state->hasCalibratedTimestamps = devInfo.hasCalibratedTimestamps;
+    state->hasCalibratedQpc = devInfo.hasCalibratedQpc;
+
+    if (state->hasCalibratedTimestamps)
+        CalibrateClockFromSwapchain(*state);
 
     if (state->hasDisplayTiming && state->getRefreshCycleDuration != nullptr)
     {
@@ -484,6 +680,88 @@ void VulkanFrameSync::OnSwapchainDestroyed(VkDevice device, VkSwapchainKHR swapc
     WaitForSwapchainIdle(removed);
 }
 
+void VulkanFrameSync::SyncGpu(VkQueue queue, const VkPresentInfoKHR* pPresentInfo, int syncDepth)
+{
+    if (syncDepth < 0 || queue == VK_NULL_HANDLE || pPresentInfo == nullptr || pPresentInfo->swapchainCount != 1 ||
+        pPresentInfo->pSwapchains == nullptr || State::Instance().isShuttingDown)
+    {
+        return;
+    }
+
+    const VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[0];
+    std::shared_ptr<SwapchainSyncState> state;
+    {
+        std::scoped_lock lock(g_registryMutex);
+        state = FindSwapchainLocked(swapchain);
+    }
+
+    if (!state || state->createFence == nullptr || state->waitForFences == nullptr ||
+        state->getFenceStatus == nullptr || state->resetFences == nullptr || state->queueSubmit == nullptr)
+    {
+        return;
+    }
+
+    SwapchainWaitGuard waitGuard(state);
+    if (!waitGuard.active)
+        return;
+
+    std::scoped_lock flock(state->gpuFenceMutex);
+    auto& ring = state->gpuFences;
+    auto& cur = ring[state->gpuFenceHead];
+
+    if (cur.fence == VK_NULL_HANDLE)
+    {
+        const VkFenceCreateInfo fci { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        if (state->createFence(state->device, &fci, nullptr, &cur.fence) != VK_SUCCESS || cur.fence == VK_NULL_HANDLE)
+            return;
+    }
+
+    if (cur.pending)
+    {
+        state->waitForFences(state->device, 1, &cur.fence, VK_TRUE, 100'000'000ULL);
+        cur.pending = false;
+    }
+
+    if (state->resetFences(state->device, 1, &cur.fence) != VK_SUCCESS)
+        return;
+
+    const uint64_t submitNs = Util::GetTimestamp();
+    if (state->queueSubmit(queue, 0, nullptr, cur.fence) != VK_SUCCESS)
+        return;
+
+    const size_t curIdx = state->gpuFenceHead;
+    state->gpuFenceHead = (state->gpuFenceHead + 1) % ring.size();
+
+    if (syncDepth == 0)
+    {
+        const bool wasBusy = (state->getFenceStatus(state->device, cur.fence) == VK_NOT_READY);
+        const VkResult wres = state->waitForFences(state->device, 1, &cur.fence, VK_TRUE, 100'000'000ULL);
+        const uint64_t completeNs = Util::GetTimestamp();
+        if (wres == VK_SUCCESS)
+            FrameLimit::recordGpuCompletion(submitNs, completeNs, 0, wasBusy);
+        return;
+    }
+
+    cur.pending = true;
+    cur.submitNs = submitNs;
+
+    const size_t prevIdx = (curIdx + ring.size() - 1) % ring.size();
+    auto& prev = ring[prevIdx];
+    if (prev.pending && prev.fence != VK_NULL_HANDLE)
+    {
+        const bool wasBusy = (state->getFenceStatus(state->device, prev.fence) == VK_NOT_READY);
+        const VkResult wres = state->waitForFences(state->device, 1, &prev.fence, VK_TRUE, 100'000'000ULL);
+        const uint64_t completeNs = Util::GetTimestamp();
+        prev.pending = false;
+        if (wres == VK_SUCCESS)
+            FrameLimit::recordGpuCompletion(prev.submitNs, completeNs, 1, wasBusy);
+    }
+    else
+    {
+        FrameLimit::recordGpuCompletion(submitNs, submitNs, 1, false);
+    }
+}
+
 void VulkanFrameSync::PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPresent, bool dxgiBacked,
                                      PresentScope& scope)
 {
@@ -500,6 +778,9 @@ void VulkanFrameSync::PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPres
 
     if (!state || state->destroying.load(std::memory_order_acquire))
         return;
+
+    if (state->hasCalibratedTimestamps && (state->calibratedSampleCounter++ % 120u) == 0u)
+        CalibrateClockFromSwapchain(*state);
 
     // Update live present mode if VK_EXT_swapchain_maintenance1 changes it per-present
     if (const auto* modeInfo = FindStructInPNext<VkSwapchainPresentModeInfoEXT>(
@@ -611,24 +892,10 @@ void VulkanFrameSync::PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPres
         const uint64_t waitTargetId = scope.usedPresentId - static_cast<uint64_t>(maxInFlight);
         if (state->lastWaitedId < waitTargetId)
         {
-            bool enterWait = false;
-            {
-                std::scoped_lock waitLock(state->waitMutex);
-                if (!state->destroying.load(std::memory_order_acquire))
-                {
-                    state->inWait.fetch_add(1, std::memory_order_acq_rel);
-                    enterWait = true;
-                }
-            }
-
-            if (enterWait)
+            SwapchainWaitGuard waitGuard(state);
+            if (waitGuard.active)
             {
                 state->waitForPresent(state->device, swapchain, waitTargetId, 50'000'000ULL);
-                {
-                    std::scoped_lock waitLock(state->waitMutex);
-                    state->inWait.fetch_sub(1, std::memory_order_acq_rel);
-                }
-                state->waitDoneCv.notify_all();
                 state->lastWaitedId = waitTargetId;
             }
         }

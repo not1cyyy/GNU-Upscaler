@@ -11,10 +11,13 @@
 #include <array>
 #include <atomic>
 #include <cfloat>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -95,13 +98,9 @@ inline int TimerSleep(int64_t hundredNs)
     return 0;
 }
 
-inline int BusywaitSleep(int64_t ns)
+inline int BusywaitUntil(uint64_t deadlineNs)
 {
-    if (ns <= 0)
-        return 0;
-
-    const uint64_t waitUntil = Util::GetTimestamp() + static_cast<uint64_t>(ns);
-    while (Util::GetTimestamp() < waitUntil)
+    while (Util::GetTimestamp() < deadlineNs)
         FL_CPU_PAUSE();
 
     return 0;
@@ -151,6 +150,7 @@ struct VBlankPllState
     bool vblankLocked = false;
     bool displayTimingActive = false;
     bool presentWaitActive = false;
+    bool calibratedTimestampsActive = false;
 } g_pll;
 
 std::mutex g_pacerMutex;
@@ -165,10 +165,19 @@ struct PacerState
     uint64_t lastIntervalNs = 0;
     double cpuWorkEmaNs = 0.0;
     double cpuJitterEmaNs = 0.0;
+    double gpuWorkEmaNs = 0.0;
+    double gpuJitterEmaNs = 0.0;
     double simSleptMs = 0.0;
     double preSleptMs = 0.0;
     bool lastFgActive = false;
     int lastMode = -1;
+    bool cpuWorkCapturedThisFrame = false;
+
+    // Tier 2: bounded GPU execution sync & adaptive strictness
+    bool gpuSyncActive = false;
+    bool gpuSyncStrict = true;
+    uint32_t gpuTightCooldown = 0;
+    uint32_t gpuMissedStreak = 0;
 
     // Pass 2: true engine simulation-start & early-acquire state
     bool simStartActive = false;
@@ -190,6 +199,8 @@ std::atomic<int> g_dynamicMaxInFlight { 2 };
 std::atomic<bool> g_gamescopeLimiterDetected { false };
 std::atomic<uint64_t> g_gamescopeScanoutPeriodNs { 0 };
 std::atomic<uint64_t> g_lastSleepWholeUs { 0 };
+std::atomic<uint64_t> g_measuredGpuWorkNs { 0 };
+std::atomic<bool> g_gpuSyncStrictActive { false };
 
 // Leaf lock: never acquires g_pacerMutex or g_pllMutex
 std::mutex g_fgSubMutex;
@@ -401,6 +412,9 @@ uint64_t ApplyVBlankPhaseNudge(uint64_t deadlineNs, uint64_t intervalNs, bool sn
         locked = g_pll.vblankLocked;
     }
 
+    if (gpuLatencyNs <= 0.0)
+        gpuLatencyNs = static_cast<double>(g_measuredGpuWorkNs.load(std::memory_order_relaxed));
+
     if (!locked || refreshNs == 0 || anchorNs == 0)
         return deadlineNs;
 
@@ -413,10 +427,10 @@ uint64_t ApplyVBlankPhaseNudge(uint64_t deadlineNs, uint64_t intervalNs, bool sn
     const float marginMs = std::clamp(Config::Instance()->FramerateLimitSyncMarginMs.value_or_default(), 0.0f, 5.0f);
     uint64_t marginNs = static_cast<uint64_t>(marginMs * 1'000'000.0);
 
-    // Pass 3: When strictly 1-in-flight with ample GPU headroom, pull Present lead ahead by GPU render duration
-    // so both CPU and GPU complete within the same refresh window
-    if (FrameLimit::maxInFlightPresents() == 1 && gpuLatencyNs > 0.0 &&
-        gpuLatencyNs < static_cast<double>(intervalNs) * 0.65)
+    // Pass 3: When strictly 1-in-flight with ample GPU headroom and without pre-present GPU sync flush,
+    // pull Present lead ahead by GPU render duration so both CPU and GPU complete within the same refresh window
+    if (FrameLimit::maxInFlightPresents() == 1 && !g_gpuSyncStrictActive.load(std::memory_order_relaxed) &&
+        gpuLatencyNs > 0.0 && gpuLatencyNs < static_cast<double>(intervalNs) * 0.65)
     {
         marginNs += static_cast<uint64_t>(gpuLatencyNs);
     }
@@ -471,20 +485,29 @@ void ResetPacer(PacerState& pacer)
     pacer.lastIntervalNs = 0;
     pacer.cpuWorkEmaNs = 0.0;
     pacer.cpuJitterEmaNs = 0.0;
+    pacer.gpuWorkEmaNs = 0.0;
+    pacer.gpuJitterEmaNs = 0.0;
     pacer.simSleptMs = 0.0;
     pacer.preSleptMs = 0.0;
     pacer.lastFgActive = false;
     pacer.lastMode = -1;
     pacer.simStartActive = false;
     pacer.simStartPending = false;
+    pacer.cpuWorkCapturedThisFrame = false;
     pacer.simStartMissedFrames = 0;
     pacer.earlyAcquireStreak = 0;
     pacer.earlyAcquireActive = false;
+    pacer.gpuSyncActive = false;
+    pacer.gpuSyncStrict = false;
+    pacer.gpuTightCooldown = 0;
+    pacer.gpuMissedStreak = 0;
     g_activeIntervalNs.store(0, std::memory_order_relaxed);
     g_dynamicMaxInFlight.store(2, std::memory_order_relaxed);
     g_gamescopeLimiterDetected.store(false, std::memory_order_relaxed);
     g_gamescopeScanoutPeriodNs.store(0, std::memory_order_relaxed);
     g_lastSleepWholeUs.store(0, std::memory_order_relaxed);
+    g_measuredGpuWorkNs.store(0, std::memory_order_relaxed);
+    g_gpuSyncStrictActive.store(false, std::memory_order_relaxed);
 }
 
 bool ShouldYieldToGamescopeLimiter(uint64_t intervalNs)
@@ -499,9 +522,53 @@ bool ShouldYieldToGamescopeLimiter(uint64_t intervalNs)
 uint64_t ComputeJitWakeupNs(const PacerState& pacer, uint64_t intervalNs)
 {
     const double jitterMargin = std::clamp(pacer.cpuJitterEmaNs * 2.0, 300'000.0, 1'500'000.0);
-    const double rawLead = pacer.cpuWorkEmaNs > 0.0 ? (pacer.cpuWorkEmaNs + jitterMargin) : 500'000.0;
+    double rawLead = pacer.cpuWorkEmaNs > 0.0 ? (pacer.cpuWorkEmaNs + jitterMargin) : 500'000.0;
+    if (pacer.gpuSyncActive && pacer.gpuSyncStrict && pacer.gpuWorkEmaNs > 0.0)
+    {
+        const double gpuMargin = std::clamp(pacer.gpuJitterEmaNs * 2.0, 150'000.0, 1'000'000.0);
+        rawLead += pacer.gpuWorkEmaNs + gpuMargin;
+    }
     const uint64_t leadNs = static_cast<uint64_t>(std::clamp(rawLead, 0.0, static_cast<double>(intervalNs) * 0.85));
     return (pacer.nextTargetNs > leadNs) ? (pacer.nextTargetNs - leadNs) : 0ULL;
+}
+
+bool DetectExternalLinuxLimiter()
+{
+    if (!State::Instance().isRunningOnLinux)
+        return false;
+
+    static const bool cached = []()
+    {
+        char buf[512] {};
+        if (GetEnvironmentVariableA("DXVK_FRAME_RATE", buf, sizeof(buf)) > 0)
+        {
+            double val = 0.0;
+            const auto res = std::from_chars(buf, buf + std::strlen(buf), val);
+            if (res.ec == std::errc() && val > 0.0)
+                return true;
+        }
+
+        if (GetEnvironmentVariableA("MANGOHUD_CONFIG", buf, sizeof(buf)) > 0)
+        {
+            std::string_view cfg(buf);
+            size_t pos = 0;
+            while ((pos = cfg.find("fps_limit=", pos)) != std::string_view::npos)
+            {
+                if (pos == 0 || cfg[pos - 1] == ',' || cfg[pos - 1] == ' ' || cfg[pos - 1] == '\t')
+                {
+                    const char* p = cfg.data() + pos + 10;
+                    const char* end = cfg.data() + cfg.size();
+                    double val = 0.0;
+                    const auto res = std::from_chars(p, end, val);
+                    if (res.ec == std::errc() && val > 0.0)
+                        return true;
+                }
+                pos += 10;
+            }
+        }
+        return false;
+    }();
+    return cached;
 }
 
 void UpdateGamescopeDetectorLocked(uint64_t blockNs)
@@ -711,37 +778,42 @@ void UpdateMaxInFlightLocked(uint64_t dt, bool isVsyncMode)
 }
 } // namespace
 
+int FrameLimit::sleepUntilNs(uint64_t deadlineNs)
+{
+    const uint64_t startNow = Util::GetTimestamp();
+    if (deadlineNs <= startNow)
+        return 0;
+
+    int status = 0;
+    const int64_t totalNs = static_cast<int64_t>(deadlineNs - startNow);
+    const int64_t overshootReserve = g_timerOvershootEmaNs.load(std::memory_order_relaxed);
+    const int64_t tailNs = kBusywaitThresholdNs + overshootReserve;
+
+    if (totalNs <= tailNs + 1000)
+        return BusywaitUntil(deadlineNs);
+
+    const int64_t requestedSleepNs = totalNs - tailNs;
+    const uint64_t timerStart = Util::GetTimestamp();
+    status = TimerSleep(requestedSleepNs / 100);
+    const uint64_t afterTimer = Util::GetTimestamp();
+    const int64_t actualSleepNs = static_cast<int64_t>(afterTimer - timerStart);
+
+    if (status == 0)
+        UpdateTimerOvershootEma(requestedSleepNs, actualSleepNs, overshootReserve);
+
+    // Fine-grained busy wait completes the remaining sub-millisecond precision to exact deadline
+    if (afterTimer < deadlineNs)
+        BusywaitUntil(deadlineNs);
+
+    return status;
+}
+
 int FrameLimit::sleepDurationNs(int64_t ns)
 {
     if (ns <= 0)
         return 0;
 
-    int status = 0;
-    const uint64_t start = Util::GetTimestamp();
-    const int64_t overshootReserve = g_timerOvershootEmaNs.load(std::memory_order_relaxed);
-    const int64_t tailNs = kBusywaitThresholdNs + overshootReserve;
-
-    if (ns <= tailNs)
-    {
-        status = BusywaitSleep(ns);
-    }
-    else
-    {
-        const int64_t requestedSleepNs = ns - tailNs;
-        const uint64_t timerStart = Util::GetTimestamp();
-        status = TimerSleep(requestedSleepNs / 100);
-        const int64_t actualSleepNs = static_cast<int64_t>(Util::GetTimestamp() - timerStart);
-
-        if (status == 0)
-            UpdateTimerOvershootEma(requestedSleepNs, actualSleepNs, overshootReserve);
-    }
-
-    // Fine-grained busy wait completes the remaining sub-millisecond precision
-    const int64_t remaining = ns - static_cast<int64_t>(Util::GetTimestamp() - start);
-    if (remaining > 0)
-        BusywaitSleep(remaining);
-
-    return status;
+    return sleepUntilNs(Util::GetTimestamp() + static_cast<uint64_t>(ns));
 }
 
 void FrameLimit::registerWaitableHandle(HANDLE handle)
@@ -781,7 +853,7 @@ void FrameLimit::onSimulationStart()
     if (intervalNs == 0)
         return;
 
-    int64_t sleepNs = 0;
+    uint64_t wakeupDeadlineNs = 0;
     {
         std::scoped_lock lock(g_pacerMutex);
         g_pacer.simStartActive = true;
@@ -798,14 +870,14 @@ void FrameLimit::onSimulationStart()
         const uint64_t now = Util::GetTimestamp();
         const uint64_t wakeupNs = ComputeJitWakeupNs(g_pacer, intervalNs);
         if (wakeupNs > now && (wakeupNs - now) <= intervalNs * 2)
-            sleepNs = static_cast<int64_t>(wakeupNs - now);
+            wakeupDeadlineNs = wakeupNs;
     }
 
     double sleptMs = 0.0;
-    if (sleepNs > 0)
+    if (wakeupDeadlineNs > 0)
     {
         const uint64_t sleepStart = Util::GetTimestamp();
-        if (const int res = sleepDurationNs(sleepNs); res != 0)
+        if (const int res = sleepUntilNs(wakeupDeadlineNs); res != 0)
         {
             static bool errorLogged = false;
             if (!errorLogged)
@@ -1196,7 +1268,134 @@ void FrameLimit::recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, u
     g_pll.lastWaitSubmitQpcNs = submitNs;
 }
 
-void FrameLimit::calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanoutQpcNs)
+void FrameLimit::markCpuWorkEnd()
+{
+    const uint64_t intervalNs = g_activeIntervalNs.load(std::memory_order_relaxed);
+    if (intervalNs == 0)
+        return;
+
+    std::scoped_lock lock(g_pacerMutex);
+    const uint64_t now = Util::GetTimestamp();
+    if (g_pacer.lastWakeNs > 0 && now > g_pacer.lastWakeNs)
+        UpdateCpuWorkEma(g_pacer, now - g_pacer.lastWakeNs, intervalNs);
+    g_pacer.cpuWorkCapturedThisFrame = true;
+}
+
+int FrameLimit::activeGpuSyncDepth(bool fgActive)
+{
+    if (fgActive || !isLimitingActive())
+        return -1;
+
+    const uint64_t intervalNs = ComputeIntervalNs(false);
+    if (intervalNs == 0 || ShouldYieldToGamescopeLimiter(intervalNs))
+        return -1;
+
+    const int cfg = std::clamp(Config::Instance()->FramerateLimitGpuSync.value_or_default(), 0, 2);
+    if (cfg == 0)
+        return -1;
+
+    if (cfg == 2)
+        return 0;
+
+    if (currentMode() != Mode::FrontEdgeSync)
+        return 1;
+
+    std::scoped_lock lock(g_pacerMutex);
+    if (g_pacer.gpuTightCooldown > 0)
+        return 1;
+
+    return 0;
+}
+
+void FrameLimit::recordGpuCompletion(uint64_t submitNs, uint64_t completeNs, int syncDepth, bool wasBusy)
+{
+    if (syncDepth < 0 || completeNs == 0)
+        return;
+
+    const uint64_t intervalNs = g_activeIntervalNs.load(std::memory_order_relaxed);
+    const uint64_t sampleNs = (wasBusy && submitNs > 0 && completeNs > submitNs) ? (completeNs - submitNs) : 0ULL;
+    const int cfg = std::clamp(Config::Instance()->FramerateLimitGpuSync.value_or_default(), 0, 2);
+    const Mode mode = currentMode();
+
+    std::scoped_lock lock(g_pacerMutex);
+    g_pacer.gpuSyncActive = true;
+    g_pacer.gpuSyncStrict = (syncDepth == 0);
+    g_gpuSyncStrictActive.store(g_pacer.gpuSyncStrict, std::memory_order_relaxed);
+
+    if (syncDepth == 0 && (intervalNs == 0 || sampleNs < intervalNs * 2))
+    {
+        const double sample = static_cast<double>(sampleNs);
+        if (wasBusy)
+        {
+            if (g_pacer.gpuWorkEmaNs <= 0.0)
+            {
+                g_pacer.gpuWorkEmaNs = sample;
+            }
+            else
+            {
+                const double alpha = (sample > g_pacer.gpuWorkEmaNs) ? 0.35 : 0.08;
+                const double err = std::abs(sample - g_pacer.gpuWorkEmaNs);
+                g_pacer.gpuWorkEmaNs = (1.0 - alpha) * g_pacer.gpuWorkEmaNs + alpha * sample;
+                g_pacer.gpuJitterEmaNs = 0.85 * g_pacer.gpuJitterEmaNs + 0.15 * err;
+            }
+        }
+        else if (g_pacer.gpuWorkEmaNs > 0.0)
+        {
+            // GPU finished before Present submit; gently decay residual tail estimate
+            g_pacer.gpuWorkEmaNs *= 0.92;
+            g_pacer.gpuJitterEmaNs *= 0.92;
+        }
+        g_measuredGpuWorkNs.store(static_cast<uint64_t>(g_pacer.gpuWorkEmaNs), std::memory_order_relaxed);
+    }
+
+    if (cfg != 1 || mode != Mode::FrontEdgeSync || intervalNs == 0)
+    {
+        g_pacer.gpuMissedStreak = 0;
+        g_pacer.gpuTightCooldown = 0;
+        return;
+    }
+
+    if (syncDepth == 0)
+    {
+        const double serializedNs = g_pacer.cpuWorkEmaNs + (wasBusy ? static_cast<double>(sampleNs) : 0.0);
+        const uint64_t frameTargetNs =
+            g_pacer.nextTargetNs > 0 ? g_pacer.nextTargetNs : g_pacer.currentFrameTargetNs;
+        const bool overBudget =
+            (serializedNs > static_cast<double>(intervalNs) * 0.88) ||
+            (frameTargetNs > 0 && completeNs > frameTargetNs + 500'000ULL);
+        if (overBudget)
+        {
+            if (++g_pacer.gpuMissedStreak >= 2)
+            {
+                g_pacer.gpuTightCooldown = 90;
+                g_pacer.gpuMissedStreak = 0;
+            }
+        }
+        else
+        {
+            g_pacer.gpuMissedStreak = 0;
+        }
+    }
+    else
+    {
+        if (wasBusy)
+        {
+            g_pacer.gpuTightCooldown = 90;
+        }
+        else if (g_pacer.gpuTightCooldown > 1)
+        {
+            --g_pacer.gpuTightCooldown;
+        }
+        else if (g_pacer.gpuTightCooldown == 1)
+        {
+            const double projectedNs = g_pacer.cpuWorkEmaNs + g_pacer.gpuWorkEmaNs + g_pacer.gpuJitterEmaNs;
+            if (projectedNs < static_cast<double>(intervalNs) * 0.78)
+                g_pacer.gpuTightCooldown = 0;
+        }
+    }
+}
+
+void FrameLimit::calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanoutQpcNs, bool immediate)
 {
     if (displayActualNs == 0 || scanoutQpcNs == 0)
         return;
@@ -1204,20 +1403,29 @@ void FrameLimit::calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanou
     const int64_t sampleOffset = static_cast<int64_t>(displayActualNs) - static_cast<int64_t>(scanoutQpcNs);
 
     std::scoped_lock lock(g_pllMutex);
+    if (immediate)
+        g_pll.calibratedTimestampsActive = true;
+
     if (g_pll.offsetStableCount == 0)
     {
         g_pll.qpcToDisplayOffsetNs = sampleOffset;
-        g_pll.offsetStableCount = 1;
-        g_pll.displayClockCalibrated = false;
+        g_pll.offsetStableCount = immediate ? 8u : 1u;
+        g_pll.displayClockCalibrated = immediate;
+        if (immediate && g_pll.displayAnchorNs > 0)
+        {
+            const int64_t anchorQpc = static_cast<int64_t>(g_pll.displayAnchorNs) - g_pll.qpcToDisplayOffsetNs;
+            if (anchorQpc > 0)
+                g_pll.anchorQpcNs = static_cast<uint64_t>(anchorQpc);
+        }
         return;
     }
 
     const int64_t err = sampleOffset - g_pll.qpcToDisplayOffsetNs;
     if (std::llabs(err) < 2'000'000)
     {
-        g_pll.qpcToDisplayOffsetNs += err / 4;
-        g_pll.offsetStableCount = std::min(g_pll.offsetStableCount + 1, 32u);
-        if (g_pll.offsetStableCount >= 4)
+        g_pll.qpcToDisplayOffsetNs += err / (immediate ? 2 : 4);
+        g_pll.offsetStableCount = std::min(g_pll.offsetStableCount + 1u, 32u);
+        if (immediate || g_pll.offsetStableCount >= 4)
         {
             g_pll.displayClockCalibrated = true;
             if (g_pll.displayAnchorNs > 0)
@@ -1232,8 +1440,14 @@ void FrameLimit::calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanou
     {
         // Re-seed if a clock jump / outlier occurred
         g_pll.qpcToDisplayOffsetNs = sampleOffset;
-        g_pll.offsetStableCount = 1;
-        g_pll.displayClockCalibrated = false;
+        g_pll.offsetStableCount = immediate ? 8u : 1u;
+        g_pll.displayClockCalibrated = immediate;
+        if (immediate && g_pll.displayAnchorNs > 0)
+        {
+            const int64_t anchorQpc = static_cast<int64_t>(g_pll.displayAnchorNs) - g_pll.qpcToDisplayOffsetNs;
+            if (anchorQpc > 0)
+                g_pll.anchorQpcNs = static_cast<uint64_t>(anchorQpc);
+        }
     }
 }
 
@@ -1332,14 +1546,18 @@ FrameLimit::SyncStats FrameLimit::getStats()
         stats.displayTimingActive = g_pll.displayTimingActive;
         stats.displayTimingScheduleActive = g_pll.displayTimingScheduleActive;
         stats.presentWaitActive = g_pll.presentWaitActive;
+        stats.calibratedTimestampsActive = g_pll.calibratedTimestampsActive;
         stats.lastGpuWorkUs = static_cast<uint64_t>(g_pll.gpuLatencyEmaNs / 1000.0);
         stats.lastPresentMarginUs = g_pll.lastPresentMarginNs / 1000ULL;
     }
     {
         std::scoped_lock lock(g_pacerMutex);
         stats.lastCpuWorkUs = static_cast<uint64_t>(g_pacer.cpuWorkEmaNs / 1000.0);
+        stats.lastGpuJitterUs = static_cast<uint64_t>(g_pacer.gpuJitterEmaNs / 1000.0);
         stats.simStartActive = g_pacer.simStartActive;
         stats.earlyAcquireActive = g_pacer.earlyAcquireActive;
+        stats.gpuSyncActive = g_pacer.gpuSyncActive;
+        stats.gpuSyncStrict = g_pacer.gpuSyncStrict;
     }
     {
         std::scoped_lock lock(g_fgSubMutex);
@@ -1347,10 +1565,17 @@ FrameLimit::SyncStats FrameLimit::getStats()
         stats.fgSubframePacingActive = isSubframePacingActive();
         stats.fgSubframeMultiplier = liveMult > 0 ? liveMult : g_fgSub.activeMult;
     }
-    if (stats.lastGpuWorkUs == 0 && State::Instance().lastUpscalerGpuMs > 0.0)
-        stats.lastGpuWorkUs = static_cast<uint64_t>(State::Instance().lastUpscalerGpuMs * 1000.0);
+    if (stats.lastGpuWorkUs == 0)
+    {
+        const uint64_t measuredGpuNs = g_measuredGpuWorkNs.load(std::memory_order_relaxed);
+        if (measuredGpuNs > 0)
+            stats.lastGpuWorkUs = measuredGpuNs / 1000ULL;
+        else if (State::Instance().lastUpscalerGpuMs > 0.0)
+            stats.lastGpuWorkUs = static_cast<uint64_t>(State::Instance().lastUpscalerGpuMs * 1000.0);
+    }
 
     stats.gamescopeLimiterDetected = g_gamescopeLimiterDetected.load(std::memory_order_relaxed);
+    stats.externalLimiterDetected = DetectExternalLinuxLimiter();
     stats.activeMaxInFlight = maxInFlightPresents();
     stats.lastTimerOvershootUs = static_cast<uint64_t>(g_timerOvershootEmaNs.load(std::memory_order_relaxed) / 1000);
     return stats;
@@ -1369,14 +1594,23 @@ void FrameLimit::prePresent(bool fgActive)
     g_activeIntervalNs.store(intervalNs, std::memory_order_relaxed);
 
     const int mode = static_cast<int>(currentMode());
-    int64_t sleepNs = 0;
+    const int gpuSyncCfg = std::clamp(Config::Instance()->FramerateLimitGpuSync.value_or_default(), 0, 2);
+    uint64_t sleepDeadlineNs = 0;
 
     {
         std::scoped_lock lock(g_pacerMutex);
         const uint64_t now = Util::GetTimestamp();
 
-        if (g_pacer.lastWakeNs > 0 && now > g_pacer.lastWakeNs)
+        if (!g_pacer.cpuWorkCapturedThisFrame && g_pacer.lastWakeNs > 0 && now > g_pacer.lastWakeNs)
             UpdateCpuWorkEma(g_pacer, now - g_pacer.lastWakeNs, intervalNs);
+        g_pacer.cpuWorkCapturedThisFrame = false;
+
+        if (fgActive || gpuSyncCfg == 0)
+        {
+            g_pacer.gpuSyncActive = false;
+            g_pacer.gpuSyncStrict = false;
+            g_gpuSyncStrictActive.store(false, std::memory_order_relaxed);
+        }
 
         const bool modeOrFgChanged = g_pacer.lastMode != mode || g_pacer.lastFgActive != fgActive;
         const bool intervalChanged =
@@ -1398,15 +1632,15 @@ void FrameLimit::prePresent(bool fgActive)
         {
             const uint64_t delta = g_pacer.nextTargetNs - now;
             if (delta <= intervalNs * 2)
-                sleepNs = static_cast<int64_t>(delta);
+                sleepDeadlineNs = g_pacer.nextTargetNs;
         }
     }
 
     double preSleptMs = 0.0;
-    if (sleepNs > 0)
+    if (sleepDeadlineNs > 0)
     {
         const uint64_t sleepStart = Util::GetTimestamp();
-        if (const int res = sleepDurationNs(sleepNs); res != 0)
+        if (const int res = sleepUntilNs(sleepDeadlineNs); res != 0)
         {
             static bool errorLogged = false;
             if (!errorLogged)
@@ -1448,7 +1682,8 @@ void FrameLimit::postPresent(bool fgActive)
     g_activeIntervalNs.store(intervalNs, std::memory_order_relaxed);
 
     const int mode = static_cast<int>(currentMode());
-    int64_t sleepNs = 0;
+    const int gpuSyncCfg = std::clamp(Config::Instance()->FramerateLimitGpuSync.value_or_default(), 0, 2);
+    uint64_t sleepDeadlineNs = 0;
     double simSleptMs = 0.0;
     double preSleptMs = 0.0;
     bool deferToSimStart = false;
@@ -1456,6 +1691,14 @@ void FrameLimit::postPresent(bool fgActive)
     {
         std::scoped_lock lock(g_pacerMutex);
         const uint64_t now = Util::GetTimestamp();
+        g_pacer.cpuWorkCapturedThisFrame = false;
+
+        if (fgActive || gpuSyncCfg == 0)
+        {
+            g_pacer.gpuSyncActive = false;
+            g_pacer.gpuSyncStrict = false;
+            g_gpuSyncStrictActive.store(false, std::memory_order_relaxed);
+        }
 
         const bool pauseOrWrap =
             g_pacer.lastPresentFinishNs > 0 &&
@@ -1486,7 +1729,7 @@ void FrameLimit::postPresent(bool fgActive)
             g_pacer.simStartPending = false;
             if (g_pacer.nextTargetNs > now && (g_pacer.nextTargetNs - now) <= intervalNs * 2)
             {
-                sleepNs = static_cast<int64_t>(g_pacer.nextTargetNs - now);
+                sleepDeadlineNs = g_pacer.nextTargetNs;
                 g_pacer.nextTargetNs = ApplyVBlankPhaseNudge(g_pacer.nextTargetNs + intervalNs, intervalNs, false);
             }
             else
@@ -1538,32 +1781,32 @@ void FrameLimit::postPresent(bool fgActive)
         {
             if (yieldGamescope || mode == static_cast<int>(Mode::FrontEdgeSync))
                 g_pacer.simStartPending = false;
-            sleepNs = 0;
+            sleepDeadlineNs = 0;
         }
         else if (isBackEdge)
         {
-            // sleepNs already computed above against current frame's target
+            // sleepDeadlineNs already computed above against current frame's target
         }
         else if (!fgActive && g_pacer.simStartActive && !g_pacer.simStartPending)
         {
             // Defer wakeup sleep to the game engine's true Simulation Start (Waitable / early Acquire)
             g_pacer.simStartPending = true;
             deferToSimStart = true;
-            sleepNs = 0;
+            sleepDeadlineNs = 0;
         }
         else
         {
             const uint64_t wakeupNs = ComputeJitWakeupNs(g_pacer, intervalNs);
             if (wakeupNs > now)
-                sleepNs = static_cast<int64_t>(wakeupNs - now);
+                sleepDeadlineNs = wakeupNs;
         }
     }
 
     double postSleptMs = 0.0;
-    if (sleepNs > 0)
+    if (sleepDeadlineNs > 0)
     {
         const uint64_t sleepStart = Util::GetTimestamp();
-        if (const int res = sleepDurationNs(sleepNs); res != 0)
+        if (const int res = sleepUntilNs(sleepDeadlineNs); res != 0)
         {
             static bool errorLogged = false;
             if (!errorLogged)

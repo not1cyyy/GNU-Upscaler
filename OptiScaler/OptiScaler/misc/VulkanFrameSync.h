@@ -18,6 +18,8 @@ class VulkanFrameSync
         bool hasPresentId = false;
         bool hasPresentWait = false;
         bool hasDisplayTiming = false;
+        bool hasCalibratedTimestamps = false;
+        bool hasCalibratedQpc = false;
     };
 
     struct PreparedDeviceCreate
@@ -41,15 +43,35 @@ class VulkanFrameSync
         PFN_vkWaitForPresentKHR waitForPresent = nullptr;
         PFN_vkGetRefreshCycleDurationGOOGLE getRefreshCycleDuration = nullptr;
         PFN_vkGetPastPresentationTimingGOOGLE getPastPresentationTiming = nullptr;
+        PFN_vkGetCalibratedTimestampsKHR getCalibratedTimestamps = nullptr;
+        PFN_vkCreateFence createFence = nullptr;
+        PFN_vkDestroyFence destroyFence = nullptr;
+        PFN_vkWaitForFences waitForFences = nullptr;
+        PFN_vkGetFenceStatus getFenceStatus = nullptr;
+        PFN_vkResetFences resetFences = nullptr;
+        PFN_vkQueueSubmit queueSubmit = nullptr;
 
         bool hasPresentId = false;
         bool hasPresentWait = false;
         bool hasDisplayTiming = false;
+        bool hasCalibratedTimestamps = false;
+        bool hasCalibratedQpc = false;
 
         uint64_t nextPresentId = 0;
         uint64_t lastWaitedId = 0;
         uint64_t refreshDurationNs = 0;
         uint32_t nextTimingId = 0;
+        uint32_t calibratedSampleCounter = 0;
+
+        struct GpuFenceSlot
+        {
+            VkFence fence = VK_NULL_HANDLE;
+            bool pending = false;
+            uint64_t submitNs = 0;
+        };
+        std::mutex gpuFenceMutex;
+        std::array<GpuFenceSlot, 4> gpuFences {};
+        size_t gpuFenceHead = 0;
 
         std::atomic<bool> destroying { false };
         std::atomic<int> inWait { 0 };
@@ -91,6 +113,7 @@ class VulkanFrameSync
                                    VkSwapchainKHR oldSwapchain);
     static void OnSwapchainDestroyed(VkDevice device, VkSwapchainKHR swapchain);
 
+    static void SyncGpu(VkQueue queue, const VkPresentInfoKHR* pPresentInfo, int syncDepth);
     static void PreparePresent(VkPresentInfoKHR* pPresentInfo, bool fgPresent, bool dxgiBacked, PresentScope& scope);
     static void PostPresent(const PresentScope& scope, VkResult presentResult, uint64_t submitNs);
 

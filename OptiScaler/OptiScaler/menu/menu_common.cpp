@@ -7227,19 +7227,24 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
         const auto syncStats = FrameLimit::getStats();
         if (syncStats.simStartActive)
             currentMethod.append(syncStats.earlyAcquireActive ? " + EarlyAcquire" : " + Waitable");
+        if (syncStats.gpuSyncActive)
+            currentMethod.append(syncStats.gpuSyncStrict ? " + GPU SyncFlush" : " + GPU Queue<=1");
         if (syncStats.fgSubframePacingActive && syncStats.fgSubframeMultiplier > 0)
             currentMethod.append(std::format(" + XeFG {}x VirtualVSync", syncStats.fgSubframeMultiplier));
         if (syncStats.vblankLocked && syncStats.detectedRefreshHz > 0.0)
             currentMethod.append(std::format(" + VBlank PLL ({:.1f} Hz)", syncStats.detectedRefreshHz));
         if (syncStats.gamescopeLimiterDetected)
             currentMethod.append(" [Gamescope]");
+        if (syncStats.externalLimiterDetected)
+            currentMethod.append(" [Ext Limiter]");
 
         if (state.rtssReflexInjection)
             currentMethod.append(" (RTSS)");
 
         ImGui::Text("Current method: %s", currentMethod.c_str());
 
-        if (syncStats.displayTimingActive || syncStats.presentWaitActive || syncStats.vblankLocked)
+        if (syncStats.displayTimingActive || syncStats.presentWaitActive || syncStats.vblankLocked ||
+            syncStats.gpuSyncActive || syncStats.lastCpuWorkUs > 0 || syncStats.lastGpuWorkUs > 0)
         {
             const std::string marginText =
                 syncStats.lastPresentMarginUs > 0
@@ -7247,14 +7252,28 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
                     : "";
             const std::string inFlightText =
                 syncStats.activeMaxInFlight > 0 ? std::format(" | InFlight: {}", syncStats.activeMaxInFlight) : "";
+            const std::string calText = syncStats.calibratedTimestampsActive ? " [Cal]" : "";
             const char* syncSource = syncStats.displayTimingScheduleActive ? "DisplayTiming (Scheduled)"
                                      : syncStats.displayTimingActive       ? "DisplayTiming"
                                      : syncStats.presentWaitActive         ? "PresentWait"
-                                                                           : "DXGI Sync";
-            ImGui::Text("Sync: %s%s%s%s | CPU: %.2f ms | GPU: %.2f ms | Slack: %llu us", syncSource,
+                                     : syncStats.gpuSyncActive
+                                         ? (syncStats.gpuSyncStrict ? "GPU SyncFlush" : "GPU Queue<=1")
+                                         : "DXGI Sync";
+            const std::string gpuText =
+                syncStats.lastGpuJitterUs > 0
+                    ? std::format("{:.2f} (+-{:.2f}) ms", syncStats.lastGpuWorkUs / 1000.0,
+                                  syncStats.lastGpuJitterUs / 1000.0)
+                    : std::format("{:.2f} ms", syncStats.lastGpuWorkUs / 1000.0);
+            ImGui::Text("Sync: %s%s%s%s%s | CPU: %.2f ms | GPU: %s | Slack: %llu us", syncSource, calText.c_str(),
                         syncStats.vblankLocked ? " (Locked)" : " (Async/VRR)", marginText.c_str(),
-                        inFlightText.c_str(), syncStats.lastCpuWorkUs / 1000.0, syncStats.lastGpuWorkUs / 1000.0,
+                        inFlightText.c_str(), syncStats.lastCpuWorkUs / 1000.0, gpuText.c_str(),
                         static_cast<unsigned long long>(syncStats.lastTimerOvershootUs));
+        }
+
+        if (syncStats.externalLimiterDetected)
+        {
+            ImGui::TextColored(StatusWarn(),
+                               "External limiter detected (DXVK_FRAME_RATE / MANGOHUD); unset it to avoid double pacing");
         }
 
         if (FrameLimit::targetFps() > 0.0f)
@@ -7339,11 +7358,19 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
                 config->FramerateLimitDisplayTimingSchedule = dtSchedule;
             ShowTooltip("Schedules VK_GOOGLE_display_timing desiredPresentTime when clock offset is calibrated");
 
+            const char* gpuSyncItems[] = { "Off", "Auto (Adaptive)", "Strict (SyncFlush)" };
+            int gpuSyncMode = std::clamp(config->FramerateLimitGpuSync.value_or_default(), 0, 2);
+            if (ImGui::Combo("GPU Sync", &gpuSyncMode, gpuSyncItems, IM_ARRAYSIZE(gpuSyncItems)))
+                config->FramerateLimitGpuSync = gpuSyncMode;
+            ShowTooltip("Synchronizes GPU completion before pacing sleep across D3D12, D3D11, and Vulkan:\n"
+                        "Auto: Strict depth-0 SyncFlush under Front-Edge Sync when budget allows; depth-1 queue limit otherwise\n"
+                        "Strict: Always waits current frame GPU completion before sleep (lowest latency, limits overlap)");
+
             const char* subframeItems[] = { "Off", "Virtual VSync 3x+ (Default)", "Virtual VSync 2x+" };
             int subframeMode = std::clamp(config->FramerateLimitFgSubframeMode.value_or_default(), 0, 2);
             if (ImGui::Combo("XeFG Virtual VSync", &subframeMode, subframeItems, IM_ARRAYSIZE(subframeItems)))
                 config->FramerateLimitFgSubframeMode = subframeMode;
-            ShowTooltip("Emulates a hardware 0.96 * targetFPS clock at Vulkan present for VSync-off/VRR;\n"
+            ShowTooltip("Emulates a hardware 0.995 * targetFPS clock at Vulkan present for VSync-off/VRR;\n"
                         "zero dtReal feedback so base FPS cannot spiral");
         }
 

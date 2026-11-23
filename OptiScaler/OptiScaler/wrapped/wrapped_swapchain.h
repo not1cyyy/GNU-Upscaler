@@ -11,6 +11,8 @@ using Microsoft::WRL::ComPtr;
 
 #define USE_LOCAL_MUTEX
 
+struct DxSwapchainGpuSync;
+
 class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChain4 final : public IDXGISwapChain4
 {
   public:
@@ -102,6 +104,8 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChai
 #ifdef USE_LOCAL_MUTEX
     OwnedMutex _localMutex;
 #endif
+
+    DxSwapchainGpuSync* _gpuSync = nullptr;
 
     void CheckForHdrOutput()
     {

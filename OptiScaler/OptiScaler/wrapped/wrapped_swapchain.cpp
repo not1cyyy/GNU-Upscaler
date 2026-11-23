@@ -342,6 +342,227 @@ void ReportD3D12LiveObjects(ID3D12Device* device)
 #endif
 #endif
 
+struct DxSwapchainGpuSync
+{
+    ComPtr<ID3D12Fence> fence12;
+    ID3D12Device* fence12Device = nullptr;
+    HANDLE fence12Event = nullptr;
+    UINT64 fence12Seq = 0;
+    uint64_t fence12SubmitNs[2] {};
+
+    static constexpr size_t kQuerySlots = 4;
+    ComPtr<ID3D11Query> queries11[kQuerySlots];
+    uint64_t submitNs11[kQuerySlots] {};
+    bool pending11[kQuerySlots] {};
+    size_t head11 = 0;
+    ID3D11Device* query11Device = nullptr;
+    ComPtr<ID3D11DeviceContext> ctx11;
+
+    ~DxSwapchainGpuSync() { Reset(); }
+
+    void Reset()
+    {
+        if (fence12Event != nullptr)
+        {
+            CloseHandle(fence12Event);
+            fence12Event = nullptr;
+        }
+        fence12.Reset();
+        fence12Device = nullptr;
+        fence12Seq = 0;
+        fence12SubmitNs[0] = 0;
+        fence12SubmitNs[1] = 0;
+
+        for (size_t i = 0; i < kQuerySlots; ++i)
+        {
+            queries11[i].Reset();
+            submitNs11[i] = 0;
+            pending11[i] = false;
+        }
+        head11 = 0;
+        ctx11.Reset();
+        query11Device = nullptr;
+    }
+
+    void SyncD3D12(ID3D12CommandQueue* cq, ID3D12Device* dev, int syncDepth)
+    {
+        if (cq == nullptr || dev == nullptr || syncDepth < 0 || State::Instance().isShuttingDown)
+            return;
+
+        if (!fence12 || fence12Device != dev)
+        {
+            fence12.Reset();
+            fence12Device = nullptr;
+            fence12Seq = 0;
+            fence12SubmitNs[0] = 0;
+            fence12SubmitNs[1] = 0;
+            if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence12))))
+            {
+                fence12.Reset();
+                return;
+            }
+            fence12Device = dev;
+        }
+
+        if (fence12Event == nullptr)
+        {
+            fence12Event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (fence12Event == nullptr)
+                return;
+        }
+
+        const UINT64 seq = ++fence12Seq;
+        const uint64_t submitNs = Util::GetTimestamp();
+        fence12SubmitNs[seq & 1ULL] = submitNs;
+        if (FAILED(cq->Signal(fence12.Get(), seq)))
+            return;
+
+        if (syncDepth == 0)
+        {
+            const UINT64 completed = fence12->GetCompletedValue();
+            if (completed == UINT64_MAX)
+                return;
+
+            const bool wasBusy = (completed < seq);
+            if (wasBusy)
+            {
+                if (FAILED(fence12->SetEventOnCompletion(seq, fence12Event)))
+                    return;
+                WaitForSingleObject(fence12Event, 100);
+            }
+            const uint64_t completeNs = Util::GetTimestamp();
+            FrameLimit::recordGpuCompletion(submitNs, completeNs, 0, wasBusy);
+        }
+        else
+        {
+            if (seq <= 1)
+            {
+                FrameLimit::recordGpuCompletion(submitNs, submitNs, 1, false);
+                return;
+            }
+
+            const UINT64 waitSeq = seq - 1;
+            const UINT64 completed = fence12->GetCompletedValue();
+            if (completed == UINT64_MAX)
+                return;
+
+            const bool wasBusy = (completed < waitSeq);
+            if (wasBusy)
+            {
+                if (FAILED(fence12->SetEventOnCompletion(waitSeq, fence12Event)))
+                    return;
+                WaitForSingleObject(fence12Event, 100);
+            }
+            const uint64_t completeNs = Util::GetTimestamp();
+            FrameLimit::recordGpuCompletion(fence12SubmitNs[waitSeq & 1ULL], completeNs, 1, wasBusy);
+        }
+    }
+
+    void SyncD3D11(ID3D11Device* dev, int syncDepth)
+    {
+        if (dev == nullptr || syncDepth < 0 || State::Instance().isShuttingDown)
+            return;
+
+        if (!ctx11 || query11Device != dev)
+        {
+            for (size_t i = 0; i < kQuerySlots; ++i)
+            {
+                queries11[i].Reset();
+                submitNs11[i] = 0;
+                pending11[i] = false;
+            }
+            head11 = 0;
+            ctx11.Reset();
+            query11Device = nullptr;
+
+            dev->GetImmediateContext(&ctx11);
+            if (!ctx11)
+                return;
+            query11Device = dev;
+        }
+
+        auto& curQuery = queries11[head11];
+        if (!curQuery)
+        {
+            const D3D11_QUERY_DESC qd { D3D11_QUERY_EVENT, 0 };
+            if (FAILED(dev->CreateQuery(&qd, &curQuery)))
+            {
+                curQuery.Reset();
+                return;
+            }
+        }
+
+        const size_t curIdx = head11;
+        head11 = (head11 + 1) % kQuerySlots;
+
+        const uint64_t submitNs = Util::GetTimestamp();
+        ctx11->End(curQuery.Get());
+        ctx11->Flush();
+
+        auto waitQuery = [this](ID3D11Query* q, bool& outBusy) -> bool
+        {
+            BOOL done = FALSE;
+            HRESULT hr = ctx11->GetData(q, &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            outBusy = (hr == S_FALSE) || (hr == S_OK && !done);
+            if (hr == S_OK && done)
+                return true;
+            if (hr != S_FALSE && hr != S_OK)
+                return false;
+
+            const uint64_t startNs = Util::GetTimestamp();
+            uint32_t spins = 0;
+            while ((hr = ctx11->GetData(q, &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE ||
+                   (hr == S_OK && !done))
+            {
+                if (Util::GetTimestamp() - startNs > 100'000'000ULL)
+                    return false;
+                if (++spins > 256)
+                {
+                    spins = 0;
+                    Sleep(0);
+                }
+                else
+                {
+                    YieldProcessor();
+                }
+            }
+            return (hr == S_OK && done);
+        };
+
+        if (syncDepth == 0)
+        {
+            pending11[curIdx] = false;
+            bool wasBusy = false;
+            if (waitQuery(curQuery.Get(), wasBusy))
+            {
+                const uint64_t completeNs = Util::GetTimestamp();
+                FrameLimit::recordGpuCompletion(submitNs, completeNs, 0, wasBusy);
+            }
+        }
+        else
+        {
+            pending11[curIdx] = true;
+            submitNs11[curIdx] = submitNs;
+
+            const size_t prevIdx = (curIdx + kQuerySlots - 1) % kQuerySlots;
+            if (pending11[prevIdx] && queries11[prevIdx])
+            {
+                pending11[prevIdx] = false;
+                bool wasBusy = false;
+                if (waitQuery(queries11[prevIdx].Get(), wasBusy))
+                {
+                    const uint64_t completeNs = Util::GetTimestamp();
+                    FrameLimit::recordGpuCompletion(submitNs11[prevIdx], completeNs, 1, wasBusy);
+                }
+            }
+            else
+            {
+                FrameLimit::recordGpuCompletion(submitNs, submitNs, 1, false);
+            }
+        }
+    }
+};
+
 static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT syncInterval, uint64_t submitNs)
 {
     if (swapChain == nullptr || State::Instance().isRunningOnLinux)
@@ -364,7 +585,7 @@ static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT sync
 
 static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags,
                             const DXGI_PRESENT_PARAMETERS* pPresentParameters, IUnknown* pDevice, HWND hWnd, bool isUWP,
-                            bool isCurrent)
+                            bool isCurrent, DxSwapchainGpuSync* gpuSync)
 {
     if (State::Instance().isShuttingDown)
     {
@@ -624,7 +845,18 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
                              State::Instance().activeFgOutput == FGOutput::NoFG && !InputCommon::can_limit_fps();
 
     if (shouldLimit)
+    {
+        const int gpuSyncDepth = FrameLimit::activeGpuSyncDepth(false);
+        if (gpuSyncDepth >= 0 && gpuSync != nullptr)
+        {
+            FrameLimit::markCpuWorkEnd();
+            if (isD3D11 && device != nullptr)
+                gpuSync->SyncD3D11(device, gpuSyncDepth);
+            else if (!isD3D11 && cq != nullptr && device12 != nullptr)
+                gpuSync->SyncD3D12(cq, device12, gpuSyncDepth);
+        }
         FrameLimit::prePresent(false);
+    }
 
     LOG_DEBUG("Calling original present");
 
@@ -765,6 +997,7 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* p
 {
     _id = ++scCount;
     _lastFlags = flags;
+    _gpuSync = new DxSwapchainGpuSync();
 
     _real->QueryInterface(IID_PPV_ARGS(&_real1));
     if (_real1 != nullptr)
@@ -790,7 +1023,14 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* p
     LOG_INFO("{} created, real: {:X}, refCount: {}", _id, (UINT64) real, refCount);
 }
 
-WrappedIDXGISwapChain4::~WrappedIDXGISwapChain4() {}
+WrappedIDXGISwapChain4::~WrappedIDXGISwapChain4()
+{
+    if (_gpuSync != nullptr)
+    {
+        delete _gpuSync;
+        _gpuSync = nullptr;
+    }
+}
 
 //
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::QueryInterface(REFIID riid, void** ppvObject)
@@ -950,6 +1190,12 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
                     State::Instance().currentFGSwapchain = nullptr;
             }
 
+            if (_gpuSync != nullptr)
+            {
+                delete _gpuSync;
+                _gpuSync = nullptr;
+            }
+
             auto refCount = _owner->Release();
 
             // Disabled for now, cause issues with some games
@@ -1034,7 +1280,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
             FrameLimit::onFgOutputPresent();
         }
 
-        result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp, isCurrent);
+        result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp, isCurrent, _gpuSync);
     }
     else
     {
@@ -1130,6 +1376,8 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
 
     // Menu's last command list can still be running
     WaitForGPUIdle(_device);
+    if (_gpuSync != nullptr)
+        _gpuSync->Reset();
 
     if (IsCurrentSwapchain(this))
     {
@@ -1349,7 +1597,8 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
             FrameLimit::onFgOutputPresent();
         }
 
-        result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp, isCurrent);
+        result =
+            LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp, isCurrent, _gpuSync);
     }
     else
     {
@@ -1501,6 +1750,8 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
 
     // Menu's last command list can still be running
     WaitForGPUIdle(_device);
+    if (_gpuSync != nullptr)
+        _gpuSync->Reset();
 
     HRESULT result = E_FAIL;
     DXGI_SWAP_CHAIN_DESC desc {};

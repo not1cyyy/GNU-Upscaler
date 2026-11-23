@@ -22,15 +22,21 @@ class FrameLimit
         bool earlyAcquireActive = false;
         bool gamescopeLimiterDetected = false;
         bool fgSubframePacingActive = false;
+        bool gpuSyncActive = false;
+        bool gpuSyncStrict = false;
+        bool calibratedTimestampsActive = false;
+        bool externalLimiterDetected = false;
         int activeMaxInFlight = 0;
         uint32_t fgSubframeMultiplier = 0;
         uint64_t lastCpuWorkUs = 0;
         uint64_t lastGpuWorkUs = 0;
+        uint64_t lastGpuJitterUs = 0;
         uint64_t lastPresentMarginUs = 0;
         uint64_t lastTimerOvershootUs = 0;
     };
 
     static int sleepDurationNs(int64_t ns);
+    static int sleepUntilNs(uint64_t deadlineNs);
 
     static void registerWaitableHandle(HANDLE handle);
     static bool isTrackedWaitable(HANDLE handle);
@@ -42,6 +48,10 @@ class FrameLimit
     static void onFgGamePresentStart();
     static void onFgOutputPresent(bool fromVulkan = false, bool hwVsync = false);
     static bool isSubframePacingActive();
+
+    static void markCpuWorkEnd();
+    static int activeGpuSyncDepth(bool fgActive);
+    static void recordGpuCompletion(uint64_t submitNs, uint64_t completeNs, int syncDepth, bool wasBusy);
 
     static void prePresent(bool fgActive);
     static void postPresent(bool fgActive);
@@ -62,7 +72,7 @@ class FrameLimit
 
     static void recordScanoutTimestamp(uint64_t submitNs, uint64_t scanoutNs, uint64_t reportedRefreshNs,
                                        uint64_t presentMarginNs, bool isVsyncMode, bool fromDisplayTiming);
-    static void calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanoutQpcNs);
+    static void calibrateDisplayClock(uint64_t displayActualNs, uint64_t scanoutQpcNs, bool immediate = false);
     static uint64_t getDesiredDisplayTimeNs(bool useActiveDxgiFrame = false);
     static uint64_t alignDeadlineToVBlank(uint64_t deadlineNs, uint64_t intervalNs);
     static void getRecentFrameTimes(float* outMs, int maxCount, int& outCount, float& outMinMs, float& outMaxMs);
