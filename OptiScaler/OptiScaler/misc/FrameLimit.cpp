@@ -192,9 +192,8 @@ std::mutex g_fgSubMutex;
 
 struct FgOpenLoopState
 {
+    uint64_t nextTargetNs = 0;
     uint64_t lastOutputEdgeNs = 0;
-    uint64_t batchStartNs = 0;
-    uint32_t batchPos = 0;
     uint32_t activeMult = 0;
 
     std::array<float, 120> frameTimesMs {};
@@ -204,6 +203,7 @@ struct FgOpenLoopState
 
 std::atomic<DWORD> g_fgGameThreadId { 0 };
 std::atomic<uint64_t> g_fgEpoch { 0 };
+std::atomic<uint64_t> g_lastFgVkOutputNs { 0 };
 std::atomic<bool> g_fgSubframeActive { false };
 
 uint32_t ActiveSubframeMultiplier()
@@ -227,9 +227,8 @@ uint32_t ActiveSubframeMultiplier()
 
 void ResetFgSubframeLocked()
 {
+    g_fgSub.nextTargetNs = 0;
     g_fgSub.lastOutputEdgeNs = 0;
-    g_fgSub.batchStartNs = 0;
-    g_fgSub.batchPos = 0;
     g_fgSub.activeMult = 0;
     g_fgSubframeActive.store(false, std::memory_order_relaxed);
 }
@@ -734,8 +733,20 @@ void FrameLimit::onFgGamePresentStart()
     g_fgEpoch.fetch_add(1ULL, std::memory_order_release);
 }
 
-void FrameLimit::onFgOutputPresent()
+void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
 {
+    if (fromVulkan)
+    {
+        g_lastFgVkOutputNs.store(Util::GetTimestamp(), std::memory_order_relaxed);
+    }
+    else
+    {
+        const uint64_t lastVk = g_lastFgVkOutputNs.load(std::memory_order_relaxed);
+        const uint64_t nowCheck = Util::GetTimestamp();
+        if (lastVk > 0 && nowCheck >= lastVk && (nowCheck - lastVk) < 2'000'000'000ULL)
+            return;
+    }
+
     const uint32_t mult = ActiveSubframeMultiplier();
     const float capFps = targetFps();
     if (mult == 0 || capFps <= 0.0f)
@@ -764,33 +775,25 @@ void FrameLimit::onFgOutputPresent()
         std::scoped_lock lock(g_fgSubMutex);
         const uint64_t now = Util::GetTimestamp();
         const double capSubNs = std::clamp(1'000'000'000.0 / static_cast<double>(capFps), 100'000.0, 100'000'000.0);
-        // Strictly open-loop bounded step (never derived from dtReal feedback)
+        // Fixed open-loop Virtual VSync tick slightly ahead of real frame rate (0.96 * T_cap) so queues drain
+        // cleanly without dtReal feedback or stalling o_FGSCPresent
         const uint64_t stepNs =
-            std::min<uint64_t>(static_cast<uint64_t>(std::llround(capSubNs * 0.85)), 10'000'000ULL);
-        const uint64_t batchGapThresholdNs = static_cast<uint64_t>(std::llround(capSubNs * 1.35));
+            std::min<uint64_t>(static_cast<uint64_t>(std::llround(capSubNs * 0.96)), 50'000'000ULL);
+        g_fgSub.activeMult = mult;
 
-        if (g_fgSub.lastOutputEdgeNs == 0 || now <= g_fgSub.lastOutputEdgeNs ||
-            (now - g_fgSub.lastOutputEdgeNs) > batchGapThresholdNs || (g_fgSub.batchPos + 1u) >= mult ||
-            g_fgSub.activeMult != mult)
+        if (!hwVsync)
         {
-            g_fgSub.batchPos = 0;
-            g_fgSub.batchStartNs = now;
+            if (g_fgSub.nextTargetNs > now && (g_fgSub.nextTargetNs - now) <= stepNs * 2)
+                deadlineNs = std::min(g_fgSub.nextTargetNs, now + stepNs);
+            else
+                g_fgSub.nextTargetNs = now;
+
+            const uint64_t effectiveEdge = (deadlineNs > now) ? deadlineNs : now;
+            g_fgSub.nextTargetNs = effectiveEdge + stepNs;
         }
         else
         {
-            ++g_fgSub.batchPos;
-        }
-        g_fgSub.activeMult = mult;
-
-        // Only space interpolated frames (0 < pos < mult - 1); never delay the first or real frame R
-        if (g_fgSub.batchPos > 0 && (g_fgSub.batchPos + 1u) < mult)
-        {
-            const uint64_t desiredFromPrev = g_fgSub.lastOutputEdgeNs + stepNs;
-            const uint64_t desiredFromBatch =
-                g_fgSub.batchStartNs + static_cast<uint64_t>(g_fgSub.batchPos) * stepNs;
-            const uint64_t candidateDeadline = std::min(desiredFromPrev, desiredFromBatch);
-            if (candidateDeadline > now)
-                deadlineNs = std::min(candidateDeadline, now + stepNs);
+            g_fgSub.nextTargetNs = 0;
         }
     }
 
@@ -801,7 +804,7 @@ void FrameLimit::onFgOutputPresent()
             static bool errorLogged = false;
             if (!errorLogged)
             {
-                LOG_ERROR("XeFG stagger sleep failed: {}", res);
+                LOG_ERROR("XeFG virtual vsync sleep failed: {}", res);
                 errorLogged = true;
             }
         }

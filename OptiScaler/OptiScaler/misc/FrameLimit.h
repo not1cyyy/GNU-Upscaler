@@ -40,7 +40,7 @@ class FrameLimit
     static void recordPresentDuration(uint64_t presentDurationNs);
 
     static void onFgGamePresentStart();
-    static void onFgOutputPresent();
+    static void onFgOutputPresent(bool fromVulkan = false, bool hwVsync = false);
     static bool isSubframePacingActive();
 
     static void prePresent(bool fgActive);

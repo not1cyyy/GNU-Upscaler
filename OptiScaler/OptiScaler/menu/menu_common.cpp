@@ -7228,7 +7228,7 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
         if (syncStats.simStartActive)
             currentMethod.append(syncStats.earlyAcquireActive ? " + EarlyAcquire" : " + Waitable");
         if (syncStats.fgSubframePacingActive && syncStats.fgSubframeMultiplier > 0)
-            currentMethod.append(std::format(" + XeFG {}x Stagger", syncStats.fgSubframeMultiplier));
+            currentMethod.append(std::format(" + XeFG {}x VirtualVSync", syncStats.fgSubframeMultiplier));
         if (syncStats.vblankLocked && syncStats.detectedRefreshHz > 0.0)
             currentMethod.append(std::format(" + VBlank PLL ({:.1f} Hz)", syncStats.detectedRefreshHz));
         if (syncStats.gamescopeLimiterDetected)
@@ -7339,12 +7339,12 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
                 config->FramerateLimitDisplayTimingSchedule = dtSchedule;
             ShowTooltip("Schedules VK_GOOGLE_display_timing desiredPresentTime when clock offset is calibrated");
 
-            const char* subframeItems[] = { "Off", "Open-Loop 3x+ XeFG (Default)", "Open-Loop 2x+ XeFG" };
+            const char* subframeItems[] = { "Off", "Virtual VSync 3x+ (Default)", "Virtual VSync 2x+" };
             int subframeMode = std::clamp(config->FramerateLimitFgSubframeMode.value_or_default(), 0, 2);
-            if (ImGui::Combo("XeFG Sub-Frame Stagger", &subframeMode, subframeItems, IM_ARRAYSIZE(subframeItems)))
+            if (ImGui::Combo("XeFG Virtual VSync", &subframeMode, subframeItems, IM_ARRAYSIZE(subframeItems)))
                 config->FramerateLimitFgSubframeMode = subframeMode;
-            ShowTooltip("Open-loop inter-frame stagger (<= 0.85 / targetFPS) on interpolated DXGI presents only;\n"
-                        "never stalls real frames, VKD3D Vulkan queues, or uses dtReal feedback");
+            ShowTooltip("Emulates a hardware 0.96 * targetFPS clock at Vulkan present for VSync-off/VRR;\n"
+                        "zero dtReal feedback so base FPS cannot spiral");
         }
 
         ImGui::Spacing();

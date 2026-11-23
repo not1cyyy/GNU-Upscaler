@@ -881,6 +881,14 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
     return result;
 }
 
+static std::atomic<bool> _dxgiSwapchainVsync { false };
+
+static bool IsFifoPresentMode(VkPresentModeKHR mode)
+{
+    return mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
+           mode == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
+}
+
 VALIDATE_HOOK(hkvkQueuePresentKHR, PFN_vkQueuePresentKHR)
 static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 {
@@ -975,6 +983,26 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     const bool trackFrameSync =
         !fgPresent && !dx12FgActive &&
         (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0);
+
+    if (dxgiBacked && localPresentInfo.swapchainCount == 1)
+    {
+        if (dx12FgActive || FrameLimit::isSubframePacingActive())
+        {
+            for (auto next = static_cast<const VkBaseInStructure*>(localPresentInfo.pNext); next != nullptr;
+                 next = next->pNext)
+            {
+                if (next->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT)
+                {
+                    const auto* modeInfo = reinterpret_cast<const VkSwapchainPresentModeInfoEXT*>(next);
+                    if (modeInfo->swapchainCount == 1 && modeInfo->pPresentModes != nullptr)
+                        _dxgiSwapchainVsync.store(IsFifoPresentMode(modeInfo->pPresentModes[0]),
+                                                  std::memory_order_relaxed);
+                    break;
+                }
+            }
+            FrameLimit::onFgOutputPresent(true, _dxgiSwapchainVsync.load(std::memory_order_relaxed));
+        }
+    }
 
     VulkanFrameSync::PresentScope frameSyncScope {};
     if (trackFrameSync)
@@ -1251,6 +1279,9 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
     if (result == VK_SUCCESS && !fgSwapchain && device != VK_NULL_HANDLE && pCreateInfo != nullptr &&
         *pSwapchain != VK_NULL_HANDLE && !State::Instance().vulkanSkipHooks)
     {
+        if (dxgiBacked)
+            _dxgiSwapchainVsync.store(IsFifoPresentMode(pCreateInfo->presentMode), std::memory_order_relaxed);
+
         VulkanFrameSync::OnSwapchainCreated(device, *pSwapchain, pCreateInfo->presentMode, pCreateInfo->oldSwapchain);
     }
 
