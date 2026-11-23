@@ -28,6 +28,7 @@ class Magnifier_Dx12 : public Shader_Dx12, public Magnifier_Common
   public:
     bool Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InResource, ID3D12Resource* OutResource);
     void SetBufferState(ID3D12GraphicsCommandList* InCommandList, D3D12_RESOURCE_STATES InState);
+    void RestoreBufferState(D3D12_RESOURCE_STATES InState) { _bufferState = InState; }
     bool CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InSource, D3D12_RESOURCE_STATES InState);
 
     ID3D12Resource* Buffer() { return _buffer; }

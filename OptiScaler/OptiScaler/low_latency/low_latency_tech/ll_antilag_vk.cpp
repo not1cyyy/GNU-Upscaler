@@ -21,16 +21,17 @@ void AntiLagVk::update(VkAntiLagStageAMD stage, std::optional<uint64_t> frame_id
     presentationInfo.stage = stage;
     presentationInfo.frameIndex = frame_id.value_or(0);
 
+    const bool enabled = is_enabled();
     VkAntiLagDataAMD antiLagData = {};
     antiLagData.sType = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
-    antiLagData.mode = is_enabled() ? VK_ANTI_LAG_MODE_ON_AMD : VK_ANTI_LAG_MODE_OFF_AMD;
-    antiLagData.maxFPS = max_fps;
+    antiLagData.mode = enabled ? VK_ANTI_LAG_MODE_ON_AMD : VK_ANTI_LAG_MODE_OFF_AMD;
+    antiLagData.maxFPS = enabled ? max_fps : 0;
 
     // Without a frame id it's only the delay, as AntiLag 2's update
     antiLagData.pPresentationInfo = frame_id.has_value() ? &presentationInfo : nullptr;
 
     LOG_TRACE_LOWLATENCY("AntiLag {}: {}, status: {}", stage == VK_ANTI_LAG_STAGE_INPUT_AMD ? "Input" : "Present",
-                         frame_id.value_or(0), is_enabled());
+                         frame_id.value_or(0), enabled);
 
     VulkanHooks::o_vkAntiLagUpdateAMD(device, &antiLagData);
 }
@@ -58,15 +59,21 @@ void AntiLagVk::set_sleep_mode(SleepMode* sleep_mode)
 
 void AntiLagVk::sleep(std::optional<uint32_t> frame_id)
 {
+    const bool canPace = is_enabled() && needs_fractional_sleep;
+
     // Inputs that sleep with the frame id (AntiLag Vk) also send its simulation start
     if (frame_id.has_value())
     {
         if (!last_input_frame_id.has_value() || (uint32_t) *last_input_frame_id != *frame_id)
         {
-            if (needs_fractional_sleep && (!last_paced_frame_id.has_value() || *last_paced_frame_id != *frame_id))
+            if (canPace && (!last_paced_frame_id.has_value() || *last_paced_frame_id != *frame_id))
             {
                 last_paced_frame_id = *frame_id;
                 fractional_pacer.Pace(minimum_interval_us);
+            }
+            else if (!canPace)
+            {
+                fractional_pacer.Reset();
             }
             last_input_frame_id = *frame_id;
             update(VK_ANTI_LAG_STAGE_INPUT_AMD, *frame_id);
@@ -75,8 +82,10 @@ void AntiLagVk::sleep(std::optional<uint32_t> frame_id)
         return;
     }
 
-    if (needs_fractional_sleep)
+    if (canPace)
         fractional_pacer.Pace(minimum_interval_us);
+    else
+        fractional_pacer.Reset();
 
     // The simulation start markers with frame ids are better
     if (++sleeps_since_id_marker > 20)
@@ -109,11 +118,15 @@ void AntiLagVk::set_marker(IUnknown* pDevice, const MarkerParams& marker_params)
 
         if (!last_input_frame_id.has_value() || (uint32_t) *last_input_frame_id != (uint32_t) marker_params.frame_id)
         {
-            if (needs_fractional_sleep &&
-                (!last_paced_frame_id.has_value() || *last_paced_frame_id != marker_params.frame_id))
+            const bool canPace = is_enabled() && needs_fractional_sleep;
+            if (canPace && (!last_paced_frame_id.has_value() || *last_paced_frame_id != marker_params.frame_id))
             {
                 last_paced_frame_id = marker_params.frame_id;
                 fractional_pacer.Pace(minimum_interval_us);
+            }
+            else if (!canPace)
+            {
+                fractional_pacer.Reset();
             }
             last_input_frame_id = marker_params.frame_id;
             update(VK_ANTI_LAG_STAGE_INPUT_AMD, marker_params.frame_id);

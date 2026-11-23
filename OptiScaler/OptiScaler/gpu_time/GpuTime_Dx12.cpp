@@ -69,6 +69,7 @@ void GpuTime_Dx12::Start(ID3D12GraphicsCommandList* cmdList)
     if (_init && _queryHeap != nullptr && Util::ShouldRecordUpscalerGpuTime())
     {
         _currentFrameIndex = (_currentFrameIndex + 1) % QUERY_BUFFER_COUNT;
+        _trigger[_currentFrameIndex] = false;
 
         cmdList->EndQuery(_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, _currentFrameIndex * 2);
         _recording = true;
@@ -120,10 +121,11 @@ std::optional<double> GpuTime_Dx12::ReadGpuTime(ID3D12CommandQueue* commandQueue
         const UINT64 startTime = _mappedTimestamps[previousFrameIndex * 2];
         const UINT64 endTime = _mappedTimestamps[previousFrameIndex * 2 + 1];
 
-        if (endTime < startTime)
+        if (startTime == 0 || endTime <= startTime || endTime == _lastConsumedEndTime[previousFrameIndex])
             return elapsedTimeMs;
 
         elapsedTimeMs = (endTime - startTime) / static_cast<double>(_cachedFrequency) * 1000.0;
+        _lastConsumedEndTime[previousFrameIndex] = endTime;
         _trigger[previousFrameIndex] = false;
         return elapsedTimeMs;
     }
@@ -143,13 +145,14 @@ std::optional<double> GpuTime_Dx12::ReadGpuTime(ID3D12CommandQueue* commandQueue
         UINT64 startTime = timestampData[previousFrameIndex * 2];
         UINT64 endTime = timestampData[previousFrameIndex * 2 + 1];
 
-        if (endTime < startTime)
+        if (startTime == 0 || endTime <= startTime || endTime == _lastConsumedEndTime[previousFrameIndex])
         {
             _readbackBuffer->Unmap(0, &writeRange);
             return elapsedTimeMs;
         }
 
         elapsedTimeMs = (endTime - startTime) / static_cast<double>(_cachedFrequency) * 1000.0;
+        _lastConsumedEndTime[previousFrameIndex] = endTime;
     }
     else
     {

@@ -47,6 +47,9 @@ void GpuTime_Dx11::Start(ID3D11DeviceContext* context)
 
     if (_init && context && Util::ShouldRecordUpscalerGpuTime())
     {
+        _currentFrameIndex = (_currentFrameIndex + 1) % QUERY_BUFFER_COUNT;
+        _trigger[_currentFrameIndex] = false;
+
         // Record the queries in the current frame
         context->Begin(_disjointQueries[_currentFrameIndex]);
         context->End(_startQueries[_currentFrameIndex]);
@@ -94,7 +97,7 @@ std::optional<double> GpuTime_Dx11::ReadGpuTime(ID3D11DeviceContext* context)
                     context->GetData(_endQueries[readIndex], &endTime, sizeof(UINT64),
                                      D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
                 {
-                    if (endTime >= startTime)
+                    if (startTime > 0 && endTime > startTime)
                     {
                         elapsedTimeMs = (endTime - startTime) / static_cast<double>(disjointData.Frequency) * 1000.0;
                     }
@@ -104,8 +107,6 @@ std::optional<double> GpuTime_Dx11::ReadGpuTime(ID3D11DeviceContext* context)
             _trigger[readIndex] = false;
         }
     }
-
-    _currentFrameIndex = (_currentFrameIndex + 1) % QUERY_BUFFER_COUNT;
 
     return elapsedTimeMs;
 }

@@ -267,6 +267,9 @@ VkSemaphore Reprojection_Vk::ReprojectPresent(VkQueue queue, const VkPresentInfo
     if (auto result = vkQueueSubmit(queue, 1, &submitInfo, _fence[commandIndex]); result != VK_SUCCESS)
     {
         LOG_ERROR("vkQueueSubmit error: {}", magic_enum::enum_name(result));
+        // Fence was reset above and will never be signaled; destroy it so BeginCommandBuffer recreates it signaled
+        vkDestroyFence(_device, _fence[commandIndex], nullptr);
+        _fence[commandIndex] = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
 

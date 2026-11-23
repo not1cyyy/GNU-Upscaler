@@ -54,6 +54,7 @@ class HudCopy_Dx12 : public Shader_Dx12, public HudCopy_Common
     void CompleteAsyncDispatch(ID3D12GraphicsCommandList* directCmdList, ID3D12Resource* hudless,
                                ID3D12Resource* present, D3D12_RESOURCE_STATES hudlessState,
                                D3D12_RESOURCE_STATES presentState);
+    void AbortAsyncPrepare(ID3D12GraphicsCommandList* directCmdList);
 
     HudCopy_Dx12(std::string InName, ID3D12Device* InDevice);
 

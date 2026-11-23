@@ -411,11 +411,13 @@ struct DxSwapchainGpuSync
                 return;
         }
 
-        const UINT64 seq = ++fence12Seq;
+        const UINT64 seq = fence12Seq + 1;
         const uint64_t submitNs = Util::GetTimestamp();
-        fence12SubmitNs[seq & 1ULL] = submitNs;
         if (FAILED(cq->Signal(fence12.Get(), seq)))
             return;
+
+        fence12Seq = seq;
+        fence12SubmitNs[seq & 1ULL] = submitNs;
 
         if (syncDepth == 0)
         {
@@ -564,7 +566,8 @@ struct DxSwapchainGpuSync
     }
 };
 
-static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT syncInterval, uint64_t submitNs)
+static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT syncInterval, uint64_t submitNs,
+                                 WrappedIDXGISwapChain4::PresentCache* cache)
 {
     if (swapChain == nullptr)
         return;
@@ -572,10 +575,15 @@ static void RecordDxgiFrameStats(IDXGISwapChain* swapChain, HWND hwnd, UINT sync
     DXGI_FRAME_STATISTICS stats {};
     if (SUCCEEDED(swapChain->GetFrameStatistics(&stats)) && stats.SyncQPCTime.QuadPart > 0)
     {
-        static UINT lastSyncCount = 0;
-        if (stats.SyncRefreshCount != lastSyncCount)
+        UINT fallbackRefreshCount = 0;
+        LONGLONG fallbackQpc = 0;
+        UINT& lastSyncCount = cache != nullptr ? cache->lastSyncRefreshCount : fallbackRefreshCount;
+        LONGLONG& lastSyncQpc = cache != nullptr ? cache->lastSyncQpc : fallbackQpc;
+
+        if (stats.SyncRefreshCount != lastSyncCount || stats.SyncQPCTime.QuadPart != lastSyncQpc)
         {
             lastSyncCount = stats.SyncRefreshCount;
+            lastSyncQpc = stats.SyncQPCTime.QuadPart;
             const uint64_t syncNs = Util::QpcToNs(stats.SyncQPCTime.QuadPart);
             const int hz = Util::GetActiveRefreshRate(hwnd);
             const uint64_t refreshNs = hz > 0 ? (1'000'000'000ULL / static_cast<uint64_t>(hz)) : 0ULL;
@@ -609,6 +617,8 @@ void WrappedIDXGISwapChain4::PresentCache::ResetDevice()
     isD3D11 = false;
     deviceResolved = false;
     d3d12Hooked = false;
+    lastSyncRefreshCount = 0;
+    lastSyncQpc = 0;
 }
 
 void WrappedIDXGISwapChain4::ApplyWaitableLatencyClamp(bool isCurrent)
@@ -670,6 +680,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         // Other windows' presents would shorten the game's frame time
         if (isCurrent)
         {
+            FrameLimit::markDxgiPresent();
             auto now = Util::MillisecondsNow();
 
             if (_lastFrameTime != 0)
@@ -851,7 +862,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             {
                 auto upscalerTime = upscalerTimeOpt.value();
                 // filter out possibly wrong measured high values
-                if (upscalerTime < 100.0)
+                if (upscalerTime > 0.0 && upscalerTime < 100.0)
                 {
                     State::Instance().frameTimeMutex.lock();
                     State::Instance().upscaleTimes.push_back(upscalerTime);
@@ -926,6 +937,9 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         // Draw overlay
         MenuOverlayDx::Present(pSwapChain, SyncInterval, Flags, pPresentParameters, pDevice, hWnd, isUWP);
 
+        if (isCurrent)
+            FrameLimit::onFgOutputPresent(false, SyncInterval > 0);
+
         if (State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG)
         {
             auto fgIsActive = fg != nullptr && fg->IsActive() && !fg->IsPaused();
@@ -984,7 +998,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
         presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
 
     if ((shouldLimit || gpuSyncDepth >= 0) && SUCCEEDED(presentResult))
-        RecordDxgiFrameStats(pSwapChain, hWnd, SyncInterval, submitNs);
+        RecordDxgiFrameStats(pSwapChain, hWnd, SyncInterval, submitNs, cache);
 
     if (shouldLimit)
         FrameLimit::postPresent(false);
@@ -1390,12 +1404,6 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
         auto isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr;
-        if (isCurrent)
-        {
-            FrameLimit::markDxgiPresent();
-            FrameLimit::onFgOutputPresent();
-        }
-
         result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp, isCurrent, _gpuSync, this);
     }
     else
@@ -1716,12 +1724,6 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
         auto isCurrent = IsCurrentSwapchain(this) || State::Instance().currentSwapchain == nullptr;
-        if (isCurrent)
-        {
-            FrameLimit::markDxgiPresent();
-            FrameLimit::onFgOutputPresent();
-        }
-
         result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp, isCurrent,
                               _gpuSync, this);
     }

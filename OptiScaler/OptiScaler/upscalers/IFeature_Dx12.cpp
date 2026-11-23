@@ -148,10 +148,21 @@ bool IFeature_Dx12::BeginPendingPostPassesAsync(ID3D12CommandQueue* directQueue)
     if (AsyncCompute != nullptr && AsyncCompute->IsInit() && directQueue != nullptr &&
         Config::Instance()->Dx12AsyncCompute.value_or_default())
     {
-        return AsyncCompute->BeginDispatch(
-            directQueue,
-            [&](ID3D12GraphicsCommandList* computeCmdList) -> bool { return ExecutePostPassSet(computeCmdList, passes); },
-            _pendingAsyncDoneFence);
+        if (AsyncCompute->BeginDispatch(
+                directQueue,
+                [&](ID3D12GraphicsCommandList* computeCmdList) -> bool { return ExecutePostPassSet(computeCmdList, passes); },
+                _pendingAsyncDoneFence))
+        {
+            return true;
+        }
+
+        // Unsubmitted compute recording may have mutated CPU-side _bufferState before failing
+        if (passes.runOutputScaler && OutputScaler)
+            OutputScaler->RestoreBufferState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (passes.runRcas && RCAS)
+            RCAS->RestoreBufferState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (passes.runMagnifier && Magnifier)
+            Magnifier->RestoreBufferState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
     return false;

@@ -325,11 +325,16 @@ struct FgOpenLoopState
 {
     uint64_t nextTargetNs = 0;
     uint64_t lastOutputEdgeNs = 0;
+    uint64_t lastEntryNs = 0;
+    uint64_t batchDeadlineEndNs = 0;
     uint64_t lastGamePresentNs = 0;
     double baseFrameIntervalEmaNs = 0.0;
     uint32_t baseFrameSamples = 0;
-    int64_t closedLoopBiasNs = 0;
+    uint32_t outlierSpikeStreak = 0;
     uint32_t activeMult = 0;
+    uint32_t batchRemaining = 0;
+    float lastCapFps = 0.0f;
+    bool lastFromVulkan = false;
 
     std::array<float, 120> frameTimesMs {};
     size_t frameTimeHead = 0;
@@ -369,20 +374,32 @@ HANDLE GetFgWakeEvent()
     return s_event;
 }
 
-void ResetFgSubframeLocked()
+void ResetFgSubframePacingLocked(bool resetEstimator)
 {
     g_fgSub.nextTargetNs = 0;
     g_fgSub.lastOutputEdgeNs = 0;
-    g_fgSub.lastGamePresentNs = 0;
-    g_fgSub.baseFrameIntervalEmaNs = 0.0;
-    g_fgSub.baseFrameSamples = 0;
-    g_fgSub.closedLoopBiasNs = 0;
-    g_fgSub.activeMult = 0;
+    g_fgSub.lastEntryNs = 0;
+    g_fgSub.batchDeadlineEndNs = 0;
+    g_fgSub.batchRemaining = 0;
+    if (resetEstimator)
+    {
+        g_fgSub.lastGamePresentNs = 0;
+        g_fgSub.baseFrameIntervalEmaNs = 0.0;
+        g_fgSub.baseFrameSamples = 0;
+        g_fgSub.outlierSpikeStreak = 0;
+    }
     if (g_fgSubframeActive.exchange(false, std::memory_order_release))
     {
         if (HANDLE ev = GetFgWakeEvent())
             SetEvent(ev);
     }
+}
+
+void ResetFgSubframeLocked()
+{
+    ResetFgSubframePacingLocked(true);
+    g_fgSub.activeMult = 0;
+    g_fgSub.lastCapFps = 0.0f;
 }
 
 void PushFrameTimeMs(std::array<float, 120>& ring, size_t& head, size_t& count, uint64_t prevNs, uint64_t curNs)
@@ -1160,11 +1177,37 @@ void FrameLimit::onFgGamePresentStart()
         if (g_fgSub.lastGamePresentNs > 0 && now > g_fgSub.lastGamePresentNs)
         {
             const uint64_t dt = now - g_fgSub.lastGamePresentNs;
-            if (dt >= 1'000'000ULL && dt <= 250'000'000ULL)
+            if (dt > 500'000'000ULL)
+            {
+                g_fgSub.baseFrameIntervalEmaNs = 0.0;
+                g_fgSub.baseFrameSamples = 0;
+                g_fgSub.outlierSpikeStreak = 0;
+            }
+            else if (dt >= 1'000'000ULL && dt <= 250'000'000ULL)
             {
                 const double dtF = static_cast<double>(dt);
-                g_fgSub.baseFrameIntervalEmaNs =
-                    g_fgSub.baseFrameIntervalEmaNs > 0.0 ? (0.20 * dtF + 0.80 * g_fgSub.baseFrameIntervalEmaNs) : dtF;
+                if (g_fgSub.baseFrameIntervalEmaNs <= 0.0)
+                {
+                    g_fgSub.baseFrameIntervalEmaNs = dtF;
+                    g_fgSub.outlierSpikeStreak = 0;
+                }
+                else if (g_fgSub.baseFrameSamples >= 4 && dtF > g_fgSub.baseFrameIntervalEmaNs * 2.5)
+                {
+                    // Ignore transient spikes so a single hitch cannot inflate uncapped stagger into queue stalls
+                    if (++g_fgSub.outlierSpikeStreak >= 3)
+                    {
+                        g_fgSub.baseFrameIntervalEmaNs = 0.25 * dtF + 0.75 * g_fgSub.baseFrameIntervalEmaNs;
+                        g_fgSub.outlierSpikeStreak = 0;
+                    }
+                }
+                else
+                {
+                    g_fgSub.outlierSpikeStreak = 0;
+                    // Adapt downward rapidly when GPU load lightens; rise conservatively to prevent feedback ratcheting
+                    const double alpha = (dtF < g_fgSub.baseFrameIntervalEmaNs) ? 0.30 : 0.12;
+                    g_fgSub.baseFrameIntervalEmaNs =
+                        alpha * dtF + (1.0 - alpha) * g_fgSub.baseFrameIntervalEmaNs;
+                }
                 if (g_fgSub.baseFrameSamples < 1000)
                     ++g_fgSub.baseFrameSamples;
             }
@@ -1215,8 +1258,26 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
         std::scoped_lock lock(g_fgSubMutex);
         const uint64_t now = Util::GetTimestamp();
 
+        const bool wasCapped = g_fgSub.lastCapFps > 0.0f;
+        const bool isCapped = capFps > 0.0f;
+        const bool capChanged =
+            (wasCapped != isCapped) ||
+            (isCapped && std::abs(capFps - g_fgSub.lastCapFps) > std::max(1.0f, g_fgSub.lastCapFps * 0.05f));
+        const bool multOrSourceChanged =
+            (g_fgSub.activeMult != 0 && (g_fgSub.activeMult != mult || g_fgSub.lastFromVulkan != fromVulkan));
+
+        if (capChanged || multOrSourceChanged)
+        {
+            // Wipe stale capped EMA when disabling the limit so old frame times never stall uncapped presents
+            ResetFgSubframePacingLocked(wasCapped && !isCapped);
+        }
+
+        g_fgSub.activeMult = mult;
+        g_fgSub.lastCapFps = capFps;
+        g_fgSub.lastFromVulkan = fromVulkan;
+
         double targetSubNs = 0.0;
-        if (capFps > 0.0f)
+        if (isCapped)
         {
             targetSubNs = std::clamp(1'000'000'000.0 / static_cast<double>(capFps), 100'000.0, 100'000'000.0);
         }
@@ -1227,47 +1288,30 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
                 std::clamp(g_fgSub.baseFrameIntervalEmaNs / static_cast<double>(mult), 100'000.0, 100'000'000.0);
         }
 
-        if (targetSubNs <= 0.0)
+        if (targetSubNs <= 0.0 || !separatePresentThread)
         {
-            g_fgSub.nextTargetNs = 0;
-            g_fgSub.lastOutputEdgeNs = 0;
-            g_fgSub.closedLoopBiasNs = 0;
-            g_fgSub.activeMult = 0;
-            if (g_fgSubframeActive.exchange(false, std::memory_order_release))
-            {
-                if (HANDLE ev = GetFgWakeEvent())
-                    SetEvent(ev);
-            }
+            ResetFgSubframePacingLocked(false);
             return;
         }
 
         g_fgSubframeActive.store(true, std::memory_order_release);
-        g_fgSub.activeMult = mult;
 
-        if (!separatePresentThread)
-            return;
-
-        const uint64_t nominalStepNs =
-            std::min<uint64_t>(static_cast<uint64_t>(std::llround(targetSubNs * 0.995)), 50'000'000ULL);
-
-        if (g_fgSub.lastOutputEdgeNs > 0 && now > g_fgSub.lastOutputEdgeNs)
+        if (hwVsync)
         {
-            const uint64_t actualDelta = now - g_fgSub.lastOutputEdgeNs;
-            if (actualDelta < nominalStepNs * 3)
-            {
-                const int64_t deltaErr =
-                    static_cast<int64_t>(actualDelta) - static_cast<int64_t>(nominalStepNs);
-                g_fgSub.closedLoopBiasNs =
-                    std::clamp<int64_t>(g_fgSub.closedLoopBiasNs - deltaErr / 16, -350'000LL, 250'000LL);
-            }
+            g_fgSub.nextTargetNs = 0;
+            g_fgSub.batchDeadlineEndNs = 0;
+            g_fgSub.batchRemaining = 0;
+            g_fgSub.lastEntryNs = now;
         }
-
-        const int64_t rawStep = static_cast<int64_t>(nominalStepNs) + g_fgSub.closedLoopBiasNs;
-        const uint64_t stepNs = static_cast<uint64_t>(
-            std::clamp<int64_t>(rawStep, 100'000LL, static_cast<int64_t>(nominalStepNs) + 250'000LL));
-
-        if (!hwVsync)
+        else if (isCapped)
         {
+            // Stay strictly faster than the primary cap (50-150us headroom) so Virtual VSync never steals
+            // pacing from AntiLag/Reflex/FrameLimit or undershoots the configured FPS limit
+            const double marginNs = std::clamp(targetSubNs * 0.008, 50'000.0, 150'000.0);
+            const double pacedSubNs = std::max(100'000.0, targetSubNs - marginNs);
+            const uint64_t stepNs =
+                std::min<uint64_t>(static_cast<uint64_t>(std::llround(pacedSubNs)), 50'000'000ULL);
+
             if (g_fgSub.nextTargetNs > now && (g_fgSub.nextTargetNs - now) <= stepNs * 2)
                 deadlineNs = std::min(g_fgSub.nextTargetNs, now + stepNs);
             else
@@ -1275,10 +1319,43 @@ void FrameLimit::onFgOutputPresent(bool fromVulkan, bool hwVsync)
 
             const uint64_t effectiveEdge = (deadlineNs > now) ? deadlineNs : now;
             g_fgSub.nextTargetNs = effectiveEdge + stepNs;
+            g_fgSub.lastEntryNs = now;
         }
         else
         {
-            g_fgSub.nextTargetNs = 0;
+            // Uncapped VRR mode: only space subframes 1..mult-1 within each batch with 8% safety slack;
+            // never hold back subframe 0 of a new batch so presenter pacing cannot backpressure o_FGSCPresent
+            const uint64_t stepNs = std::clamp<uint64_t>(static_cast<uint64_t>(std::llround(targetSubNs * 0.92)),
+                                                         100'000ULL, 46'000'000ULL);
+            const bool batchTimedOut =
+                (g_fgSub.batchDeadlineEndNs > 0 && now >= g_fgSub.batchDeadlineEndNs) ||
+                (g_fgSub.lastEntryNs > 0 && now > g_fgSub.lastEntryNs &&
+                 (now - g_fgSub.lastEntryNs) > (stepNs * 3) / 2);
+
+            if (g_fgSub.batchRemaining == 0 || batchTimedOut)
+            {
+                deadlineNs = 0;
+                g_fgSub.batchRemaining = mult - 1u;
+                g_fgSub.nextTargetNs = now + stepNs;
+                g_fgSub.batchDeadlineEndNs = now + stepNs * mult;
+            }
+            else
+            {
+                --g_fgSub.batchRemaining;
+                if (g_fgSub.nextTargetNs > now && (g_fgSub.nextTargetNs - now) <= stepNs * 2)
+                    deadlineNs = std::min(g_fgSub.nextTargetNs, now + stepNs);
+
+                if (g_fgSub.batchRemaining > 0)
+                {
+                    const uint64_t effectiveEdge = (deadlineNs > now) ? deadlineNs : now;
+                    g_fgSub.nextTargetNs = effectiveEdge + stepNs;
+                }
+                else
+                {
+                    g_fgSub.nextTargetNs = 0;
+                }
+            }
+            g_fgSub.lastEntryNs = now;
         }
     }
 

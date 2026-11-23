@@ -1544,6 +1544,7 @@ bool XeFG_Dx12::Present()
                 {
                     bool asyncDispatched = false;
                     bool prepSubmitted = false;
+                    bool computeOk = false;
                     if (_hudCopy->PrepareAsyncDispatch(prepCmdList, pendingAsyncHudCopy.hudless,
                                                        pendingAsyncHudCopy.backBuffer,
                                                        pendingAsyncHudCopy.hudlessState,
@@ -1555,7 +1556,7 @@ bool XeFG_Dx12::Present()
                         _gameCommandQueue->ExecuteCommandLists(1, prepList);
                         prepSubmitted = true;
 
-                        const bool computeOk = _asyncCompute->Dispatch(
+                        computeOk = _asyncCompute->Dispatch(
                             _gameCommandQueue,
                             [&](ID3D12GraphicsCommandList* computeList) -> bool
                             {
@@ -1589,14 +1590,27 @@ bool XeFG_Dx12::Present()
                         {
                             if (prepSubmitted)
                             {
-                                // PrepareAsyncDispatch left _buffer in UAV and hudless in NON_PIXEL_SHADER_RESOURCE
-                                _hudCopy->Dispatch(fallbackCmdList, pendingAsyncHudCopy.hudless,
-                                                   pendingAsyncHudCopy.backBuffer,
-                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                                   D3D12_RESOURCE_STATE_PRESENT, pendingAsyncHudCopy.threshold);
-                                ResourceBarrier(fallbackCmdList, pendingAsyncHudCopy.hudless,
-                                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                                pendingAsyncHudCopy.hudlessState);
+                                if (computeOk)
+                                {
+                                    // Async compute already completed and direct queue waited on it; finish the copy-back
+                                    _hudCopy->CompleteAsyncDispatch(fallbackCmdList, pendingAsyncHudCopy.hudless,
+                                                                    pendingAsyncHudCopy.backBuffer,
+                                                                    pendingAsyncHudCopy.hudlessState,
+                                                                    D3D12_RESOURCE_STATE_PRESENT);
+                                }
+                                else
+                                {
+                                    // PrepareAsyncDispatch left _buffer in UAV, _srcBuffer in NON_PIXEL_SHADER_RESOURCE,
+                                    // and hudless in NON_PIXEL_SHADER_RESOURCE
+                                    _hudCopy->AbortAsyncPrepare(fallbackCmdList);
+                                    _hudCopy->Dispatch(fallbackCmdList, pendingAsyncHudCopy.hudless,
+                                                       pendingAsyncHudCopy.backBuffer,
+                                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                       D3D12_RESOURCE_STATE_PRESENT, pendingAsyncHudCopy.threshold);
+                                    ResourceBarrier(fallbackCmdList, pendingAsyncHudCopy.hudless,
+                                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                    pendingAsyncHudCopy.hudlessState);
+                                }
                             }
                             else
                             {

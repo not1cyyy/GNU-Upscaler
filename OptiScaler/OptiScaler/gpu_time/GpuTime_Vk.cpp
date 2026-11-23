@@ -56,6 +56,7 @@ void GpuTime_Vk::Start(VkCommandBuffer cmdBuffer)
     if (_init && _queryPool != VK_NULL_HANDLE && Util::ShouldRecordUpscalerGpuTime())
     {
         _currentFrameIndex = (_currentFrameIndex + 1) % QUERY_BUFFER_COUNT;
+        _trigger[_currentFrameIndex] = false;
 
         vkCmdResetQueryPool(cmdBuffer, _queryPool, _currentFrameIndex * 2, 2);
         vkCmdWriteTimestamp(cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, _queryPool, _currentFrameIndex * 2);
@@ -98,7 +99,7 @@ std::optional<double> GpuTime_Vk::ReadGpuTime()
 
     _trigger[previousFrameIndex] = false;
 
-    if (timestamps[1] < timestamps[0])
+    if (timestamps[0] == 0 || timestamps[1] <= timestamps[0])
         return elapsedTimeMs;
 
     elapsedTimeMs = (timestamps[1] - timestamps[0]) * _timestampPeriod / 1e6;

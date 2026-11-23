@@ -397,8 +397,17 @@ static void InsertHeapRangeLocked(std::vector<HeapRangeEntry>& ranges, SIZE_T st
         return;
 
     std::erase_if(ranges, [&](const HeapRangeEntry& entry)
-                  { return entry.heap == nullptr || !entry.heap->active.load(std::memory_order_acquire) ||
-                           (entry.start == start && entry.end == end); });
+                  {
+                      if (entry.heap == nullptr || !entry.heap->active.load(std::memory_order_acquire))
+                          return true;
+                      if (entry.start < end && start < entry.end)
+                      {
+                          if (entry.heap != heap)
+                              entry.heap->DeactivateAndClear();
+                          return true;
+                      }
+                      return false;
+                  });
 
     auto it = std::upper_bound(ranges.begin(), ranges.end(), start,
                                [](SIZE_T s, const HeapRangeEntry& entry) { return s < entry.start; });
@@ -1065,6 +1074,7 @@ struct BindingCacheTLS
     ID3D12GraphicsCommandList* cmdList = nullptr;
     std::shared_ptr<CommandListBindingState> state;
     uint64_t generation = 0;
+    ID3D12GraphicsCommandList* untrackableCmdList = nullptr;
 };
 
 static thread_local BindingCacheTLS gBindingCacheTLS;
@@ -1079,6 +1089,8 @@ void ResTrack_Dx12::RemoveBindingState(ID3D12GraphicsCommandList* commandList)
         gBindingCacheTLS.cmdList = nullptr;
         gBindingCacheTLS.state.reset();
     }
+    if (gBindingCacheTLS.untrackableCmdList == commandList)
+        gBindingCacheTLS.untrackableCmdList = nullptr;
     _bindingStateGeneration.fetch_add(1, std::memory_order_release);
 
     if (!_useShards)
@@ -1097,6 +1109,7 @@ void ResTrack_Dx12::ClearBindingStates()
 {
     gBindingCacheTLS.cmdList = nullptr;
     gBindingCacheTLS.state.reset();
+    gBindingCacheTLS.untrackableCmdList = nullptr;
     _bindingStateGeneration.fetch_add(1, std::memory_order_release);
 
     if (!_useShards)
@@ -1129,32 +1142,28 @@ CommandListBindingState* ResTrack_Dx12::GetOrCreateBindingState(ID3D12GraphicsCo
     if (gBindingCacheTLS.cmdList == commandList && gBindingCacheTLS.generation == gen && gBindingCacheTLS.state != nullptr)
         return gBindingCacheTLS.state.get();
 
+    if (gBindingCacheTLS.untrackableCmdList == commandList)
+        return nullptr;
+
     std::shared_ptr<CommandListBindingState> statePtr;
-    bool created = false;
 
     if (!_useShards)
     {
         std::lock_guard<std::mutex> lock(_bindingStateMutex);
-        auto [it, inserted] = _bindingStates.try_emplace(commandList);
-        if (inserted)
-            it->second = std::make_shared<CommandListBindingState>();
-        statePtr = it->second;
-        created = inserted;
+        if (auto it = _bindingStates.find(commandList); it != _bindingStates.end())
+            statePtr = it->second;
     }
     else
     {
         auto& shard = _bindingShards[GetShardIndex(commandList)];
         std::lock_guard<BindingStateMutex> lock(shard.mutex);
-        auto [it, inserted] = shard.map.try_emplace(commandList);
-        if (inserted)
-            it->second = std::make_shared<CommandListBindingState>();
-        statePtr = it->second;
-        created = inserted;
+        if (auto it = shard.map.find(commandList); it != shard.map.end())
+            statePtr = it->second;
     }
 
-    if (!created)
+    if (statePtr != nullptr)
     {
-        gBindingCacheTLS = { commandList, statePtr, _bindingStateGeneration.load(std::memory_order_acquire) };
+        gBindingCacheTLS = { commandList, statePtr, _bindingStateGeneration.load(std::memory_order_acquire), nullptr };
         return statePtr.get();
     }
 
@@ -1164,23 +1173,46 @@ CommandListBindingState* ResTrack_Dx12::GetOrCreateBindingState(ID3D12GraphicsCo
     {
         LOG_DEBUG("ID3DDestructionNotifier is not available for commandlist {:X}, result: {:X}", (size_t) commandList,
                   (UINT) result);
-        RemoveBindingState(commandList);
+        gBindingCacheTLS.untrackableCmdList = commandList;
         return nullptr;
     }
 
     UINT callbackId = 0;
     result = notifier->RegisterDestructionCallback(&ResTrack_Dx12::CommandListDestroyed, commandList, &callbackId);
-    notifier->Release();
-
     if (FAILED(result))
     {
+        notifier->Release();
         LOG_DEBUG("Can't register commandlist remove callback for {:X}, result: {:X}", (size_t) commandList,
                   (UINT) result);
-        RemoveBindingState(commandList);
+        gBindingCacheTLS.untrackableCmdList = commandList;
         return nullptr;
     }
 
-    gBindingCacheTLS = { commandList, statePtr, _bindingStateGeneration.load(std::memory_order_acquire) };
+    auto newState = std::make_shared<CommandListBindingState>();
+    bool inserted = false;
+
+    if (!_useShards)
+    {
+        std::lock_guard<std::mutex> lock(_bindingStateMutex);
+        auto [it, didInsert] = _bindingStates.try_emplace(commandList, std::move(newState));
+        statePtr = it->second;
+        inserted = didInsert;
+    }
+    else
+    {
+        auto& shard = _bindingShards[GetShardIndex(commandList)];
+        std::lock_guard<BindingStateMutex> lock(shard.mutex);
+        auto [it, didInsert] = shard.map.try_emplace(commandList, std::move(newState));
+        statePtr = it->second;
+        inserted = didInsert;
+    }
+
+    if (!inserted)
+        notifier->UnregisterDestructionCallback(callbackId);
+
+    notifier->Release();
+
+    gBindingCacheTLS = { commandList, statePtr, _bindingStateGeneration.load(std::memory_order_acquire), nullptr };
     return statePtr.get();
 }
 

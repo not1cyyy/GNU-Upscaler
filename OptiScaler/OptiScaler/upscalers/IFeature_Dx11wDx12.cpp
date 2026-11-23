@@ -396,9 +396,7 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
         InParameters->Set("FSR.transparencyAndComposition", (void*) nullptr);
 
         LOG_DEBUG("Dispatch!!");
-        dx12Feature->SetDeferPostPasses(true);
         dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
-        dx12Feature->SetDeferPostPasses(false);
 
     } while (false);
 
@@ -437,8 +435,6 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
         ID3D12CommandList* ppCommandLists[] = { cmdList };
         Dx12CommandQueue->ExecuteCommandLists(1, ppCommandLists);
         commandListExecuted = true;
-
-        dx12Feature->DispatchPendingPostPassesAsync(Dx12CommandQueue);
 
         const auto fenceValue = ++Dx12FenceValue;
         result = Dx12CommandQueue->Signal(Dx12Fence, fenceValue);

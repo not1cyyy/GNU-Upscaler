@@ -21,6 +21,9 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_
 #ifdef LOG_REFLEX_CALLS
     LOG_FUNC();
 #endif
+    if (pSetSleepModeParams == nullptr)
+        return o_NvAPI_D3D_SetSleepMode(pDev, nullptr);
+
     // Store for later so we can adjust the fps whenever we want
     memcpy(&_lastSleepParams, pSetSleepModeParams, sizeof(NV_SET_SLEEP_MODE_PARAMS));
     _lastSleepDev = pDev;
@@ -28,10 +31,14 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_
     if (State::Instance().gameQuirks & GameQuirk::HitmanReflexHacks)
         _lastSetSleepThread = std::this_thread::get_id();
 
-    if (_minimumIntervalUs != 0)
-        pSetSleepModeParams->minimumIntervalUs = _minimumIntervalUs;
+    if (_minimumIntervalUs == 0)
+        return o_NvAPI_D3D_SetSleepMode(pDev, pSetSleepModeParams);
 
-    return o_NvAPI_D3D_SetSleepMode(pDev, pSetSleepModeParams);
+    // Modify a local copy so persistent game structs aren't overwritten with OptiScaler's cap
+    NV_SET_SLEEP_MODE_PARAMS localParams = _lastSleepParams;
+    localParams.minimumIntervalUs = _minimumIntervalUs;
+
+    return o_NvAPI_D3D_SetSleepMode(pDev, &localParams);
 }
 
 NvAPI_Status ReflexHooks::hkNvAPI_D3D_Sleep(IUnknown* pDev)
@@ -411,14 +418,20 @@ NvAPI_Status ReflexHooks::hkNvAPI_Vulkan_SetSleepMode(HANDLE vkDevice,
 #ifdef LOG_REFLEX_CALLS
     LOG_FUNC();
 #endif
+    if (pSetSleepModeParams == nullptr)
+        return o_NvAPI_Vulkan_SetSleepMode(vkDevice, nullptr);
+
     // Store for later so we can adjust the fps whenever we want
     memcpy(&_lastVkSleepParams, pSetSleepModeParams, sizeof(NV_VULKAN_SET_SLEEP_MODE_PARAMS));
     _lastVkSleepDev = vkDevice;
 
-    if (_minimumIntervalUs != 0)
-        pSetSleepModeParams->minimumIntervalUs = _minimumIntervalUs;
+    if (_minimumIntervalUs == 0)
+        return o_NvAPI_Vulkan_SetSleepMode(vkDevice, pSetSleepModeParams);
 
-    return o_NvAPI_Vulkan_SetSleepMode(vkDevice, pSetSleepModeParams);
+    NV_VULKAN_SET_SLEEP_MODE_PARAMS localParams = _lastVkSleepParams;
+    localParams.minimumIntervalUs = _minimumIntervalUs;
+
+    return o_NvAPI_Vulkan_SetSleepMode(vkDevice, &localParams);
 }
 
 NvAPI_Status ReflexHooks::hkNvAPI_Vulkan_GetLatency(HANDLE vkDevice, NV_VULKAN_LATENCY_RESULT_PARAMS* pGetLatencyParams)
@@ -515,10 +528,8 @@ void ReflexHooks::update(bool fgActive, bool isVulkan)
     if (_updatesWithoutMarker > 20 || !_inited)
     {
         State::Instance().reflexLimitsFps = false;
-        return;
     }
-
-    if (isVulkan && _lastVkSleepDev)
+    else if (isVulkan && _lastVkSleepDev)
     {
         // fgActive doesn't matter for vulkan
         State::Instance().reflexLimitsFps = _lastVkSleepParams.bLowLatencyMode;
@@ -543,12 +554,15 @@ void ReflexHooks::update(bool fgActive, bool isVulkan)
     static float lastFps = 0;
     static bool lastReflexLimitsFps = State::Instance().reflexLimitsFps;
 
-    // Reset required when toggling Reflex
+    // Reset required when toggling Reflex or when game markers stop arriving
     if (State::Instance().reflexLimitsFps != lastReflexLimitsFps)
     {
         lastReflexLimitsFps = State::Instance().reflexLimitsFps;
         lastFps = 0;
-        setFPSLimit(0);
+        if (_inited)
+            setFPSLimit(0);
+        else
+            _minimumIntervalUs = 0;
     }
 
     if (!State::Instance().reflexLimitsFps)

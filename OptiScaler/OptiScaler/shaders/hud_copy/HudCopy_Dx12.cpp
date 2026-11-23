@@ -254,15 +254,29 @@ bool HudCopy_Dx12::DispatchAsyncCompute(ID3D12GraphicsCommandList* computeCmdLis
         computeCmdList == nullptr)
         return false;
 
-    ScopedGpuTime_Dx12 scopedGpuTime(GpuTime.get(), computeCmdList);
-
     const bool ok = DispatchKernel(computeCmdList, hudless, _srcBuffer, hudDetectionThreshold, _asyncWidth, _asyncHeight);
 
-    ResourceBarrier(computeCmdList, _buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    ResourceBarrier(computeCmdList, _srcBuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                    D3D12_RESOURCE_STATE_COPY_DEST);
+    if (ok)
+    {
+        ResourceBarrier(computeCmdList, _buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ResourceBarrier(computeCmdList, _srcBuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+    }
 
     return ok;
+}
+
+void HudCopy_Dx12::AbortAsyncPrepare(ID3D12GraphicsCommandList* directCmdList)
+{
+    if (directCmdList == nullptr)
+        return;
+
+    if (_buffer != nullptr)
+        ResourceBarrier(directCmdList, _buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (_srcBuffer != nullptr)
+        ResourceBarrier(directCmdList, _srcBuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
 }
 
 void HudCopy_Dx12::CompleteAsyncDispatch(ID3D12GraphicsCommandList* directCmdList, ID3D12Resource* hudless,

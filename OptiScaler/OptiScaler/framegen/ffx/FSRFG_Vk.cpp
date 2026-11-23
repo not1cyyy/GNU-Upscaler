@@ -1004,6 +1004,9 @@ VkSemaphore FSRFG_Vk::Dispatch(const VkPresentInfoKHR* pPresentInfo)
     if (auto submitResult = vkQueueSubmit(_gameQueue, 1, &submitInfo, _fence[fIndex]); submitResult != VK_SUCCESS)
     {
         LOG_ERROR("vkQueueSubmit error: {}", magic_enum::enum_name(submitResult));
+        // Fence was reset above and will never be signaled; destroy it so BeginCommandBuffer recreates it signaled
+        vkDestroyFence(_device, _fence[fIndex], nullptr);
+        _fence[fIndex] = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
 

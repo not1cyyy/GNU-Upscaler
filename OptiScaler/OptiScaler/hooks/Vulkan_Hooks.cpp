@@ -123,10 +123,33 @@ static bool FromFGOutput(void* returnAddress)
     return state.optiSlInterposer != nullptr && state.IsOptiStreamlineModule(Util::GetCallerModule(returnAddress));
 }
 
+static std::atomic<bool> _dxgiSwapchainVsync { false };
+static std::atomic<bool> _vkSwapchainVsync { false };
+
+static bool IsFifoPresentMode(VkPresentModeKHR mode)
+{
+    return mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
+           mode == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
+}
+
 // FG outputs present the real and the generated frames through this
 static VkResult FGOutputQueuePresent(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 {
     MenuCommon::FGOutputPresent();
+    if (pPresentInfo != nullptr && pPresentInfo->swapchainCount == 1)
+    {
+        for (auto next = static_cast<const VkBaseInStructure*>(pPresentInfo->pNext); next != nullptr; next = next->pNext)
+        {
+            if (next->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT)
+            {
+                const auto* modeInfo = reinterpret_cast<const VkSwapchainPresentModeInfoEXT*>(next);
+                if (modeInfo->swapchainCount == 1 && modeInfo->pPresentModes != nullptr)
+                    _vkSwapchainVsync.store(IsFifoPresentMode(modeInfo->pPresentModes[0]), std::memory_order_relaxed);
+                break;
+            }
+        }
+        FrameLimit::onFgOutputPresent(true, _vkSwapchainVsync.load(std::memory_order_relaxed));
+    }
     return o_QueuePresentKHR(queue, pPresentInfo);
 }
 
@@ -885,14 +908,6 @@ static VkResult hkvkCreateDevice(VkPhysicalDevice physicalDevice, const VkDevice
     return result;
 }
 
-static std::atomic<bool> _dxgiSwapchainVsync { false };
-
-static bool IsFifoPresentMode(VkPresentModeKHR mode)
-{
-    return mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
-           mode == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
-}
-
 VALIDATE_HOOK(hkvkQueuePresentKHR, PFN_vkQueuePresentKHR)
 static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 {
@@ -923,7 +938,7 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
 
             auto upscalerTime = upscalerTimeOpt.value();
             // filter out possibly wrong measured high values
-            if (upscalerTime < 100.0)
+            if (upscalerTime > 0.0 && upscalerTime < 100.0)
             {
                 State::Instance().frameTimeMutex.lock();
                 State::Instance().upscaleTimes.push_back(upscalerTime);
@@ -966,16 +981,18 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
         return VK_ERROR_OUT_OF_DATE_KHR;
     }
 
-    ReflexHooks::update(false, true);
-
-    // dxvk/vkd3d-proton's go through the DXGI swapchain
-    if (!dxgiBacked)
-        InputCommon::update();
-
     const bool fgPresent = !dxgiBacked && fg != nullptr && localPresentInfo.swapchainCount == 1 &&
                            fg->OwnsSwapchain(localPresentInfo.pSwapchains[0]);
+    const bool fgActive = fgPresent && fg->IsActive() && !fg->IsPaused();
 
-    MenuCommon::FGOutputPresents(fgPresent && fg->IsActive() && !fg->IsPaused());
+    // dxvk/vkd3d-proton's presents go through the DXGI swapchain
+    if (!dxgiBacked)
+    {
+        ReflexHooks::update(fgActive, true);
+        InputCommon::update();
+    }
+
+    MenuCommon::FGOutputPresents(fgActive);
 
     auto dx12Fg = State::Instance().currentFG;
     const bool dx12FgActive = dxgiBacked && dx12Fg != nullptr && dx12Fg->IsActive() && !dx12Fg->IsPaused();
@@ -983,7 +1000,6 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     if (!dx12FgActive)
         FrameLimit::markVulkanPresent();
 
-    const bool fgActive = fgPresent && fg->IsActive() && !fg->IsPaused();
     const bool dxgiPacingActive = dxgiBacked && FrameLimit::hasRecentDxgiPresent();
     const bool limitActive =
         !dx12FgActive && !dxgiPacingActive && !State::Instance().reflexLimitsFps && !InputCommon::can_limit_fps();
@@ -991,7 +1007,7 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     const bool trackFrameSync =
         !fgPresent && !dx12FgActive &&
         (FrameLimit::targetFps() > 0.0f || Config::Instance()->FramerateLimitMaxInFlight.value_or_default() > 0 ||
-         FrameLimit::isGpuSyncActive() || State::Instance().reflexLimitsFps || InputCommon::can_limit_fps());
+         FrameLimit::isGpuSyncActive());
 
     if (dxgiBacked && localPresentInfo.swapchainCount == 1)
     {
@@ -1013,7 +1029,7 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
         }
     }
 
-    if (!dxgiBacked && !fgActive)
+    if (!dxgiBacked)
         FrameLimit::markCpuWorkEnd();
 
     if (gpuSyncEnabled)
@@ -1056,8 +1072,12 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
 
     if (fgPresent)
     {
+        if (fgActive)
+            FrameLimit::onFgGamePresentStart();
         ScopedFGCall fgCall {};
+        const auto fgPresentStart = Util::MillisecondsNow();
         result = fg->QueuePresent(queue, &localPresentInfo);
+        State::Instance().lastFGPresentMs = Util::MillisecondsNow() - fgPresentStart;
     }
     else
     {
@@ -1335,6 +1355,7 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
         LOG_DEBUG("_device captured: {0:X}", (UINT64) _device);
 
         _gameSwapchain = *pSwapchain;
+        _vkSwapchainVsync.store(IsFifoPresentMode(pCreateInfo->presentMode), std::memory_order_relaxed);
 
         if (Config::Instance()->OverlayMenu.value_or_default())
         {

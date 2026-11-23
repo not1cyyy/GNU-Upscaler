@@ -103,6 +103,9 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChai
         UINT gameRequestedLatency = 3;
         UINT appliedLatency = 0;
 
+        UINT lastSyncRefreshCount = 0;
+        LONGLONG lastSyncQpc = 0;
+
         void ResetDevice();
     };
 

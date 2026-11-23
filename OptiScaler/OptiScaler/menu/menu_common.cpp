@@ -7497,7 +7497,7 @@ void MenuCommon::RenderFramerateSettings(RenderMenuContext& ctx)
         if (syncStats.gpuSyncActive)
             currentMethod.append(syncStats.gpuSyncStrict ? " + GPU SyncFlush" : " + GPU Queue<=1");
         if (syncStats.fgSubframePacingActive && syncStats.fgSubframeMultiplier > 0)
-            currentMethod.append(std::format(" + XeFG {}x VirtualVSync", syncStats.fgSubframeMultiplier));
+            currentMethod.append(std::format(" + FG {}x VirtualVSync", syncStats.fgSubframeMultiplier));
         if (syncStats.vblankLocked && syncStats.detectedRefreshHz > 0.0)
             currentMethod.append(std::format(" + VBlank PLL ({:.1f} Hz)", syncStats.detectedRefreshHz));
         if (syncStats.gamescopeLimiterDetected)

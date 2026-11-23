@@ -22,7 +22,7 @@ struct FractionalFpsPacer
         const double exactFps = 1'000'000.0 / static_cast<double>(intervalUs);
         const double roundedFps = std::round(exactFps);
         outNeedsFractionalSleep = std::abs(exactFps - roundedFps) > 0.05;
-        return static_cast<int>(std::ceil(exactFps));
+        return outNeedsFractionalSleep ? static_cast<int>(std::ceil(exactFps)) : static_cast<int>(roundedFps);
     }
 
     void Pace(uint32_t intervalUs)

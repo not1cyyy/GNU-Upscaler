@@ -12,6 +12,7 @@ class GpuTime_Dx12
     ID3D12CommandQueue* _cachedQueue = nullptr;
     UINT64 _cachedFrequency = 0;
     std::array<bool, QUERY_BUFFER_COUNT> _trigger {};
+    std::array<UINT64, QUERY_BUFFER_COUNT> _lastConsumedEndTime {};
 
     int _currentFrameIndex = 0;
     bool _init = false;

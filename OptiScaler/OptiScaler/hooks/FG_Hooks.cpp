@@ -1434,7 +1434,7 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
             {
                 auto upscalerTime = upscalerTimeOpt.value();
                 // filter out possibly wrong measured high values
-                if (upscalerTime < 100.0)
+                if (upscalerTime > 0.0 && upscalerTime < 100.0)
                 {
                     State::Instance().frameTimeMutex.lock();
                     State::Instance().upscaleTimes.push_back(upscalerTime);

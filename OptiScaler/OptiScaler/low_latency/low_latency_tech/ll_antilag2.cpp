@@ -5,10 +5,12 @@
 
 inline HRESULT AntiLag2::al2_sleep()
 {
+    const bool enabled = is_enabled();
     bool needsFractionalSleep = false;
-    const int max_fps = FractionalFpsPacer::ComputeDriverCeilingFps(minimum_interval_us, needsFractionalSleep);
+    const int max_fps =
+        enabled ? FractionalFpsPacer::ComputeDriverCeilingFps(minimum_interval_us, needsFractionalSleep) : 0;
 
-    if (needsFractionalSleep)
+    if (enabled && needsFractionalSleep)
         fractional_pacer.Pace(minimum_interval_us);
     else
         fractional_pacer.Reset();
@@ -18,9 +20,9 @@ inline HRESULT AntiLag2::al2_sleep()
     // auto pre_sleep = Util::GetTimestamp();
 
     if (dx12_ctx.m_pAntiLagAPI)
-        result = AMD::AntiLag2DX12::Update(&dx12_ctx, is_enabled(), max_fps);
+        result = AMD::AntiLag2DX12::Update(&dx12_ctx, enabled, max_fps);
     else if (dx11_ctx.m_pAntiLagAPI)
-        result = AMD::AntiLag2DX11::Update(&dx11_ctx, is_enabled(), max_fps);
+        result = AMD::AntiLag2DX11::Update(&dx11_ctx, enabled, max_fps);
 
     // log_event("al2_sleep", "{}", Util::GetTimestamp() - pre_sleep);
 
