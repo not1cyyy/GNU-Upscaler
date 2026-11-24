@@ -594,6 +594,37 @@ bool Config::Reload(std::filesystem::path iniPath)
             MotionSharpnessDebug.set_from_config(readBool("CAS", "SharpenerDebug"));
         }
 
+        // 3D Neural Look (DLSS 5-Style)
+        {
+            NeuralLookEnabled.set_from_config(readBool("NeuralLook", "Enabled"));
+
+            if (auto setting = readInt("NeuralLook", "Preset"); setting.has_value())
+                NeuralLookPreset.set_from_config(std::clamp(setting.value(), 0, 2));
+
+            if (auto setting = readFloat("NeuralLook", "GiIntensity"); setting.has_value())
+                NeuralLookGiIntensity.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
+
+            if (auto setting = readFloat("NeuralLook", "AoIntensity"); setting.has_value())
+                NeuralLookAoIntensity.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
+
+            if (auto setting = readFloat("NeuralLook", "Detail"); setting.has_value())
+                NeuralLookDetail.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
+
+            if (auto setting = readFloat("NeuralLook", "SpecularRelief"); setting.has_value())
+                NeuralLookSpecularRelief.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
+
+            if (auto setting = readFloat("NeuralLook", "ToneContrast"); setting.has_value())
+                NeuralLookToneContrast.set_from_config(std::clamp(setting.value(), 0.0f, 1.0f));
+
+            if (auto setting = readFloat("NeuralLook", "MaxGpuMs"); setting.has_value())
+                NeuralLookMaxGpuMs.set_from_config(std::clamp(setting.value(), 0.25f, 5.0f));
+
+            NeuralLookUseGBuffers.set_from_config(readBool("NeuralLook", "UseGBuffers"));
+
+            if (auto setting = readInt("NeuralLook", "DebugView"); setting.has_value())
+                NeuralLookDebugView.set_from_config(std::clamp(setting.value(), 0, 4));
+        }
+
         // Magnifier
         {
             MagnifierEnabled.set_from_config(readBool("Magnifier", "Enabled"));
@@ -1812,6 +1843,27 @@ bool Config::SaveIni()
 
         ini.SetValue("CAS", "SharpenerDebug",
                      GetBoolValue(Instance()->MotionSharpnessDebug.value_for_config()).c_str());
+    }
+
+    // 3D Neural Look (DLSS 5-Style)
+    {
+        ini.SetValue("NeuralLook", "Enabled", GetBoolValue(Instance()->NeuralLookEnabled.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "Preset", GetIntValue(Instance()->NeuralLookPreset.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "GiIntensity",
+                     GetFloatValue(Instance()->NeuralLookGiIntensity.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "AoIntensity",
+                     GetFloatValue(Instance()->NeuralLookAoIntensity.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "Detail", GetFloatValue(Instance()->NeuralLookDetail.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "SpecularRelief",
+                     GetFloatValue(Instance()->NeuralLookSpecularRelief.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "ToneContrast",
+                     GetFloatValue(Instance()->NeuralLookToneContrast.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "MaxGpuMs",
+                     GetFloatValue(Instance()->NeuralLookMaxGpuMs.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "UseGBuffers",
+                     GetBoolValue(Instance()->NeuralLookUseGBuffers.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "DebugView",
+                     GetIntValue(Instance()->NeuralLookDebugView.value_for_config()).c_str());
     }
 
     // Magnifier

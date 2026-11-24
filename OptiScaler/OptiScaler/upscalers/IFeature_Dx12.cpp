@@ -50,6 +50,7 @@ bool IFeature_Dx12::Init(ID3D12Device* InDevice, ID3D12GraphicsCommandList* InCo
             Imgui = std::make_unique<Menu_Dx12>(Util::GetProcessWindow(), InDevice);
 
         OutputScaler = std::make_unique<OS_Dx12>("Output Scaling", InDevice, (TargetWidth() < DisplayWidth()));
+        NeuralLook = std::make_unique<NL_Dx12>("Neural Look", InDevice);
         RCAS = std::make_unique<RCAS_Dx12>("RCAS", InDevice);
         // DLSS/DLSSD take the bias mask as is
         if (GetUpscalerType() != Upscaler::DLSS && GetUpscalerType() != Upscaler::DLSSD)
@@ -98,6 +99,49 @@ RcasConstants IFeature_Dx12::BuildRcasConstants(NVSDK_NGX_Parameter* InParameter
     return rcasConstants;
 }
 
+NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters)
+{
+    NeuralLookConstants nlConstants {};
+
+    nlConstants.DepthIsLinear = DepthLinear();
+    nlConstants.DepthIsReversed = DepthInverted();
+    nlConstants.IsHdr =
+        IsHdr() || State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+
+    InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &nlConstants.MvScaleX);
+    InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &nlConstants.MvScaleY);
+
+    float nearPlane = 0.0f;
+    float farPlane = 0.0f;
+    if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
+    {
+        nlConstants.CameraNear = nearPlane;
+        nlConstants.CameraFar = farPlane;
+    }
+    else
+    {
+        nlConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+        nlConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+    }
+
+    float vFov = 0.0f;
+    if (InParameters->Get("DLSSG.CameraVFov", &vFov) == NVSDK_NGX_Result_Success && vFov > 0.05f)
+        nlConstants.CameraVFov = vFov;
+
+    float aspectRatio = 0.0f;
+    if (InParameters->Get("DLSSG.CameraAspectRatio", &aspectRatio) == NVSDK_NGX_Result_Success && aspectRatio > 0.1f)
+        nlConstants.AspectRatio = aspectRatio;
+    else if (TargetHeight() > 0)
+        nlConstants.AspectRatio = static_cast<float>(TargetWidth()) / static_cast<float>(TargetHeight());
+
+    int resetFlag = 0;
+    if (InParameters->Get(NVSDK_NGX_Parameter_Reset, &resetFlag) == NVSDK_NGX_Result_Success && resetFlag != 0)
+        nlConstants.ResetHistory = true;
+
+    return nlConstants;
+}
+
 bool IFeature_Dx12::ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const PendingAsyncPostPasses& passes)
 {
     if (passes.runOutputScaler)
@@ -109,6 +153,19 @@ bool IFeature_Dx12::ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const
         {
             Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
             State::Instance().changeBackend[Handle()->Id] = true;
+            return false;
+        }
+    }
+
+    if (passes.runNeuralLook && NeuralLook != nullptr)
+    {
+        NeuralLook->SetBufferState(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        if (!NeuralLook->Dispatch(cmdList, passes.nlInput, passes.paramMotion, passes.paramDepth, passes.nlConstants,
+                                  passes.nlOutput, passes.paramGBufferNormals, passes.paramGBufferAlbedo,
+                                  passes.paramGBufferRoughness))
+        {
+            Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
             return false;
         }
     }
@@ -159,6 +216,8 @@ bool IFeature_Dx12::BeginPendingPostPassesAsync(ID3D12CommandQueue* directQueue)
         // Unsubmitted compute recording may have mutated CPU-side _bufferState before failing
         if (passes.runOutputScaler && OutputScaler)
             OutputScaler->RestoreBufferState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (passes.runNeuralLook && NeuralLook)
+            NeuralLook->RestoreBufferState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (passes.runRcas && RCAS)
             RCAS->RestoreBufferState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (passes.runMagnifier && Magnifier)
@@ -239,10 +298,24 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     ID3D12Resource* paramOutput = nullptr;
     ID3D12Resource* paramMotion = nullptr;
     ID3D12Resource* paramDepth = nullptr;
+    ID3D12Resource* paramGBufferNormals = nullptr;
+    ID3D12Resource* paramGBufferAlbedo = nullptr;
+    ID3D12Resource* paramGBufferRoughness = nullptr;
 
     InParameters->Get(NVSDK_NGX_Parameter_Output, &paramOutput);
     InParameters->Get(NVSDK_NGX_Parameter_MotionVectors, &paramMotion);
     InParameters->Get(NVSDK_NGX_Parameter_Depth, &paramDepth);
+
+    if (Config::Instance()->NeuralLookUseGBuffers.value_or_default())
+    {
+        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Normals, &paramGBufferNormals);
+        if (InParameters->Get(NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo, &paramGBufferAlbedo) != NVSDK_NGX_Result_Success)
+            InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Albedo, &paramGBufferAlbedo);
+        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Roughness, &paramGBufferRoughness);
+    }
+
+    const bool useNeuralLook = Config::Instance()->NeuralLookEnabled.value_or_default() && NeuralLook != nullptr &&
+                               NeuralLook->IsInit() && paramDepth != nullptr && paramMotion != nullptr;
 
     // Order is important as that's the order of shader dispatch
     struct PostPass
@@ -252,11 +325,14 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
         ID3D12Resource* outputBuffer = nullptr;
     };
 
-    std::array<PostPass, 3> pipeline {};
+    std::array<PostPass, 4> pipeline {};
     size_t passCount = 0;
 
     if (useOutputScaling)
         pipeline[passCount++].stage = PostPassStage::OutputScaling;
+
+    if (useNeuralLook)
+        pipeline[passCount++].stage = PostPassStage::NeuralLook;
 
     _actualSharpness.reset();
     if (useRcas)
@@ -285,6 +361,16 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
             {
                 OutputScaler->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 requiredInput = OutputScaler->Buffer();
+            }
+            break;
+
+        case PostPassStage::NeuralLook:
+            if (paramMotion && paramDepth && paramOutput &&
+                NeuralLook->CreateBufferResource(Device, currentTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
+                NeuralLook->CanRender())
+            {
+                NeuralLook->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                requiredInput = NeuralLook->Buffer();
             }
             break;
 
@@ -385,6 +471,20 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
                 }
                 break;
 
+            case PostPassStage::NeuralLook:
+                if (NeuralLook && NeuralLook->CanRender() && paramMotion && paramDepth && paramOutput)
+                {
+                    pending.runNeuralLook = true;
+                    pending.nlInput = pass.inputBuffer;
+                    pending.nlOutput = pass.outputBuffer;
+                    pending.paramGBufferNormals = paramGBufferNormals;
+                    pending.paramGBufferAlbedo = paramGBufferAlbedo;
+                    pending.paramGBufferRoughness = paramGBufferRoughness;
+                    pending.nlConstants = BuildNeuralLookConstants(InParameters);
+                    pending.active = true;
+                }
+                break;
+
             case PostPassStage::Rcas:
                 if (RCAS && RCAS->CanRender() && paramMotion && paramOutput)
                 {
@@ -435,6 +535,22 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
                 Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
                 State::Instance().changeBackend[Handle()->Id] = true;
                 ok = false;
+            }
+            break;
+
+        case PostPassStage::NeuralLook:
+            if (NeuralLook && NeuralLook->CanRender() && paramMotion && paramDepth && paramOutput)
+            {
+                NeuralLook->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                const NeuralLookConstants nlConstants = BuildNeuralLookConstants(InParameters);
+
+                if (!NeuralLook->Dispatch(InCommandList, pass.inputBuffer, paramMotion, paramDepth, nlConstants,
+                                          pass.outputBuffer, paramGBufferNormals, paramGBufferAlbedo,
+                                          paramGBufferRoughness))
+                {
+                    Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
+                    ok = false;
+                }
             }
             break;
 
@@ -504,8 +620,11 @@ std::optional<double> IFeature_Dx12::ReadUpscalerTime(void* commandQueueVoid)
     lastUpscalerTime = UpscalerTime->ReadGpuTime(commandQueue);
     lastRcasTime = RCAS->ReadGpuTime(commandQueue);
     lastOutputScalingTime = OutputScaler->ReadGpuTime(commandQueue);
+    lastNeuralLookTime = NeuralLook ? NeuralLook->ReadGpuTime(commandQueue) : std::nullopt;
+    if (lastNeuralLookTime.has_value() && NeuralLook)
+        NeuralLook->UpdateBudget(lastNeuralLookTime.value());
 
-    return sumOpts(lastUpscalerTime, lastRcasTime, lastOutputScalingTime);
+    return sumOpts(lastUpscalerTime, lastRcasTime, lastOutputScalingTime, lastNeuralLookTime);
 }
 
 void IFeature_Dx12::ReadDetailedGpuTimes(void* commandQueueVoid, std::vector<DetailedGpuTime>& detailedGpuTimes)
@@ -517,6 +636,9 @@ void IFeature_Dx12::ReadDetailedGpuTimes(void* commandQueueVoid, std::vector<Det
     // Do not call ReadGpuTime twice for shaders
     if (lastUpscalerTime)
         detailedGpuTimes.emplace_back(DetailedGpuTime { ShortName(), lastUpscalerTime.value(), true });
+
+    if (lastNeuralLookTime && NeuralLook)
+        detailedGpuTimes.emplace_back(DetailedGpuTime { NeuralLook->Name(), lastNeuralLookTime.value(), true });
 
     if (lastRcasTime)
         detailedGpuTimes.emplace_back(DetailedGpuTime { RCAS->Name(), lastRcasTime.value(), true });
@@ -539,6 +661,7 @@ IFeature_Dx12::~IFeature_Dx12()
 
     Imgui.reset();
     OutputScaler.reset();
+    NeuralLook.reset();
     RCAS.reset();
     Bias.reset();
     AsyncCompute.reset();

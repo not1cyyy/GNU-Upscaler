@@ -20,6 +20,7 @@ bool IFeature_Vk::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice In
     if (result)
     {
         OutputScaler = std::make_unique<OS_Vk>("Output Scaling", InDevice, InPD, (TargetWidth() < DisplayWidth()));
+        NeuralLook = std::make_unique<NL_Vk>("Neural Look", InDevice, InPD);
         RCAS = std::make_unique<RCAS_Vk>("RCAS", InDevice, InPD);
         // DLSS/DLSSD take the bias mask as is
         if (GetUpscalerType() != Upscaler::DLSS && GetUpscalerType() != Upscaler::DLSSD)
@@ -78,10 +79,27 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
     NVSDK_NGX_Resource_VK* paramOutput = nullptr;
     NVSDK_NGX_Resource_VK* paramMotion = nullptr;
     NVSDK_NGX_Resource_VK* paramDepth = nullptr;
+    NVSDK_NGX_Resource_VK* paramGBufferNormals = nullptr;
+    NVSDK_NGX_Resource_VK* paramGBufferAlbedo = nullptr;
+    NVSDK_NGX_Resource_VK* paramGBufferRoughness = nullptr;
 
     InParameters->Get(NVSDK_NGX_Parameter_Output, (void**) &paramOutput);
     InParameters->Get(NVSDK_NGX_Parameter_MotionVectors, (void**) &paramMotion);
     InParameters->Get(NVSDK_NGX_Parameter_Depth, (void**) &paramDepth);
+
+    if (Config::Instance()->NeuralLookUseGBuffers.value_or_default())
+    {
+        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Normals, (void**) &paramGBufferNormals);
+        if (InParameters->Get(NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo, (void**) &paramGBufferAlbedo) !=
+            NVSDK_NGX_Result_Success)
+        {
+            InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Albedo, (void**) &paramGBufferAlbedo);
+        }
+        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Roughness, (void**) &paramGBufferRoughness);
+    }
+
+    const bool useNeuralLook = Config::Instance()->NeuralLookEnabled.value_or_default() && NeuralLook != nullptr &&
+                               NeuralLook->IsInit() && paramDepth != nullptr && paramMotion != nullptr;
 
     // Save the original output so we can restore it later
     VkImageInfo originalOutput {};
@@ -106,11 +124,14 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
         VkImageInfo outputBuffer {};
     };
 
-    std::array<PostPass, 3> pipeline {};
+    std::array<PostPass, 4> pipeline {};
     size_t passCount = 0;
 
     if (useOutputScaling)
         pipeline[passCount++].stage = PostPassStage::OutputScaling;
+
+    if (useNeuralLook)
+        pipeline[passCount++].stage = PostPassStage::NeuralLook;
 
     _actualSharpness.reset();
     if (useRcas)
@@ -146,6 +167,21 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
                 info.ImageView = OutputScaler->GetImageView();
                 info.Width = TargetWidth();
                 info.Height = TargetHeight();
+                requiredInput = info;
+            }
+            break;
+
+        case PostPassStage::NeuralLook:
+            if (paramMotion && paramDepth && paramOutput && NeuralLook->IsInit() &&
+                NeuralLook->CreateImageResource(Device, PhysicalDevice, currentTarget.Width, currentTarget.Height,
+                                                currentTarget.Format, intermediateUsage))
+            {
+                NeuralLook->SetImageLayout(InCmdBuffer, NeuralLook->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
+                                           VK_IMAGE_LAYOUT_GENERAL, currentTarget.SubresourceRange);
+
+                VkImageInfo info = currentTarget;
+                info.Image = NeuralLook->GetImage();
+                info.ImageView = NeuralLook->GetImageView();
                 requiredInput = info;
             }
             break;
@@ -254,6 +290,73 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
             }
             break;
 
+        case PostPassStage::NeuralLook:
+            if (NeuralLook && NeuralLook->IsInit() && paramMotion && paramDepth && paramOutput)
+            {
+                NeuralLook->SetImageLayout(InCmdBuffer, pass.inputBuffer.Image, VK_IMAGE_LAYOUT_GENERAL,
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, pass.inputBuffer.SubresourceRange);
+
+                NeuralLookConstants nlConstants {};
+                nlConstants.DepthIsLinear = DepthLinear();
+                nlConstants.DepthIsReversed = DepthInverted();
+                nlConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
+                                    State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+
+                InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &nlConstants.MvScaleX);
+                InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &nlConstants.MvScaleY);
+
+                float nearPlane = 0.0f;
+                float farPlane = 0.0f;
+                if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
+                    InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
+                {
+                    nlConstants.CameraNear = nearPlane;
+                    nlConstants.CameraFar = farPlane;
+                }
+                else
+                {
+                    nlConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+                    nlConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+                }
+
+                float vFov = 0.0f;
+                if (InParameters->Get("DLSSG.CameraVFov", &vFov) == NVSDK_NGX_Result_Success && vFov > 0.05f)
+                    nlConstants.CameraVFov = vFov;
+
+                float aspectRatio = 0.0f;
+                if (InParameters->Get("DLSSG.CameraAspectRatio", &aspectRatio) == NVSDK_NGX_Result_Success &&
+                    aspectRatio > 0.1f)
+                {
+                    nlConstants.AspectRatio = aspectRatio;
+                }
+                else if (TargetHeight() > 0)
+                {
+                    nlConstants.AspectRatio = static_cast<float>(TargetWidth()) / static_cast<float>(TargetHeight());
+                }
+
+                int resetFlag = 0;
+                if (InParameters->Get(NVSDK_NGX_Parameter_Reset, &resetFlag) == NVSDK_NGX_Result_Success &&
+                    resetFlag != 0)
+                    nlConstants.ResetHistory = true;
+
+                VkImageInfo mvInfo = *(VkImageInfo*) &paramMotion->Resource.ImageViewInfo;
+                VkImageInfo* depthInfo = paramDepth ? (VkImageInfo*) &paramDepth->Resource.ImageViewInfo : nullptr;
+                VkImageInfo* normInfo =
+                    paramGBufferNormals ? (VkImageInfo*) &paramGBufferNormals->Resource.ImageViewInfo : nullptr;
+                VkImageInfo* albedoInfo =
+                    paramGBufferAlbedo ? (VkImageInfo*) &paramGBufferAlbedo->Resource.ImageViewInfo : nullptr;
+                VkImageInfo* roughInfo =
+                    paramGBufferRoughness ? (VkImageInfo*) &paramGBufferRoughness->Resource.ImageViewInfo : nullptr;
+
+                if (!NeuralLook->Dispatch(Device, InCmdBuffer, nlConstants, pass.inputBuffer, mvInfo, pass.outputBuffer,
+                                          depthInfo, normInfo, albedoInfo, roughInfo))
+                {
+                    Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
+                    ok = false;
+                }
+            }
+            break;
+
         case PostPassStage::Rcas:
             if (RCAS->CanRender() && paramMotion && paramOutput)
             {
@@ -330,8 +433,11 @@ std::optional<double> IFeature_Vk::ReadUpscalerTime(void* unused)
     lastUpscalerTime = UpscalerTime->ReadGpuTime();
     lastRcasTime = RCAS->ReadGpuTime();
     lastOutputScalingTime = OutputScaler->ReadGpuTime();
+    lastNeuralLookTime = NeuralLook ? NeuralLook->ReadGpuTime() : std::nullopt;
+    if (lastNeuralLookTime.has_value() && NeuralLook)
+        NeuralLook->UpdateBudget(lastNeuralLookTime.value());
 
-    return sumOpts(lastUpscalerTime, lastRcasTime, lastOutputScalingTime);
+    return sumOpts(lastUpscalerTime, lastRcasTime, lastOutputScalingTime, lastNeuralLookTime);
 }
 
 void IFeature_Vk::ReadDetailedGpuTimes(void* unused, std::vector<DetailedGpuTime>& detailedGpuTimes)
@@ -341,6 +447,9 @@ void IFeature_Vk::ReadDetailedGpuTimes(void* unused, std::vector<DetailedGpuTime
     // Do not call ReadGpuTime twice for shaders
     if (lastUpscalerTime)
         detailedGpuTimes.emplace_back(DetailedGpuTime { ShortName(), lastUpscalerTime.value(), true });
+
+    if (lastNeuralLookTime && NeuralLook)
+        detailedGpuTimes.emplace_back(DetailedGpuTime { NeuralLook->Name(), lastNeuralLookTime.value(), true });
 
     if (lastRcasTime)
         detailedGpuTimes.emplace_back(DetailedGpuTime { RCAS->Name(), lastRcasTime.value(), true });

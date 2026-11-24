@@ -380,6 +380,18 @@ class Config
     CustomOptional<float> MotionThreshold { 0.0f };
     CustomOptional<float> MotionScaleLimit { 10.0f };
 
+    // 3D Neural Look (DLSS 5-Style)
+    CustomOptional<bool> NeuralLookEnabled { false };
+    CustomOptional<int> NeuralLookPreset { 1 };
+    CustomOptional<float> NeuralLookGiIntensity { 0.75f };
+    CustomOptional<float> NeuralLookAoIntensity { 0.65f };
+    CustomOptional<float> NeuralLookDetail { 0.65f };
+    CustomOptional<float> NeuralLookSpecularRelief { 0.50f };
+    CustomOptional<float> NeuralLookToneContrast { 0.25f };
+    CustomOptional<float> NeuralLookMaxGpuMs { 1.50f };
+    CustomOptional<bool> NeuralLookUseGBuffers { true };
+    CustomOptional<int> NeuralLookDebugView { 0 };
+
     // Magnifier
     CustomOptional<bool> MagnifierEnabled { false };
     CustomOptional<float> MagnifierSize { 15.f }; // % of screen Height

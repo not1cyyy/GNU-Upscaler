@@ -296,6 +296,11 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\menu_blur\precompile\MenuBlur_Shader.h" />
     <ClInclude Include="shaders\magnifier\Magnifier_Vk.h" />
     <ClInclude Include="shaders\magnifier\precompile\Magnifier_Shader_Vk.h" />
+    <ClInclude Include="shaders\neural_look\NL_Vk.h" />
+    <ClInclude Include="shaders\neural_look\precompile\nl_composite_Shader.h" />
+    <ClInclude Include="shaders\neural_look\precompile\nl_composite_Shader_Vk.h" />
+    <ClInclude Include="shaders\neural_look\precompile\nl_gi_temporal_Shader.h" />
+    <ClInclude Include="shaders\neural_look\precompile\nl_gi_temporal_Shader_Vk.h" />
     <ClInclude Include="shaders\rcas\precompile\da_das_sharpen_Shader.h" />
     <ClInclude Include="shaders\rcas\precompile\da_das_sharpen_Shader_Dx11.h" />
     <ClInclude Include="shaders\rcas\precompile\da_das_sharpen_Shader_Vk.h" />
@@ -570,6 +575,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\rcas\RCAS_Common.h" />
     <ClInclude Include="shaders\rcas\RCAS_Dx11.h" />
     <ClInclude Include="shaders\rcas\RCAS_Dx12.h" />
+    <ClInclude Include="shaders\neural_look\NL_Common.h" />
+    <ClInclude Include="shaders\neural_look\NL_Dx12.h" />
     <ClInclude Include="State.h" />
     <ClInclude Include="upscalers\xess\XeSSFeature_Dx11on12.h" />
     <ClInclude Include="upscalers\xess\XeSSFeature_Vk.h" />
@@ -674,6 +681,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="shaders\output_scaling\OS_Vk.cpp" />
     <ClCompile Include="shaders\rcas\RCAS_Common.cpp" />
     <ClCompile Include="shaders\rcas\RCAS_Vk.cpp" />
+    <ClCompile Include="shaders\neural_look\NL_Dx12.cpp" />
+    <ClCompile Include="shaders\neural_look\NL_Vk.cpp" />
     <ClCompile Include="shaders\reproject\Reproject.cpp" />
     <ClCompile Include="shaders\reproject\Reproject_Vk.cpp" />
     <ClCompile Include="framegen\reprojection\Reprojection_Vk.cpp" />

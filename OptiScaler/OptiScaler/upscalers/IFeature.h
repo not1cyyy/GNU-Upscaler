@@ -17,6 +17,7 @@ inline static unsigned int handleCounter = DLSS_MOD_ID_OFFSET;
 enum class PostPassStage : uint8_t
 {
     OutputScaling,
+    NeuralLook,
     Rcas,
     Magnifier,
 };
@@ -109,6 +110,7 @@ class IFeature
     std::optional<double> lastUpscalerTime {};
     std::optional<double> lastRcasTime {};
     std::optional<double> lastOutputScalingTime {};
+    std::optional<double> lastNeuralLookTime {};
 
     void SetHandle(unsigned int InHandleId);
     bool SetInitParameters(NVSDK_NGX_Parameter* InParameters);
@@ -184,6 +186,7 @@ class IFeature
     virtual bool SharpenEnabled() { return _initFlags.SharpenEnabled; }
 
     virtual bool CallsUpscalerEndByItself() { return false; }
+    virtual int NeuralLookActiveTier() const { return -1; }
 
     IFeature(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters) { SetHandle(InHandleId); }
 

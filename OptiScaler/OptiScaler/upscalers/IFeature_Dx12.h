@@ -6,6 +6,7 @@
 #include <Util.h>
 #include <menu/menu_dx12.h>
 #include <shaders/output_scaling/OS_Dx12.h>
+#include <shaders/neural_look/NL_Dx12.h>
 #include <shaders/rcas/RCAS_Dx12.h>
 #include <shaders/bias/Bias_Dx12.h>
 #include <shaders/magnifier/Magnifier_Dx12.h>
@@ -23,6 +24,13 @@ class IFeature_Dx12 : public virtual IFeature
         bool runOutputScaler = false;
         ID3D12Resource* osInput = nullptr;
         ID3D12Resource* osOutput = nullptr;
+        bool runNeuralLook = false;
+        ID3D12Resource* nlInput = nullptr;
+        ID3D12Resource* nlOutput = nullptr;
+        ID3D12Resource* paramGBufferNormals = nullptr;
+        ID3D12Resource* paramGBufferAlbedo = nullptr;
+        ID3D12Resource* paramGBufferRoughness = nullptr;
+        NeuralLookConstants nlConstants {};
         bool runRcas = false;
         ID3D12Resource* rcasInput = nullptr;
         ID3D12Resource* rcasOutput = nullptr;
@@ -39,12 +47,14 @@ class IFeature_Dx12 : public virtual IFeature
 
     void RestoreBarriers(ID3D12GraphicsCommandList* InCommandList);
     RcasConstants BuildRcasConstants(NVSDK_NGX_Parameter* InParameters);
+    NeuralLookConstants BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters);
     bool ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const PendingAsyncPostPasses& passes);
 
   protected:
     ID3D12Device* Device = nullptr;
     static inline std::unique_ptr<Menu_Dx12> Imgui = nullptr;
     std::unique_ptr<OS_Dx12> OutputScaler = nullptr;
+    std::unique_ptr<NL_Dx12> NeuralLook = nullptr;
     std::unique_ptr<RCAS_Dx12> RCAS = nullptr;
     std::unique_ptr<Bias_Dx12> Bias = nullptr;
     std::unique_ptr<Magnifier_Dx12> Magnifier = nullptr;
@@ -71,6 +81,7 @@ class IFeature_Dx12 : public virtual IFeature
     bool DispatchPendingPostPassesAsync(ID3D12CommandQueue* directQueue);
 
     API Api() const override { return API::DX12; }
+    int NeuralLookActiveTier() const override { return NeuralLook ? NeuralLook->ActiveTier() : -1; }
     std::optional<double> ReadUpscalerTime(void* commandQueue) override;
     void ReadDetailedGpuTimes(void* commandQueue, std::vector<DetailedGpuTime>& detailedGpuTimes) override;
 

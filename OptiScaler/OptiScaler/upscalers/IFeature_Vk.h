@@ -3,6 +3,7 @@
 #include "IFeature.h"
 
 #include <shaders/rcas/RCAS_Vk.h>
+#include <shaders/neural_look/NL_Vk.h>
 #include <shaders/output_scaling/OS_Vk.h>
 #include <shaders/bias/Bias_Vk.h>
 #include <shaders/magnifier/Magnifier_Vk.h>
@@ -18,6 +19,7 @@ class IFeature_Vk : public virtual IFeature
     PFN_vkGetDeviceProcAddr GDPA = nullptr;
 
     std::unique_ptr<OS_Vk> OutputScaler = nullptr;
+    std::unique_ptr<NL_Vk> NeuralLook = nullptr;
     std::unique_ptr<RCAS_Vk> RCAS = nullptr;
     std::unique_ptr<Bias_Vk> Bias = nullptr;
     std::unique_ptr<Magnifier_Vk> Magnifier = nullptr;
@@ -40,6 +42,7 @@ class IFeature_Vk : public virtual IFeature
 
     bool IsWithDx12() override { return false; }
     API Api() const override { return API::Vulkan; }
+    int NeuralLookActiveTier() const override { return NeuralLook ? NeuralLook->ActiveTier() : -1; }
     virtual VkDevice GetDevice() const { return Device; }
 
     virtual ~IFeature_Vk() {}

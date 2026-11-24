@@ -189,6 +189,9 @@ bool IFeature_Dx11::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Par
                 requiredInput = OutputScaler->Buffer();
             break;
 
+        case PostPassStage::NeuralLook:
+            break;
+
         case PostPassStage::Rcas:
             // Same checks as Dispatch, a skipped pass must not take over the output
             if (paramMotion && paramOutput && RCAS->CreateBufferResource(Device, currentTarget) && RCAS->CanRender())
@@ -257,6 +260,9 @@ bool IFeature_Dx11::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Par
                 State::Instance().changeBackend[Handle()->Id] = true;
                 ok = false;
             }
+            break;
+
+        case PostPassStage::NeuralLook:
             break;
 
         case PostPassStage::Rcas:
