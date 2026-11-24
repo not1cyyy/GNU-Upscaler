@@ -16,7 +16,7 @@
 <p align="center">
   <img src="docs/screenshots/stellar-blade-showcase.jpg" alt="Stellar Blade running under VKD3D-Proton at 1440p with GNU-Upscaler" width="92%" />
   <br />
-  <sub><b>Stellar Blade</b> (2560x1440, VKD3D-Proton) on RX 7800 XT and R7 5700X: 181 FPS (5.5 ms) with a flat frametime graph (5.3 to 8.7 ms)</sub>
+  <sub><b>Stellar Blade</b> (2560x1440, VKD3D-Proton) on RX 7800 XT (RADV) and R7 5700X with the <code>GnuUi</code> overlay: 165 FPS (6.1 ms, 0.20 ms jitter) using XeLL + XeFG 2x VirtualVSync and Front-Edge Sync</sub>
 </p>
 
 ## Why GNU-Upscaler
