@@ -145,10 +145,10 @@ int2 ClampGiCoord(int2 p)
     return int2(clamp(p.x, 0, GiWidth - 1), clamp(p.y, 0, GiHeight - 1));
 }
 
-float LoadRawDepthAtOutputCoord(int2 outCoord)
+float LoadRawDepthAtUv(float2 uv)
 {
-    int2 dCoord = int2((float2(outCoord) + 0.5f) * DepthTextureScale);
-    return DepthTex.Load(int3(ClampDepthCoord(dCoord), 0)).r;
+    int2 dCoord = ClampDepthCoord(int2(uv * float2(DepthWidth, DepthHeight)));
+    return DepthTex.Load(int3(dCoord, 0)).r;
 }
 
 float LinearizeDepth(float rawDepth)
@@ -184,27 +184,31 @@ float2 ProjectViewPosToUv(float3 p)
     return float2(ndcX * 0.5f + 0.5f, 0.5f - ndcY * 0.5f);
 }
 
-float3 ReconstructViewNormal(int2 outCoord, float2 uv, float centerDepth, float3 centerPos)
+// Always step in exact depth-texel coordinates so upscaled render-res depth produces crisp 3D normals
+float3 ReconstructViewNormalFromDepthTexel(float2 uv)
 {
-    int stepPx = max(1, OutputWidth / max(DepthWidth, 1));
-    float2 invOut = 1.0f / float2(OutputWidth, OutputHeight);
+    int2 dCoord = ClampDepthCoord(int2(uv * float2(DepthWidth, DepthHeight)));
+    float2 dUv = (float2(dCoord) + 0.5f) / float2(DepthWidth, DepthHeight);
+    float2 invDepth = 1.0f / float2(DepthWidth, DepthHeight);
 
-    float dL = LinearizeDepth(LoadRawDepthAtOutputCoord(outCoord + int2(-stepPx, 0)));
-    float dR = LinearizeDepth(LoadRawDepthAtOutputCoord(outCoord + int2(stepPx, 0)));
-    float dU = LinearizeDepth(LoadRawDepthAtOutputCoord(outCoord + int2(0, -stepPx)));
-    float dD = LinearizeDepth(LoadRawDepthAtOutputCoord(outCoord + int2(0, stepPx)));
+    float dC = LinearizeDepth(DepthTex.Load(int3(dCoord, 0)).r);
+    float dL = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(-1, 0)), 0)).r);
+    float dR = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(1, 0)), 0)).r);
+    float dU = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(0, -1)), 0)).r);
+    float dD = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(0, 1)), 0)).r);
 
-    float3 pL = ReconstructViewPos(uv + float2(-stepPx, 0) * invOut, dL);
-    float3 pR = ReconstructViewPos(uv + float2(stepPx, 0) * invOut, dR);
-    float3 pU = ReconstructViewPos(uv + float2(0, -stepPx) * invOut, dU);
-    float3 pD = ReconstructViewPos(uv + float2(0, stepPx) * invOut, dD);
+    float3 pC = ReconstructViewPos(dUv, dC);
+    float3 pL = ReconstructViewPos(dUv + float2(-invDepth.x, 0.0f), dL);
+    float3 pR = ReconstructViewPos(dUv + float2(invDepth.x, 0.0f), dR);
+    float3 pU = ReconstructViewPos(dUv + float2(0.0f, -invDepth.y), dU);
+    float3 pD = ReconstructViewPos(dUv + float2(0.0f, invDepth.y), dD);
 
-    float3 dx = (abs(dR - centerDepth) < abs(centerDepth - dL)) ? (pR - centerPos) : (centerPos - pL);
-    float3 dy = (abs(dD - centerDepth) < abs(centerDepth - dU)) ? (pU - centerPos) : (centerPos - pD);
+    float3 dx = (abs(dR - dC) < abs(dC - dL)) ? (pR - pC) : (pC - pL);
+    float3 dy = (abs(dD - dC) < abs(dC - dU)) ? (pC - pD) : (pU - pC);
 
     float3 n = cross(dx, dy);
     float lenSq = dot(n, n);
-    if (lenSq < 1e-10f)
+    if (lenSq < 1e-12f)
         return float3(0.0f, 0.0f, -1.0f);
 
     n *= rsqrt(lenSq);
@@ -243,7 +247,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float2 uv = (float2(giCoord) + 0.5f) / float2(GiWidth, GiHeight);
     int2 outCoord = ClampOutputCoord(int2(uv * float2(OutputWidth, OutputHeight)));
 
-    float rawDepth = LoadRawDepthAtOutputCoord(outCoord);
+    float rawDepth = LoadRawDepthAtUv(uv);
     float centerDepth = LinearizeDepth(rawDepth);
 
     bool isSky = (centerDepth >= SkyDepthThreshold) || (DepthIsReversed > 0 && rawDepth <= 1e-6f) ||
@@ -256,11 +260,11 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     }
 
     float3 centerPos = ReconstructViewPos(uv, centerDepth);
-    float3 viewNormal = ReconstructViewNormal(outCoord, uv, centerDepth, centerPos);
+    float3 viewNormal = ReconstructViewNormalFromDepthTexel(uv);
 
     if (HasGBufferNormals > 0)
     {
-        float3 gN = GBufferNormalsTex.Load(int3(ClampOutputCoord(outCoord), 0)).xyz;
+        float3 gN = GBufferNormalsTex.Load(int3(outCoord, 0)).xyz;
         if (all(gN >= 0.0f) && all(gN <= 1.0f))
             gN = gN * 2.0f - 1.0f;
         float gLen = dot(gN, gN);
@@ -268,7 +272,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         {
             float3 gNorm = gN * rsqrt(gLen);
             if (dot(gNorm, viewNormal) > 0.15f)
-                viewNormal = normalize(lerp(viewNormal, gNorm, 0.40f));
+                viewNormal = normalize(lerp(viewNormal, gNorm, 0.45f));
         }
     }
 
@@ -276,16 +280,16 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float2(giCoord) + float2((FrameIndex & 15) * 5.588238f, (FrameIndex & 15) * 3.1732f));
     float noiseB = frac(noiseA * 1.6180339f + 0.371f);
 
-    float maxRadiusPx = max(GiRadius, 18.0f);
+    float maxRadiusPx = max(GiRadius, 24.0f);
     float2 invOutSize = 1.0f / float2(OutputWidth, OutputHeight);
 
     float3 accumGi = float3(0.0f, 0.0f, 0.0f);
     float accumAo = 0.0f;
 
-    int rays = clamp(RayCount, 1, 6);
+    int rays = clamp(RayCount, 1, 8);
     int steps = clamp(StepCount, 2, 8);
-    float worldRange = clamp(centerDepth * 0.28f, 1.5f, 24.0f);
-    float thicknessLimit = clamp(centerDepth * 0.18f, 0.35f, 9.0f);
+    float worldRange = clamp(centerDepth * 0.32f, 1.5f, 26.0f);
+    float thicknessLimit = clamp(centerDepth * 0.16f, 0.25f, 7.0f);
 
     [loop]
     for (int r = 0; r < rays; ++r)
@@ -301,15 +305,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         [loop]
         for (int s = 1; s <= steps; ++s)
         {
-            float t = (float(s) - 0.5f + noiseB * 0.5f) / float(steps);
+            float t = (float(s) - 0.35f + noiseB * 0.5f) / float(steps);
             float radiusPx = lerp(2.0f, maxRadiusPx, t * t);
             float2 sampleUv = uv + dirPx * radiusPx * invOutSize;
 
             if (any(sampleUv < 0.001f) || any(sampleUv > 0.999f))
                 break;
 
-            int2 sampleOutCoord = ClampOutputCoord(int2(sampleUv * float2(OutputWidth, OutputHeight)));
-            float sampleRawDepth = LoadRawDepthAtOutputCoord(sampleOutCoord);
+            float sampleRawDepth = LoadRawDepthAtUv(sampleUv);
             float sampleDepth = LinearizeDepth(sampleRawDepth);
 
             if (sampleDepth >= SkyDepthThreshold)
@@ -325,6 +328,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             float3 dir3D = delta / dist;
             float nDotD = dot(viewNormal, dir3D);
 
+            // Thickness rejection
             float depthDelta = centerDepth - sampleDepth;
             if (depthDelta > thicknessLimit)
                 continue;
@@ -332,22 +336,26 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             float rangeFade = 1.0f - saturate(dist / worldRange);
             float elev = nDotD - GiBias;
 
-            // Tight contact shadow boost on closest steps
-            if (s <= 2 && elev > 0.04f)
-                microContactOcc = max(microContactOcc, saturate(elev * 1.4f) * (1.0f - saturate(dist / max(centerDepth * 0.06f, 0.35f))));
+            // Strong close-range contact shadow term for character/object grounding
+            if (s <= 2 && elev > 0.02f)
+            {
+                float contactRange = max(centerDepth * 0.075f, 0.45f);
+                microContactOcc = max(microContactOcc, saturate(elev * 1.65f) * (1.0f - saturate(dist / contactRange)));
+            }
 
             if (elev > maxHorizonSin)
             {
                 float aoDelta = saturate(elev) * rangeFade;
                 maxHorizonSin = max(maxHorizonSin, elev);
 
+                int2 sampleOutCoord = ClampOutputCoord(int2(sampleUv * float2(OutputWidth, OutputHeight)));
                 float3 hitColor = ToLinearColor(SourceColor.Load(int3(sampleOutCoord, 0)).rgb);
                 float hitLuma = Luma(hitColor);
-                float fireflyScale = min(hitLuma, 6.0f) / max(hitLuma, 1e-4f);
+                float fireflyScale = min(hitLuma, 5.0f) / max(hitLuma, 1e-4f);
                 hitColor *= fireflyScale;
 
-                // Boost chromatic saturation of indirect bounce slightly so colored light pops
-                hitColor = lerp(hitLuma.xxx, hitColor, 1.35f);
+                // Boost chromatic saturation of indirect bounce slightly so colored bounce stands out
+                hitColor = max(lerp(hitLuma.xxx, hitColor, 1.35f), 0.0f);
 
                 float bounceCos = saturate(nDotD);
                 rayGi += hitColor * bounceCos * rangeFade * aoDelta;
@@ -355,27 +363,27 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             }
         }
 
-        float rayAo = saturate(1.0f - max(maxHorizonSin * 0.98f, microContactOcc * 0.85f));
+        float rayAo = saturate(1.0f - max(maxHorizonSin * 1.05f, microContactOcc * 0.92f));
         accumAo += rayAo;
         if (rayWeightSum > 1e-4f)
-            accumGi += rayGi / max(rayWeightSum, 0.55f);
+            accumGi += rayGi / max(rayWeightSum, 0.70f);
     }
 
     float3 currentGi = max(accumGi / float(rays), 0.0f);
     float currentAo = saturate(accumAo / float(rays));
 
-    // Real-time Half-Res Screen-Space Reflections (SSR)
+    // Real-time Half-Res Screen-Space Reflections (SSR) using true 3D viewNormal
     float4 currentSsr = float4(0.0f, 0.0f, 0.0f, 0.0f);
     if (SsrEnabled > 0)
     {
         float3 viewDir = normalize(centerPos);
         float3 reflDir = normalize(reflect(viewDir, viewNormal));
 
-        if (reflDir.z > -0.55f)
+        if (reflDir.z > -0.45f)
         {
             int ssrSteps = clamp(SsrSteps, 4, 12);
-            float ssrMaxDist = clamp(centerDepth * 0.95f, 3.0f, 45.0f);
-            float ssrThickness = clamp(centerDepth * 0.14f, 0.30f, 6.5f);
+            float ssrMaxDist = clamp(centerDepth * 1.15f, 3.0f, 55.0f);
+            float ssrThickness = clamp(centerDepth * 0.085f, 0.16f, 3.8f);
 
             float prevDist = 0.0f;
             float hitDist = 0.0f;
@@ -385,8 +393,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             [loop]
             for (int k = 1; k <= ssrSteps; ++k)
             {
-                float kt = (float(k) + noiseB * 0.45f) / float(ssrSteps);
-                float marchDist = lerp(max(centerDepth * 0.02f, 0.08f), ssrMaxDist, kt * kt);
+                float kt = (float(k) + noiseB * 0.40f) / float(ssrSteps);
+                float marchDist = lerp(max(centerDepth * 0.015f, 0.06f), ssrMaxDist, kt * kt);
                 float3 rayPos = centerPos + reflDir * marchDist;
 
                 if (rayPos.z <= 0.05f || rayPos.z >= SkyDepthThreshold)
@@ -396,9 +404,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 if (any(rayUv < 0.004f) || any(rayUv > 0.996f))
                     break;
 
-                int2 rayOutCoord = ClampOutputCoord(int2(rayUv * float2(OutputWidth, OutputHeight)));
-                float rayDepth = LinearizeDepth(LoadRawDepthAtOutputCoord(rayOutCoord));
-
+                float rayDepth = LinearizeDepth(LoadRawDepthAtUv(rayUv));
                 float diff = rayPos.z - rayDepth;
                 if (diff > 0.0f && diff < ssrThickness)
                 {
@@ -413,19 +419,28 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
             if (hit)
             {
-                // 1 binary midpoint refinement step for cleaner reflection silhouettes
-                float midDist = 0.5f * (prevDist + hitDist);
-                float3 midPos = centerPos + reflDir * midDist;
-                if (midPos.z > 0.05f)
+                // 2 binary midpoint refinement steps for crisp reflection edges
+                float lo = prevDist;
+                float hi = hitDist;
+                [unroll]
+                for (int b = 0; b < 2; ++b)
                 {
+                    float mid = 0.5f * (lo + hi);
+                    float3 midPos = centerPos + reflDir * mid;
                     float2 midUv = ProjectViewPosToUv(midPos);
-                    if (all(midUv >= 0.002f) && all(midUv <= 0.998f))
+                    if (midPos.z > 0.05f && all(midUv >= 0.002f) && all(midUv <= 0.998f))
                     {
-                        int2 midCoord = ClampOutputCoord(int2(midUv * float2(OutputWidth, OutputHeight)));
-                        float midDepth = LinearizeDepth(LoadRawDepthAtOutputCoord(midCoord));
+                        float midDepth = LinearizeDepth(LoadRawDepthAtUv(midUv));
                         float midDiff = midPos.z - midDepth;
                         if (midDiff > 0.0f && midDiff < ssrThickness)
+                        {
+                            hi = mid;
                             hitUv = midUv;
+                        }
+                        else
+                        {
+                            lo = mid;
+                        }
                     }
                 }
 
@@ -436,8 +451,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
                 float2 edgeDist = min(hitUv, 1.0f - hitUv);
                 float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 14.0f);
-                float distFade = 1.0f - saturate(hitDist / ssrMaxDist);
-                float conf = edgeFade * lerp(0.45f, 1.0f, distFade);
+                float distFade = 1.0f - saturate(hi / ssrMaxDist);
+                float conf = edgeFade * lerp(0.50f, 1.0f, distFade);
 
                 currentSsr = float4(hitCol, conf);
             }

@@ -8230,7 +8230,7 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
     {
         const int tier = currentFeature->NeuralLookActiveTier();
         const auto gpuMs = currentFeature->LastNeuralLookTime();
-        const char* tierName = (tier == 2) ? "Full (6-ray SSGI + 8-step SSR + Neural)"
+        const char* tierName = (tier == 2) ? "Full (6-ray SSGI + 10-step SSR + Neural)"
                                : (tier == 1) ? "Medium (4-ray SSGI + 6-step SSR + Neural)"
                                : (tier == 0) ? "Light (Relight + Neural only)"
                                              : "Inactive / DX11 unsupported";

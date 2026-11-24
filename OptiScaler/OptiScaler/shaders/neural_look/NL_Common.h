@@ -167,7 +167,12 @@ class NL_Common
         float VolumetricGlow = 0.45f;
         float SplitScreenPos = 0.0f;
         int32_t SsrEnabled = 1;
+        float CameraVFov = 1.04719755f;
+
+        float AspectRatio = 16.0f / 9.0f;
         int32_t _pad0 = 0;
+        int32_t _pad1 = 0;
+        int32_t _pad2 = 0;
     };
 
     static_assert(sizeof(NLGiInternalConstants) % 16 == 0);
@@ -227,7 +232,7 @@ class NL_Common
         c.HasGBufferNormals = hasNormals ? 1 : 0;
         c.InColorEncodeMode = inEncodeMode;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
-        c.SsrSteps = (_activeTier >= 2) ? 8 : 6;
+        c.SsrSteps = (_activeTier >= 2) ? 10 : 6;
     }
 
     void FillCompositeConstants(NLCompositeInternalConstants& c, const NeuralLookConstants& inConst, bool giEnabled,
@@ -252,6 +257,9 @@ class NL_Common
 
         c.GiEnabled = giEnabled ? 1 : 0;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
+        c.CameraVFov = std::clamp(inConst.CameraVFov, 0.25f, 2.4f);
+        c.AspectRatio =
+            (inConst.AspectRatio > 0.1f) ? inConst.AspectRatio : ((float) c.OutputWidth / (float) std::max(c.OutputHeight, 1));
         c.HasGBufferNormals = hasNormals ? 1 : 0;
         c.HasGBufferAlbedo = hasAlbedo ? 1 : 0;
         c.HasGBufferRoughness = hasRoughness ? 1 : 0;

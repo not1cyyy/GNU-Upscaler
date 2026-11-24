@@ -50,7 +50,12 @@ cbuffer Params : register(b0)
     float VolumetricGlow;
     float SplitScreenPos;
     int SsrEnabled;
+    float CameraVFov;
+
+    float AspectRatio;
     int _pad0;
+    int _pad1;
+    int _pad2;
 };
 
 #ifdef VK_MODE
@@ -212,32 +217,69 @@ float LoadDepthAtOutputCoord(int2 outCoord)
     return LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord), 0)).r);
 }
 
-float4 BilateralSampleHalfRes(Texture2D<float4> halfTex, int2 outCoord, float centerDepth)
+float3 ReconstructViewPos(float2 uv, float linearDepth)
 {
-    float2 giF = (float2(outCoord) + 0.5f) * (float2(GiWidth, GiHeight) / float2(OutputWidth, OutputHeight)) - 0.5f;
-    int2 giBase = int2(floor(giF));
-    float2 fracUv = frac(giF);
+    float tanHalfFov = tan(clamp(CameraVFov, 0.25f, 2.4f) * 0.5f);
+    float2 ndc = float2(uv.x * 2.0f - 1.0f, (1.0f - uv.y) * 2.0f - 1.0f);
+    return float3(ndc.x * tanHalfFov * AspectRatio * linearDepth, ndc.y * tanHalfFov * linearDepth, linearDepth);
+}
 
-    float invSigma = 1.0f / max(centerDepth * 0.05f, 0.02f);
+// Exact depth-texel 3D normal reconstruction (crisp at all upscaling ratios)
+float3 ReconstructViewNormalFromDepthTexel(float2 uv)
+{
+    int2 dCoord = ClampDepthCoord(int2(uv * float2(DepthWidth, DepthHeight)));
+    float2 dUv = (float2(dCoord) + 0.5f) / float2(DepthWidth, DepthHeight);
+    float2 invDepth = 1.0f / float2(DepthWidth, DepthHeight);
 
+    float dC = LinearizeDepth(DepthTex.Load(int3(dCoord, 0)).r);
+    float dL = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(-1, 0)), 0)).r);
+    float dR = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(1, 0)), 0)).r);
+    float dU = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(0, -1)), 0)).r);
+    float dD = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(0, 1)), 0)).r);
+
+    float3 pC = ReconstructViewPos(dUv, dC);
+    float3 pL = ReconstructViewPos(dUv + float2(-invDepth.x, 0.0f), dL);
+    float3 pR = ReconstructViewPos(dUv + float2(invDepth.x, 0.0f), dR);
+    float3 pU = ReconstructViewPos(dUv + float2(0.0f, -invDepth.y), dU);
+    float3 pD = ReconstructViewPos(dUv + float2(0.0f, invDepth.y), dD);
+
+    float3 dx = (abs(dR - dC) < abs(dC - dL)) ? (pR - pC) : (pC - pL);
+    float3 dy = (abs(dD - dC) < abs(dC - dU)) ? (pC - pD) : (pU - pC);
+
+    float3 n = cross(dx, dy);
+    float lenSq = dot(n, n);
+    if (lenSq < 1e-12f)
+        return float3(0.0f, 0.0f, -1.0f);
+
+    n *= rsqrt(lenSq);
+    if (n.z > 0.0f)
+        n = -n;
+    return n;
+}
+
+// 9-tap depth-guided Atrous bilateral denoise over half-res GI/SSR for ray-traced smoothness without edge bleed
+float4 DenoiseSampleHalfRes(Texture2D<float4> halfTex, int2 outCoord, float centerDepth)
+{
+    int2 giCenter = int2((float2(outCoord) + 0.5f) * (float2(GiWidth, GiHeight) / float2(OutputWidth, OutputHeight)));
+    float invSigma = 1.0f / max(centerDepth * 0.045f, 0.02f);
+
+    static const float kernel[3] = { 0.25f, 0.5f, 0.25f };
     float4 accum = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float wSum = 0.0f;
 
     [unroll]
-    for (int dy = 0; dy <= 1; ++dy)
+    for (int dy = -1; dy <= 1; ++dy)
     {
         [unroll]
-        for (int dx = 0; dx <= 1; ++dx)
+        for (int dx = -1; dx <= 1; ++dx)
         {
-            int2 tapGi = ClampGiCoord(giBase + int2(dx, dy));
+            int2 tapGi = ClampGiCoord(giCenter + int2(dx * 2, dy * 2));
             float4 tap = halfTex.Load(int3(tapGi, 0));
 
             int2 tapOut = ClampOutputCoord(int2((float2(tapGi) + 0.5f) * (float2(OutputWidth, OutputHeight) / float2(GiWidth, GiHeight))));
             float tapDepth = LoadDepthAtOutputCoord(tapOut);
 
-            float wx = (dx == 0) ? (1.0f - fracUv.x) : fracUv.x;
-            float wy = (dy == 0) ? (1.0f - fracUv.y) : fracUv.y;
-            float spatialW = wx * wy;
+            float spatialW = kernel[dx + 1] * kernel[dy + 1];
             float depthW = exp(-abs(centerDepth - tapDepth) * invSigma);
             float w = spatialW * depthW + 1e-5f;
 
@@ -249,7 +291,17 @@ float4 BilateralSampleHalfRes(Texture2D<float4> halfTex, int2 outCoord, float ce
     return accum / max(wSum, 1e-5f);
 }
 
-float3 SampleVolumetricGlow(int2 outCoord)
+// Jimenez et al. 2016 Multi-Bounce Colored AO approximation
+float3 MultiBounceAO(float visibility, float3 albedo)
+{
+    float3 a = 2.0404f * albedo - 0.3324f;
+    float3 b = -4.7951f * albedo + 0.6417f;
+    float3 c = 2.7552f * albedo + 0.6903f;
+    float v = saturate(visibility);
+    return max(v.xxx, ((v * a + b) * v + c) * v);
+}
+
+float3 SampleBrightVolumetricGlow(int2 outCoord)
 {
     int2 giCenter = int2((float2(outCoord) + 0.5f) * (float2(GiWidth, GiHeight) / float2(OutputWidth, OutputHeight)));
     float3 sum = float3(0.0f, 0.0f, 0.0f);
@@ -259,7 +311,11 @@ float3 SampleVolumetricGlow(int2 outCoord)
     {
         float3 g = GiTex.Load(int3(ClampGiCoord(giCenter + offsets[i]), 0)).rgb;
         float3 s = SsrTex.Load(int3(ClampGiCoord(giCenter + offsets[i]), 0)).rgb;
-        sum += g * 0.65f + s * 0.35f;
+        float3 c = g * 0.6f + s * 0.4f;
+        // Extract only genuinely bright emissive/specular energy (> 0.65)
+        float l = Luma(c);
+        float brightMask = max(l - 0.65f, 0.0f) / max(l, 1e-4f);
+        sum += c * brightMask;
     }
     return sum * 0.25f;
 }
@@ -269,6 +325,8 @@ float SiLU(float x)
     return x / (1.0f + exp(-clamp(x, -12.0f, 12.0f)));
 }
 
+// Embedded-weight 3-layer residual MLP (6 -> 8 -> 8 -> 3)
+// Returns zero-centered [deltaDetail, deltaMicroLight, deltaChromaPop]
 float3 EvalNeuralResidualMLP(float f0, float f1, float f2, float f3, float f4, float f5)
 {
     static const float W1[8][6] = {
@@ -281,7 +339,7 @@ float3 EvalNeuralResidualMLP(float f0, float f1, float f2, float f3, float f4, f
         { -0.30f,  0.15f,  0.65f,  0.30f, -0.40f,  0.60f },
         {  0.48f, -0.20f, -0.30f, -0.15f,  0.35f,  0.35f }
     };
-    static const float B1[8] = { 0.02f, -0.02f, 0.05f, -0.04f, 0.01f, 0.03f, -0.03f, 0.02f };
+    static const float B1[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
     static const float W2[8][8] = {
         {  0.55f, -0.40f,  0.25f, -0.15f,  0.10f,  0.45f, -0.20f,  0.15f },
@@ -293,14 +351,12 @@ float3 EvalNeuralResidualMLP(float f0, float f1, float f2, float f3, float f4, f
         { -0.20f,  0.30f, -0.25f,  0.35f,  0.20f, -0.15f,  0.50f,  0.30f },
         {  0.15f,  0.20f,  0.40f,  0.15f,  0.30f,  0.25f,  0.20f,  0.45f }
     };
-    static const float B2[8] = { 0.01f, -0.01f, 0.02f, 0.0f, 0.01f, 0.02f, -0.02f, 0.01f };
 
     static const float W3[3][8] = {
         {  0.65f, -0.58f,  0.18f, -0.12f,  0.10f,  0.48f, -0.15f,  0.12f },
-        { -0.08f,  0.10f,  0.32f,  0.42f,  0.36f, -0.06f,  0.28f,  0.24f },
-        {  0.18f, -0.14f,  0.22f,  0.20f,  0.28f,  0.26f,  0.12f,  0.30f }
+        { -0.14f,  0.14f, -0.18f,  0.22f,  0.16f, -0.12f, -0.16f,  0.08f },
+        {  0.18f, -0.14f,  0.22f,  0.18f,  0.24f,  0.22f,  0.10f,  0.24f }
     };
-    static const float B3[3] = { 0.0f, -0.02f, -0.01f };
 
     float h1[8];
     [unroll]
@@ -314,14 +370,14 @@ float3 EvalNeuralResidualMLP(float f0, float f1, float f2, float f3, float f4, f
     [unroll]
     for (int j = 0; j < 8; ++j)
     {
-        float s = B2[j];
+        float s = 0.0f;
         [unroll]
         for (int k = 0; k < 8; ++k)
             s += W2[j][k] * h1[k];
         h2[j] = SiLU(s);
     }
 
-    float3 outV = float3(B3[0], B3[1], B3[2]);
+    float3 outV = float3(0.0f, 0.0f, 0.0f);
     [unroll]
     for (int m = 0; m < 8; ++m)
     {
@@ -330,7 +386,7 @@ float3 EvalNeuralResidualMLP(float f0, float f1, float f2, float f3, float f4, f
         outV.z += W3[2][m] * h2[m];
     }
 
-    return clamp(outV, -0.42f, 0.42f);
+    return clamp(outV, -0.35f, 0.35f);
 }
 
 [numthreads(16, 16, 1)]
@@ -360,6 +416,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     int2 outCoord = int2(dtid.xy);
     int2 ldsCoord = int2(gtid.xy) + 1;
+    float2 uv = (float2(outCoord) + 0.5f) / float2(OutputWidth, OutputHeight);
 
     float4 origRaw = SourceColor.Load(int3(outCoord, 0));
 
@@ -381,10 +438,9 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     float3 centerColor = s_color[ldsCoord.y][ldsCoord.x];
     float centerDepth = s_depth[ldsCoord.y][ldsCoord.x];
-
     float skyMask = 1.0f - smoothstep(SkyDepthThreshold * 0.65f, SkyDepthThreshold, centerDepth);
 
-    // 3x3 neighborhood stats from shared memory
+    // 3x3 color & depth stats from shared memory
     float3 cL = s_color[ldsCoord.y][ldsCoord.x - 1];
     float3 cR = s_color[ldsCoord.y][ldsCoord.x + 1];
     float3 cU = s_color[ldsCoord.y - 1][ldsCoord.x];
@@ -399,13 +455,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float dU = s_depth[ldsCoord.y - 1][ldsCoord.x];
     float dD = s_depth[ldsCoord.y + 1][ldsCoord.x];
 
-    float gx = abs(dR - centerDepth) < abs(centerDepth - dL) ? (dR - centerDepth) : (centerDepth - dL);
-    float gy = abs(dD - centerDepth) < abs(centerDepth - dU) ? (dD - centerDepth) : (centerDepth - dU);
     float maxDepthGrad = max(abs(dR - dL), abs(dD - dU));
     float relDepthJump = maxDepthGrad / max(centerDepth, 0.05f);
     float haloRisk = smoothstep(0.015f, 0.08f, relDepthJump);
 
-    float3 geomNormal = normalize(float3(-gx / max(centerDepth * 0.01f, 1e-3f), gy / max(centerDepth * 0.01f, 1e-3f), -1.0f));
+    // True 3D depth-texel view normal (+ optional G-buffer normal)
+    float3 viewNormal = ReconstructViewNormalFromDepthTexel(uv);
     if (HasGBufferNormals > 0)
     {
         float3 gN = GBufferNormalsTex.Load(int3(outCoord, 0)).xyz;
@@ -413,8 +468,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             gN = gN * 2.0f - 1.0f;
         float gLen = dot(gN, gN);
         if (gLen > 0.1f && gLen < 4.0f)
-            geomNormal = gN * rsqrt(gLen);
+            viewNormal = gN * rsqrt(gLen);
     }
+
+    float3 viewPos = ReconstructViewPos(uv, centerDepth);
+    float3 viewDir = normalize(viewPos);
+    float NdotV = saturate(-dot(viewDir, viewNormal));
 
     float centerLuma = Luma(centerColor);
     float lumaL = Luma(cL);
@@ -423,130 +482,137 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float lumaD = Luma(cD);
     float lumaAvg = (lumaL + lumaR + lumaU + lumaD + Luma(cUL) + Luma(cUR) + Luma(cDL) + Luma(cDR)) * 0.125f;
 
-    // Micro-bump perturbed surface normal for directional relighting
-    float2 microGrad = float2(lumaR - lumaL, lumaD - lumaU);
-    float3 microNormal = normalize(geomNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (2.2f * (1.0f - haloRisk) * skyMask));
-    float normalFacing = saturate(abs(microNormal.z));
+    // Micro-bump surface normal perturbation (screen-space relief)
+    float2 microGrad = float2(lumaR - lumaL, lumaD - lumaU) / max(centerLuma + 0.12f, 0.12f);
+    float3 microNormal = normalize(viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (1.85f * (1.0f - haloRisk) * skyMask));
 
-    // Stage A + C: Bilateral Half-Res Temporal SSGI, Contact AO, and SSR
+    // Stage A + C: 9-tap Denoised Half-Res Temporal SSGI, Multi-Bounce AO, and SSR
     float3 giBounce = float3(0.0f, 0.0f, 0.0f);
     float contactAo = 1.0f;
     float4 ssrSample = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
     if (GiEnabled > 0)
     {
-        float4 giSample = BilateralSampleHalfRes(GiTex, outCoord, centerDepth);
+        float4 giSample = DenoiseSampleHalfRes(GiTex, outCoord, centerDepth);
         giBounce = max(giSample.rgb, 0.0f);
         contactAo = lerp(1.0f, saturate(giSample.a), saturate(AoIntensity) * skyMask);
 
         if (SsrEnabled > 0 && SsrIntensity > 1e-4f)
-            ssrSample = BilateralSampleHalfRes(SsrTex, outCoord, centerDepth);
+            ssrSample = DenoiseSampleHalfRes(SsrTex, outCoord, centerDepth);
     }
+
+    float3 albedoApprox = saturate(centerColor / max(centerLuma, 0.06f)) * saturate(centerLuma * 1.4f);
+    if (HasGBufferAlbedo > 0)
+        albedoApprox = saturate(GBufferAlbedoTex.Load(int3(outCoord, 0)).rgb);
 
     float3 litColor = centerColor;
 
+    // 1. Energy-Conserving Multi-Bounce AO + Ambient De-Lighted Indirect GI Bounce
     if (GiEnabled > 0)
     {
-        float aoProtect = 1.0f / (1.0f + centerLuma * 0.75f);
-        float effectiveAo = lerp(1.0f, contactAo, aoProtect);
-        litColor *= effectiveAo;
+        // De-light flat ambient slightly so colored bounce & AO sculpt depth instead of lifting exposure
+        float ambientDelight = lerp(1.0f, 0.84f, saturate(GiIntensity * 0.45f) * skyMask);
+        float aoProtect = 1.0f / (1.0f + centerLuma * 0.85f);
+        float3 coloredAo = lerp(float3(1.0f, 1.0f, 1.0f), MultiBounceAO(contactAo, albedoApprox), aoProtect);
 
-        if (HasGBufferAlbedo > 0)
-        {
-            float3 albedo = saturate(GBufferAlbedoTex.Load(int3(outCoord, 0)).rgb);
-            litColor += giBounce * albedo * (GiIntensity * 1.65f) * skyMask;
-        }
-        else
-        {
-            float3 approxAlbedo = saturate(centerColor / max(centerLuma, 0.06f)) * saturate(centerLuma * 1.5f + 0.15f);
-            litColor += giBounce * approxAlbedo * (GiIntensity * 1.25f) * skyMask;
-        }
+        litColor = litColor * coloredAo * ambientDelight;
+
+        // Inject bounce light strongest in shadowed/shaded crevices (never blows out sunlit areas)
+        float shadowFocus = 1.0f / (1.0f + centerLuma * 1.35f);
+        litColor += giBounce * albedoApprox * (GiIntensity * (0.65f + 0.75f * shadowFocus)) * skyMask;
     }
 
-    // Roughness / smoothness factor (PBR G-buffer or perceptual fallback)
-    float smoothness = saturate(0.32f + saturate(centerLuma * 0.65f) * 0.35f);
+    // Roughness / smoothness (PBR G-buffer or perceptual reflectance fallback)
+    float smoothness = saturate(0.28f + saturate(centerLuma * 0.55f) * 0.35f);
     if (HasGBufferRoughness > 0)
     {
         float rough = saturate(GBufferRoughnessTex.Load(int3(outCoord, 0)).r);
         smoothness = saturate(1.0f - rough);
     }
 
-    // Real-time Glossy Screen-Space Reflections composite
+    // 2. Energy-Conserving Fresnel Screen-Space Reflections (pure lerp, never additive!)
     if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && ssrSample.a > 1e-3f)
     {
-        float fresnelSsr = 0.04f + 0.96f * pow(saturate(1.0f - normalFacing), 3.5f);
-        float reflWeight = saturate(ssrSample.a * fresnelSsr * smoothness * SsrIntensity * 0.75f) * skyMask;
-        litColor = lerp(litColor, max(litColor, ssrSample.rgb), reflWeight);
+        float fresnelSsr = 0.04f + 0.96f * pow(1.0f - NdotV, 4.0f);
+        float reflWeight = saturate(ssrSample.a * fresnelSsr * smoothness * SsrIntensity * 0.85f) * skyMask;
+        litColor = lerp(litColor, ssrSample.rgb, reflWeight);
     }
 
-    // 3D Directional Key/Rim Relighting using perturbed micro-normals
+    // 3. Zero-Mean 3D Micro-Normal Sculpting & Directional Hemisphere Relighting
     if (RelightIntensity > 1e-4f)
     {
-        float3 keyDir = normalize(float3(0.35f, 0.75f, -0.56f));
-        float keyNdotL = dot(microNormal, keyDir);
-        float keyFactor = keyNdotL * 0.24f * RelightIntensity * skyMask * (1.0f - haloRisk * 0.7f);
-        float3 keyTint = (keyFactor >= 0.0f) ? float3(1.05f, 1.01f, 0.94f) : float3(0.88f, 0.94f, 1.08f);
+        float3 keyDir = normalize(float3(0.45f, 0.78f, -0.43f));
+        // Purely relative micro-bump delta (zero spatial mean -> carves shadows AND pops highlights)
+        float deltaBump = (dot(microNormal, keyDir) - dot(viewNormal, keyDir)) * 0.95f;
+        // Hemisphere vertical sculpting (upward faces catch warm sky, downward faces deepen cool shadow)
+        float hemiTerm = viewNormal.y * 0.16f;
 
-        // Foreground Fresnel rim light separation
-        float rim = pow(saturate(1.0f - abs(geomNormal.z)), 3.2f) * RelightIntensity * skyMask * 0.28f;
-        float rimEnv = saturate(Luma(giBounce) * 1.8f + centerLuma * 0.4f);
+        float sculpt = (deltaBump + hemiTerm) * RelightIntensity * skyMask * (1.0f - haloRisk * 0.8f);
+        float3 sculptTint = (sculpt >= 0.0f) ? float3(1.04f, 1.01f, 0.96f) : float3(0.90f, 0.95f, 1.06f);
+        litColor *= max(1.0f + sculpt * sculptTint, 0.25f);
 
-        litColor = max(litColor * (1.0f + keyFactor * keyTint) + (giBounce + 0.08f) * rim * rimEnv, 0.0f);
+        // Strictly luminance-proportional grazing rim (zero linear floor -> black stays black)
+        float rim = pow(1.0f - NdotV, 3.5f) * RelightIntensity * skyMask * 0.22f;
+        litColor += litColor * rim * saturate(Luma(giBounce) * 1.5f + 0.35f);
     }
 
-    // Grazing Specular Micro-Relief
+    // 4. Zero-Mean Micro-Specular Relief
     float microMag = length(microGrad);
-    float fresnel = pow(saturate(1.0f - normalFacing), 2.5f);
-    float grazingBoost = SpecularRelief * skyMask * (1.0f - haloRisk) * smoothness *
-                         (0.45f * fresnel + 0.75f * saturate(microMag * 2.8f)) * saturate(centerLuma * 0.95f);
-    litColor += litColor * grazingBoost * 0.42f;
+    float grazing = pow(1.0f - NdotV, 2.5f);
+    float specSignal = (0.35f * grazing + 0.65f * saturate(microMag * 1.8f)) - 0.12f;
+    float specMod = SpecularRelief * skyMask * (1.0f - haloRisk) * smoothness * specSignal * 0.32f;
+    litColor *= max(1.0f + specMod, 0.65f);
 
-    // Volumetric Light Wrap / Atmospheric Halation
+    // 5. Bright-Only Volumetric Halation
     if (GiEnabled > 0 && VolumetricGlow > 1e-4f)
     {
-        float3 glow = SampleVolumetricGlow(outCoord);
-        float glowGate = saturate(0.25f + (1.0f - skyMask) * 0.75f + saturate(centerLuma * 0.5f));
-        litColor += glow * (VolumetricGlow * 0.28f) * glowGate;
+        float3 glow = SampleBrightVolumetricGlow(outCoord);
+        litColor += glow * (VolumetricGlow * 0.30f);
     }
 
-    // Stage B: Embedded Tiled Residual Neural Detail & Relighting Network
-    float highPass = centerLuma - lumaAvg;
+    // Stage B: Mean-Preserving Tiled Residual Neural Detail & Relighting
+    float highPass = (centerLuma - lumaAvg) / max(lumaAvg + 0.10f, 0.10f);
     float variance = (abs(lumaL - lumaAvg) + abs(lumaR - lumaAvg) + abs(lumaU - lumaAvg) + abs(lumaD - lumaAvg)) * 0.25f;
 
-    float f0 = saturate(log2(1.0f + centerLuma) * 0.5f) * 2.0f - 1.0f;
-    float f1 = clamp(highPass * 6.5f, -1.0f, 1.0f);
-    float f2 = saturate(variance * 8.5f) * 2.0f - 1.0f;
-    float f3 = saturate(centerDepth / max(SkyDepthThreshold * 0.5f, 1.0f)) * 2.0f - 1.0f;
-    float f4 = normalFacing * 2.0f - 1.0f;
-    float f5 = saturate(Luma(giBounce) * 2.5f) * 2.0f - 1.0f;
+    float f0 = saturate(log2(1.0f + centerLuma) * 0.45f) * 2.0f - 1.0f;
+    float f1 = clamp(highPass * 3.5f, -1.0f, 1.0f);
+    float f2 = saturate((variance / max(lumaAvg + 0.08f, 0.08f)) * 4.5f) * 2.0f - 1.0f;
+    float f3 = saturate(log2(1.0f + centerDepth) / 8.0f) * 2.0f - 1.0f;
+    float f4 = saturate(abs(microNormal.z)) * 2.0f - 1.0f;
+    float f5 = saturate(Luma(giBounce) * 2.2f) * 2.0f - 1.0f;
 
     float3 neuralOut = EvalNeuralResidualMLP(f0, f1, f2, f3, f4, f5);
 
     int2 mvCoord = DisplaySizeMV > 0 ? outCoord : int2((float2(outCoord) + 0.5f) * MotionTextureScale);
     float2 mv = MotionTex.Load(int3(ClampMotionCoord(mvCoord), 0)).rg * float2(MvScaleX, MvScaleY);
-    float motionDamp = 1.0f / (1.0f + length(mv) * 0.055f);
+    float motionDamp = 1.0f / (1.0f + length(mv) * 0.06f);
 
     float detailGate = skyMask * (1.0f - haloRisk) * motionDamp * NeuralDetail;
-    float detailDelta = (neuralOut.x * 0.52f + highPass * 0.48f) * detailGate * 0.55f;
-    float lightDelta = neuralOut.y * skyMask * (1.0f - haloRisk) * NeuralDetail * 0.20f;
-    float chromaPop = neuralOut.z * skyMask * NeuralDetail * 0.24f;
+    // Strictly zero-mean detail & light modulation (pivoted around local contrast, no global DC shift)
+    float detailDelta = (neuralOut.x * 0.45f + clamp(highPass, -0.5f, 0.5f) * 0.55f) * detailGate * 0.48f;
+    float lightDelta = neuralOut.y * skyMask * (1.0f - haloRisk) * NeuralDetail * 0.14f;
+    float chromaPop = neuralOut.z * skyMask * NeuralDetail * 0.26f;
 
-    float outLuma = max(Luma(litColor), 1e-4f);
-    float targetLuma = max(outLuma + detailDelta * max(outLuma, 0.16f) + lightDelta * outLuma, 0.0f);
-    float3 finalColor = litColor * (targetLuma / outLuma);
+    float outLuma = max(Luma(litColor), 1e-5f);
+    float lumaScale = max(1.0f + detailDelta + lightDelta, 0.35f);
+    float3 finalColor = litColor * lumaScale;
 
-    float3 chroma = finalColor - Luma(finalColor);
-    finalColor = Luma(finalColor) + chroma * (1.0f + clamp(chromaPop, -0.15f, 0.35f));
+    float finalLuma = Luma(finalColor);
+    float3 chroma = finalColor - finalLuma;
+    finalColor = finalLuma + chroma * (1.0f + clamp(chromaPop, -0.10f, 0.32f));
 
-    // HDR-safe filmic micro-contrast & highlight shoulder
+    // Local-Mean-Preserving Filmic Contrast (deepens blacks/shadows without lifting midtones)
     if (ToneContrast > 1e-4f)
     {
         float l = max(Luma(finalColor), 1e-5f);
         float cStr = clamp(ToneContrast, 0.0f, 1.0f);
-        float logL = log2(l / 0.18f + 1e-4f);
-        float shapedLog = logL * (1.0f + cStr * 0.28f) / (1.0f + abs(logL) * cStr * 0.09f);
-        float shapedL = 0.18f * exp2(shapedLog);
-        finalColor *= (shapedL / l);
+        float pivot = max(lumaAvg, 0.08f);
+        float ratio = l / pivot;
+        float contrasted = pow(max(ratio, 1e-4f), 1.0f + cStr * 0.26f) * pivot;
+        // Soft highlight protection above 1.0 so HDR/bright whites never clip
+        float shoulder = l / (1.0f + max(l - 1.0f, 0.0f) * cStr * 0.18f);
+        float targetL = lerp(contrasted, min(contrasted, shoulder), saturate(l * 0.5f));
+        finalColor *= (targetL / l);
     }
 
     // Debug views
@@ -555,7 +621,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     else if (DebugView == 2)
         finalColor = contactAo.xxx;
     else if (DebugView == 3)
-        finalColor = microNormal * 0.5f + 0.5f;
+        finalColor = viewNormal * 0.5f + 0.5f;
     else if (DebugView == 4)
         finalColor = saturate(float3(detailDelta * 4.0f + 0.5f, lightDelta * 4.0f + 0.5f, chromaPop * 2.0f + 0.5f));
     else if (DebugView == 5)
