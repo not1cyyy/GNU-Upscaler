@@ -6,6 +6,7 @@
 
 #include <State.h>
 #include <misc/DeferredRelease.h>
+#include <wrl/client.h>
 
 bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t height)
 {
@@ -279,8 +280,8 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc {};
         rootSigDesc.Init_1_1(1, &rootParam, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
-        ComPtr<ID3DBlob> sigBlob;
-        ComPtr<ID3DBlob> errBlob;
+        Microsoft::WRL::ComPtr<ID3DBlob> sigBlob;
+        Microsoft::WRL::ComPtr<ID3DBlob> errBlob;
         if (FAILED(D3D12SerializeVersionedRootSignature(&rootSigDesc, &sigBlob, &errBlob)) ||
             FAILED(InDevice->CreateRootSignature(0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(),
                                                  IID_PPV_ARGS(&_rootSignatureGi))))

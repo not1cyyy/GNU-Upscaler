@@ -111,6 +111,7 @@ class IFeature
     std::optional<double> lastRcasTime {};
     std::optional<double> lastOutputScalingTime {};
     std::optional<double> lastNeuralLookTime {};
+    int _neuralLookActiveTier = -1;
 
     void SetHandle(unsigned int InHandleId);
     bool SetInitParameters(NVSDK_NGX_Parameter* InParameters);
@@ -186,7 +187,7 @@ class IFeature
     virtual bool SharpenEnabled() { return _initFlags.SharpenEnabled; }
 
     virtual bool CallsUpscalerEndByItself() { return false; }
-    virtual int NeuralLookActiveTier() const { return -1; }
+    int NeuralLookActiveTier() const { return _neuralLookActiveTier; }
 
     IFeature(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters) { SetHandle(InHandleId); }
 

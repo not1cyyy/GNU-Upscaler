@@ -51,6 +51,7 @@ bool IFeature_Dx12::Init(ID3D12Device* InDevice, ID3D12GraphicsCommandList* InCo
 
         OutputScaler = std::make_unique<OS_Dx12>("Output Scaling", InDevice, (TargetWidth() < DisplayWidth()));
         NeuralLook = std::make_unique<NL_Dx12>("Neural Look", InDevice);
+        _neuralLookActiveTier = (NeuralLook && NeuralLook->IsInit()) ? NeuralLook->ActiveTier() : -1;
         RCAS = std::make_unique<RCAS_Dx12>("RCAS", InDevice);
         // DLSS/DLSSD take the bias mask as is
         if (GetUpscalerType() != Upscaler::DLSS && GetUpscalerType() != Upscaler::DLSSD)
@@ -622,7 +623,10 @@ std::optional<double> IFeature_Dx12::ReadUpscalerTime(void* commandQueueVoid)
     lastOutputScalingTime = OutputScaler->ReadGpuTime(commandQueue);
     lastNeuralLookTime = NeuralLook ? NeuralLook->ReadGpuTime(commandQueue) : std::nullopt;
     if (lastNeuralLookTime.has_value() && NeuralLook)
+    {
         NeuralLook->UpdateBudget(lastNeuralLookTime.value());
+        _neuralLookActiveTier = NeuralLook->ActiveTier();
+    }
 
     return sumOpts(lastUpscalerTime, lastRcasTime, lastOutputScalingTime, lastNeuralLookTime);
 }

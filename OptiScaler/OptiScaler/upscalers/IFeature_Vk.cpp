@@ -21,6 +21,7 @@ bool IFeature_Vk::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice In
     {
         OutputScaler = std::make_unique<OS_Vk>("Output Scaling", InDevice, InPD, (TargetWidth() < DisplayWidth()));
         NeuralLook = std::make_unique<NL_Vk>("Neural Look", InDevice, InPD);
+        _neuralLookActiveTier = (NeuralLook && NeuralLook->IsInit()) ? NeuralLook->ActiveTier() : -1;
         RCAS = std::make_unique<RCAS_Vk>("RCAS", InDevice, InPD);
         // DLSS/DLSSD take the bias mask as is
         if (GetUpscalerType() != Upscaler::DLSS && GetUpscalerType() != Upscaler::DLSSD)
@@ -435,7 +436,10 @@ std::optional<double> IFeature_Vk::ReadUpscalerTime(void* unused)
     lastOutputScalingTime = OutputScaler->ReadGpuTime();
     lastNeuralLookTime = NeuralLook ? NeuralLook->ReadGpuTime() : std::nullopt;
     if (lastNeuralLookTime.has_value() && NeuralLook)
+    {
         NeuralLook->UpdateBudget(lastNeuralLookTime.value());
+        _neuralLookActiveTier = NeuralLook->ActiveTier();
+    }
 
     return sumOpts(lastUpscalerTime, lastRcasTime, lastOutputScalingTime, lastNeuralLookTime);
 }

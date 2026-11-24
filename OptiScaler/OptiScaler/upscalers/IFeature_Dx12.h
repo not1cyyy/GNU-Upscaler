@@ -81,7 +81,6 @@ class IFeature_Dx12 : public virtual IFeature
     bool DispatchPendingPostPassesAsync(ID3D12CommandQueue* directQueue);
 
     API Api() const override { return API::DX12; }
-    int NeuralLookActiveTier() const override { return NeuralLook ? NeuralLook->ActiveTier() : -1; }
     std::optional<double> ReadUpscalerTime(void* commandQueue) override;
     void ReadDetailedGpuTimes(void* commandQueue, std::vector<DetailedGpuTime>& detailedGpuTimes) override;
 
