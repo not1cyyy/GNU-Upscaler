@@ -27,9 +27,9 @@ class NL_Common
   public:
     enum class BudgetTier : int
     {
-        Light = 0,  // Composite + Neural MLP + Specular Relief only (skip half-res SSGI)
-        Medium = 1, // 2-ray, 4-step Half-Res Temporal SSGI + Composite
-        Full = 2    // 4-ray, 5-step Half-Res Temporal SSGI + Composite
+        Light = 0,  // Composite + Relight + Neural Detail only (skip half-res SSGI/SSR)
+        Medium = 1, // 4-ray SSGI + 6-step SSR + Composite
+        Full = 2    // 6-ray SSGI + 8-step SSR + Composite
     };
 
     void UpdateBudget(double gpuMs)
@@ -105,18 +105,18 @@ class NL_Common
 
         float CameraVFov = 1.04719755f;
         float AspectRatio = 16.0f / 9.0f;
-        float GiRadius = 64.0f;
-        float GiBias = 0.08f;
+        float GiRadius = 96.0f;
+        float GiBias = 0.05f;
 
-        int32_t RayCount = 4;
-        int32_t StepCount = 5;
+        int32_t RayCount = 6;
+        int32_t StepCount = 6;
         int32_t FrameIndex = 0;
         int32_t ResetHistory = 0;
 
         int32_t HasGBufferNormals = 0;
         int32_t InColorEncodeMode = 0;
-        int32_t _pad0 = 0;
-        int32_t _pad1 = 0;
+        int32_t SsrEnabled = 1;
+        int32_t SsrSteps = 8;
     };
 
     struct alignas(256) NLCompositeInternalConstants
@@ -146,12 +146,12 @@ class NL_Common
         float MotionTextureScale = 1.0f;
         float DepthTextureScale = 1.0f;
 
-        float GiIntensity = 0.75f;
-        float AoIntensity = 0.65f;
-        float NeuralDetail = 0.65f;
-        float SpecularRelief = 0.50f;
+        float GiIntensity = 1.00f;
+        float AoIntensity = 0.85f;
+        float NeuralDetail = 0.80f;
+        float SpecularRelief = 0.70f;
 
-        float ToneContrast = 0.25f;
+        float ToneContrast = 0.32f;
         int32_t InColorEncodeMode = 0;
 
         int32_t GiEnabled = 1;
@@ -161,8 +161,13 @@ class NL_Common
 
         int32_t DebugView = 0;
         int32_t OutColorEncodeMode = 0;
+        float SsrIntensity = 0.85f;
+        float RelightIntensity = 0.75f;
+
+        float VolumetricGlow = 0.45f;
+        float SplitScreenPos = 0.0f;
+        int32_t SsrEnabled = 1;
         int32_t _pad0 = 0;
-        int32_t _pad1 = 0;
     };
 
     static_assert(sizeof(NLGiInternalConstants) % 16 == 0);
@@ -200,7 +205,7 @@ class NL_Common
     }
 
     void FillGiConstants(NLGiInternalConstants& c, const NeuralLookConstants& inConst, bool hasNormals,
-                         int32_t inEncodeMode) const
+                         int32_t inEncodeMode, bool ssrEnabled) const
     {
         FillSharedDepthMotion(c.OutputWidth, c.OutputHeight, c.DepthWidth, c.DepthHeight, c.MotionWidth, c.MotionHeight,
                               inConst, c.DepthIsLinear, c.DepthIsReversed, c.DisplaySizeMV, c.DepthLinearA,
@@ -212,20 +217,22 @@ class NL_Common
             (inConst.AspectRatio > 0.1f) ? inConst.AspectRatio : ((float) c.OutputWidth / (float) std::max(c.OutputHeight, 1));
 
         const float minDim = (float) std::min(c.OutputWidth, c.OutputHeight);
-        c.GiRadius = std::clamp(minDim * 0.065f, 24.0f, 96.0f);
-        c.GiBias = 0.06f;
+        c.GiRadius = std::clamp(minDim * 0.11f, 40.0f, 144.0f);
+        c.GiBias = 0.05f;
 
-        c.RayCount = (_activeTier >= 2) ? 4 : 2;
-        c.StepCount = (_activeTier >= 2) ? 5 : 4;
+        c.RayCount = (_activeTier >= 2) ? 6 : 4;
+        c.StepCount = (_activeTier >= 2) ? 6 : 5;
         c.FrameIndex = static_cast<int32_t>(_frameIndex);
         c.ResetHistory = inConst.ResetHistory ? 1 : 0;
         c.HasGBufferNormals = hasNormals ? 1 : 0;
         c.InColorEncodeMode = inEncodeMode;
+        c.SsrEnabled = ssrEnabled ? 1 : 0;
+        c.SsrSteps = (_activeTier >= 2) ? 8 : 6;
     }
 
     void FillCompositeConstants(NLCompositeInternalConstants& c, const NeuralLookConstants& inConst, bool giEnabled,
-                                bool hasNormals, bool hasAlbedo, bool hasRoughness, int32_t inEncodeMode,
-                                int32_t outEncodeMode) const
+                                bool ssrEnabled, bool hasNormals, bool hasAlbedo, bool hasRoughness,
+                                int32_t inEncodeMode, int32_t outEncodeMode) const
     {
         FillSharedDepthMotion(c.OutputWidth, c.OutputHeight, c.DepthWidth, c.DepthHeight, c.MotionWidth, c.MotionHeight,
                               inConst, c.DepthIsLinear, c.DepthIsReversed, c.DisplaySizeMV, c.DepthLinearA,
@@ -238,8 +245,13 @@ class NL_Common
         c.NeuralDetail = std::clamp(cfg->NeuralLookDetail.value_or_default(), 0.0f, 2.0f);
         c.SpecularRelief = std::clamp(cfg->NeuralLookSpecularRelief.value_or_default(), 0.0f, 2.0f);
         c.ToneContrast = std::clamp(cfg->NeuralLookToneContrast.value_or_default(), 0.0f, 1.0f);
+        c.SsrIntensity = std::clamp(cfg->NeuralLookSsrIntensity.value_or_default(), 0.0f, 2.0f);
+        c.RelightIntensity = std::clamp(cfg->NeuralLookRelightIntensity.value_or_default(), 0.0f, 2.0f);
+        c.VolumetricGlow = std::clamp(cfg->NeuralLookVolumetricGlow.value_or_default(), 0.0f, 2.0f);
+        c.SplitScreenPos = std::clamp(cfg->NeuralLookSplitScreen.value_or_default(), 0.0f, 1.0f);
 
         c.GiEnabled = giEnabled ? 1 : 0;
+        c.SsrEnabled = ssrEnabled ? 1 : 0;
         c.HasGBufferNormals = hasNormals ? 1 : 0;
         c.HasGBufferAlbedo = hasAlbedo ? 1 : 0;
         c.HasGBufferRoughness = hasRoughness ? 1 : 0;

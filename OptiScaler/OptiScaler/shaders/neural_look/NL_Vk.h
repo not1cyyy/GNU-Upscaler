@@ -22,22 +22,31 @@ class NL_Vk : public Shader_Vk, public NL_Common
     VkImageView _giImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkDeviceMemory _giMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     bool _giImageInitialized[2] = { false, false };
+
+    VkImage _ssrImages[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView _ssrImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceMemory _ssrMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    bool _ssrImageInitialized[2] = { false, false };
+
     uint32_t _giWidth = 0;
     uint32_t _giHeight = 0;
     int _giWriteIdx = 0;
     bool _resetGiHistory = true;
 
+    bool CreateHalfResImage(uint32_t width, uint32_t height, VkImage& outImg, VkImageView& outView,
+                            VkDeviceMemory& outMem);
     bool CreateGiImages(uint32_t width, uint32_t height);
     void ReleaseGiImages();
 
     void UpdateGiDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo, VkImageView colorView,
                                VkImageView depthView, VkImageView motionView, VkImageView prevGiView,
-                               VkImageView normalsView, VkImageView outGiView);
+                               VkImageView normalsView, VkImageView prevSsrView, VkImageView outGiView,
+                               VkImageView outSsrView);
 
     void UpdateCompositeDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
                                       VkImageView colorView, VkImageView depthView, VkImageView motionView,
                                       VkImageView giView, VkImageView normalsView, VkImageView albedoView,
-                                      VkImageView roughnessView, VkImageView outColorView);
+                                      VkImageView roughnessView, VkImageView ssrView, VkImageView outColorView);
 
   public:
     NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalDevice);

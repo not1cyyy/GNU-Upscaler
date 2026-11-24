@@ -599,13 +599,22 @@ bool Config::Reload(std::filesystem::path iniPath)
             NeuralLookEnabled.set_from_config(readBool("NeuralLook", "Enabled"));
 
             if (auto setting = readInt("NeuralLook", "Preset"); setting.has_value())
-                NeuralLookPreset.set_from_config(std::clamp(setting.value(), 0, 2));
+                NeuralLookPreset.set_from_config(std::clamp(setting.value(), 0, 3));
 
             if (auto setting = readFloat("NeuralLook", "GiIntensity"); setting.has_value())
                 NeuralLookGiIntensity.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
 
             if (auto setting = readFloat("NeuralLook", "AoIntensity"); setting.has_value())
                 NeuralLookAoIntensity.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
+
+            if (auto setting = readFloat("NeuralLook", "SsrIntensity"); setting.has_value())
+                NeuralLookSsrIntensity.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
+
+            if (auto setting = readFloat("NeuralLook", "RelightIntensity"); setting.has_value())
+                NeuralLookRelightIntensity.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
+
+            if (auto setting = readFloat("NeuralLook", "VolumetricGlow"); setting.has_value())
+                NeuralLookVolumetricGlow.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
 
             if (auto setting = readFloat("NeuralLook", "Detail"); setting.has_value())
                 NeuralLookDetail.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
@@ -622,7 +631,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             NeuralLookUseGBuffers.set_from_config(readBool("NeuralLook", "UseGBuffers"));
 
             if (auto setting = readInt("NeuralLook", "DebugView"); setting.has_value())
-                NeuralLookDebugView.set_from_config(std::clamp(setting.value(), 0, 4));
+                NeuralLookDebugView.set_from_config(std::clamp(setting.value(), 0, 5));
         }
 
         // Magnifier
@@ -1853,6 +1862,12 @@ bool Config::SaveIni()
                      GetFloatValue(Instance()->NeuralLookGiIntensity.value_for_config()).c_str());
         ini.SetValue("NeuralLook", "AoIntensity",
                      GetFloatValue(Instance()->NeuralLookAoIntensity.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "SsrIntensity",
+                     GetFloatValue(Instance()->NeuralLookSsrIntensity.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "RelightIntensity",
+                     GetFloatValue(Instance()->NeuralLookRelightIntensity.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "VolumetricGlow",
+                     GetFloatValue(Instance()->NeuralLookVolumetricGlow.value_for_config()).c_str());
         ini.SetValue("NeuralLook", "Detail", GetFloatValue(Instance()->NeuralLookDetail.value_for_config()).c_str());
         ini.SetValue("NeuralLook", "SpecularRelief",
                      GetFloatValue(Instance()->NeuralLookSpecularRelief.value_for_config()).c_str());

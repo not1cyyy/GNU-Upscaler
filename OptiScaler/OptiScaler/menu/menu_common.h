@@ -120,6 +120,7 @@ enum class MenuTab : int
     Upscaling,
     FrameGen,
     Image,
+    NeuralLook,
     Interface,
     Advanced,
     Count
@@ -274,6 +275,7 @@ class MenuCommon
     static void RenderVsyncSettings(RenderMenuContext& ctx);
     static void RenderLowLatencySettings(RenderMenuContext& ctx);
     static void RenderActiveImageSettings(RenderMenuContext& ctx);
+    static void RenderNeuralLookTab(RenderMenuContext& ctx);
     static void RenderUpscaleRatioSettings(RenderMenuContext& ctx);
     static void RenderOutputScalingSettings(RenderMenuContext& ctx);
     static void RenderInitFlagsSettings(RenderMenuContext& ctx);

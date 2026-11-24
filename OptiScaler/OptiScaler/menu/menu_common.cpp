@@ -8208,97 +8208,156 @@ void MenuCommon::RenderActiveImageSettings(RenderMenuContext& ctx)
             }
         }
     }
+}
 
-    // 3D Neural Look (DLSS 5-Style)
+void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
+{
+    auto config = ctx.config;
+    auto& currentFeature = ctx.currentFeature;
+
+    GnuUi::SectionHeader("3D Neural Look (DLSS 5-Style)");
+
+    bool nlEnabled = config->NeuralLookEnabled.value_or_default();
+    if (GnuUi::Checkbox("Enable 3D Neural Look", &nlEnabled))
+        config->NeuralLookEnabled = nlEnabled;
+    ShowTooltip("Real-time 3D-guided relighting & neural detail pipeline (DX12 & Vulkan, pre-HUD):\n"
+                "- Half-res temporal multi-bounce SSGI & tight contact shadows\n"
+                "- Half-res temporal Screen-Space Reflections (SSR)\n"
+                "- 3D normal/micro-bump directional relighting & volumetric light wrap\n"
+                "- Tiled FP16 residual neural detail synthesis & HDR filmic contrast");
+
+    if (currentFeature != nullptr)
     {
-        ImGui::Spacing();
-        GnuUi::SectionHeader("3D Neural Look (DLSS 5-Style)");
+        const int tier = currentFeature->NeuralLookActiveTier();
+        const auto gpuMs = currentFeature->LastNeuralLookTime();
+        const char* tierName = (tier == 2) ? "Full (6-ray SSGI + 8-step SSR + Neural)"
+                               : (tier == 1) ? "Medium (4-ray SSGI + 6-step SSR + Neural)"
+                               : (tier == 0) ? "Light (Relight + Neural only)"
+                                             : "Inactive / DX11 unsupported";
+        if (nlEnabled && gpuMs.has_value())
+            ImGui::TextDisabled("Active Tier: %s | GPU Pass: %.2f ms", tierName, gpuMs.value());
+        else
+            ImGui::TextDisabled("Active Tier: %s", tierName);
+    }
 
-        bool nlEnabled = config->NeuralLookEnabled.value_or_default();
-        if (GnuUi::Checkbox("Enable 3D Neural Look", &nlEnabled))
-            config->NeuralLookEnabled = nlEnabled;
-        ShowTooltip("Adds half-res temporal Screen-Space GI + contact shadows, depth-guided specular relief, "
-                    "and a tiled FP16 residual neural detail & relighting pass pre-HUD (DX12 & Vulkan).");
+    ImGui::BeginDisabled(!nlEnabled);
 
-        if (nlEnabled)
+    int preset = config->NeuralLookPreset.value_or_default();
+    const char* presetNames[] = { "Subtle", "Balanced", "Dramatic (DLSS 5)", "Ultra Cinematic" };
+    if (ImGui::Combo("Look Preset", &preset, presetNames, IM_ARRAYSIZE(presetNames)))
+    {
+        config->NeuralLookPreset = preset;
+        if (preset == 0) // Subtle
         {
-            if (currentFeature != nullptr)
-            {
-                const int tier = currentFeature->NeuralLookActiveTier();
-                const char* tierName = (tier == 2) ? "Full (4-ray SSGI + Neural)"
-                                       : (tier == 1) ? "Medium (2-ray SSGI + Neural)"
-                                       : (tier == 0) ? "Light (Neural + Relief only)"
-                                                     : "Inactive / DX11 unsupported";
-                ImGui::TextDisabled("Active Budget Tier: %s", tierName);
-            }
-
-            int preset = config->NeuralLookPreset.value_or_default();
-            const char* presetNames[] = { "Subtle", "Balanced", "Cinematic" };
-            if (ImGui::Combo("Look Preset", &preset, presetNames, IM_ARRAYSIZE(presetNames)))
-            {
-                config->NeuralLookPreset = preset;
-                if (preset == 0)
-                {
-                    config->NeuralLookGiIntensity = 0.40f;
-                    config->NeuralLookAoIntensity = 0.40f;
-                    config->NeuralLookDetail = 0.40f;
-                    config->NeuralLookSpecularRelief = 0.30f;
-                    config->NeuralLookToneContrast = 0.12f;
-                }
-                else if (preset == 1)
-                {
-                    config->NeuralLookGiIntensity = 0.75f;
-                    config->NeuralLookAoIntensity = 0.65f;
-                    config->NeuralLookDetail = 0.65f;
-                    config->NeuralLookSpecularRelief = 0.50f;
-                    config->NeuralLookToneContrast = 0.25f;
-                }
-                else
-                {
-                    config->NeuralLookGiIntensity = 1.15f;
-                    config->NeuralLookAoIntensity = 0.90f;
-                    config->NeuralLookDetail = 0.90f;
-                    config->NeuralLookSpecularRelief = 0.75f;
-                    config->NeuralLookToneContrast = 0.40f;
-                }
-            }
-
-            float giIntensity = config->NeuralLookGiIntensity.value_or_default();
-            if (ImGui::SliderFloat("GI Bounce", &giIntensity, 0.0f, 2.0f, "%.2f"))
-                config->NeuralLookGiIntensity = giIntensity;
-
-            float aoIntensity = config->NeuralLookAoIntensity.value_or_default();
-            if (ImGui::SliderFloat("Contact Shadows (AO)", &aoIntensity, 0.0f, 2.0f, "%.2f"))
-                config->NeuralLookAoIntensity = aoIntensity;
-
-            float nlDetail = config->NeuralLookDetail.value_or_default();
-            if (ImGui::SliderFloat("Neural Detail", &nlDetail, 0.0f, 2.0f, "%.2f"))
-                config->NeuralLookDetail = nlDetail;
-
-            float specRelief = config->NeuralLookSpecularRelief.value_or_default();
-            if (ImGui::SliderFloat("Specular Relief", &specRelief, 0.0f, 2.0f, "%.2f"))
-                config->NeuralLookSpecularRelief = specRelief;
-
-            float toneContrast = config->NeuralLookToneContrast.value_or_default();
-            if (ImGui::SliderFloat("Filmic Contrast", &toneContrast, 0.0f, 1.0f, "%.2f"))
-                config->NeuralLookToneContrast = toneContrast;
-
-            float maxGpuMs = config->NeuralLookMaxGpuMs.value_or_default();
-            if (ImGui::SliderFloat("Max GPU Budget (ms)", &maxGpuMs, 0.25f, 5.0f, "%.2f ms"))
-                config->NeuralLookMaxGpuMs = maxGpuMs;
-            ShowTooltip("Auto-steps down SSGI rays or falls back to Light mode if GPU pass time exceeds this budget.");
-
-            bool useGBuffers = config->NeuralLookUseGBuffers.value_or_default();
-            if (GnuUi::Checkbox("Use Ray Reconstruction G-Buffers", &useGBuffers))
-                config->NeuralLookUseGBuffers = useGBuffers;
-            ShowTooltip("Uses GBuffer.Normals, DiffuseAlbedo, and Roughness when provided by the game.");
-
-            int debugView = config->NeuralLookDebugView.value_or_default();
-            const char* debugViews[] = { "Off", "GI Bounce", "Contact AO", "Normals", "Neural Residual" };
-            if (ImGui::Combo("Debug View##NL", &debugView, debugViews, IM_ARRAYSIZE(debugViews)))
-                config->NeuralLookDebugView = debugView;
+            config->NeuralLookGiIntensity = 0.50f;
+            config->NeuralLookAoIntensity = 0.45f;
+            config->NeuralLookSsrIntensity = 0.45f;
+            config->NeuralLookRelightIntensity = 0.35f;
+            config->NeuralLookVolumetricGlow = 0.20f;
+            config->NeuralLookDetail = 0.45f;
+            config->NeuralLookSpecularRelief = 0.35f;
+            config->NeuralLookToneContrast = 0.15f;
+        }
+        else if (preset == 1) // Balanced
+        {
+            config->NeuralLookGiIntensity = 1.00f;
+            config->NeuralLookAoIntensity = 0.85f;
+            config->NeuralLookSsrIntensity = 0.85f;
+            config->NeuralLookRelightIntensity = 0.75f;
+            config->NeuralLookVolumetricGlow = 0.45f;
+            config->NeuralLookDetail = 0.80f;
+            config->NeuralLookSpecularRelief = 0.70f;
+            config->NeuralLookToneContrast = 0.32f;
+        }
+        else if (preset == 2) // Dramatic (DLSS 5)
+        {
+            config->NeuralLookGiIntensity = 1.45f;
+            config->NeuralLookAoIntensity = 1.15f;
+            config->NeuralLookSsrIntensity = 1.30f;
+            config->NeuralLookRelightIntensity = 1.20f;
+            config->NeuralLookVolumetricGlow = 0.80f;
+            config->NeuralLookDetail = 1.15f;
+            config->NeuralLookSpecularRelief = 1.05f;
+            config->NeuralLookToneContrast = 0.48f;
+        }
+        else // Ultra Cinematic
+        {
+            config->NeuralLookGiIntensity = 1.85f;
+            config->NeuralLookAoIntensity = 1.40f;
+            config->NeuralLookSsrIntensity = 1.70f;
+            config->NeuralLookRelightIntensity = 1.60f;
+            config->NeuralLookVolumetricGlow = 1.20f;
+            config->NeuralLookDetail = 1.40f;
+            config->NeuralLookSpecularRelief = 1.35f;
+            config->NeuralLookToneContrast = 0.65f;
         }
     }
+
+    ImGui::Spacing();
+    GnuUi::SectionHeader("Lighting & Reflections");
+
+    float giIntensity = config->NeuralLookGiIntensity.value_or_default();
+    if (ImGui::SliderFloat("GI Bounce", &giIntensity, 0.0f, 2.0f, "%.2f"))
+        config->NeuralLookGiIntensity = giIntensity;
+
+    float aoIntensity = config->NeuralLookAoIntensity.value_or_default();
+    if (ImGui::SliderFloat("Contact Shadows (AO)", &aoIntensity, 0.0f, 2.0f, "%.2f"))
+        config->NeuralLookAoIntensity = aoIntensity;
+
+    float ssrIntensity = config->NeuralLookSsrIntensity.value_or_default();
+    if (ImGui::SliderFloat("Screen-Space Reflections (SSR)", &ssrIntensity, 0.0f, 2.0f, "%.2f"))
+        config->NeuralLookSsrIntensity = ssrIntensity;
+
+    float relightIntensity = config->NeuralLookRelightIntensity.value_or_default();
+    if (ImGui::SliderFloat("3D Directional Relighting", &relightIntensity, 0.0f, 2.0f, "%.2f"))
+        config->NeuralLookRelightIntensity = relightIntensity;
+
+    float volGlow = config->NeuralLookVolumetricGlow.value_or_default();
+    if (ImGui::SliderFloat("Volumetric Light Wrap", &volGlow, 0.0f, 2.0f, "%.2f"))
+        config->NeuralLookVolumetricGlow = volGlow;
+
+    ImGui::Spacing();
+    GnuUi::SectionHeader("Detail & Tone");
+
+    float nlDetail = config->NeuralLookDetail.value_or_default();
+    if (ImGui::SliderFloat("Neural Detail", &nlDetail, 0.0f, 2.0f, "%.2f"))
+        config->NeuralLookDetail = nlDetail;
+
+    float specRelief = config->NeuralLookSpecularRelief.value_or_default();
+    if (ImGui::SliderFloat("Specular Relief", &specRelief, 0.0f, 2.0f, "%.2f"))
+        config->NeuralLookSpecularRelief = specRelief;
+
+    float toneContrast = config->NeuralLookToneContrast.value_or_default();
+    if (ImGui::SliderFloat("Filmic Contrast", &toneContrast, 0.0f, 1.0f, "%.2f"))
+        config->NeuralLookToneContrast = toneContrast;
+
+    ImGui::Spacing();
+    GnuUi::SectionHeader("Performance & Comparison");
+
+    float maxGpuMs = config->NeuralLookMaxGpuMs.value_or_default();
+    if (ImGui::SliderFloat("Max GPU Budget (ms)", &maxGpuMs, 0.25f, 5.0f, "%.2f ms"))
+        config->NeuralLookMaxGpuMs = maxGpuMs;
+    ShowTooltip("Auto-steps down SSGI/SSR rays or falls back to Light mode if GPU pass time exceeds this budget.");
+
+    float splitScreen = config->NeuralLookSplitScreen.value_or_default();
+    if (ImGui::SliderFloat("Split-Screen Compare", &splitScreen, 0.0f, 1.0f,
+                           (splitScreen > 0.01f && splitScreen < 0.99f) ? "Split %.0f%%" : "Off"))
+    {
+        config->NeuralLookSplitScreen = splitScreen;
+    }
+    ShowTooltip("Drag between 1%% and 99%% to compare Original (left) vs. 3D Neural Look (right) live.");
+
+    bool useGBuffers = config->NeuralLookUseGBuffers.value_or_default();
+    if (GnuUi::Checkbox("Use Ray Reconstruction G-Buffers", &useGBuffers))
+        config->NeuralLookUseGBuffers = useGBuffers;
+    ShowTooltip("Uses GBuffer.Normals, DiffuseAlbedo, and Roughness when provided by the game.");
+
+    int debugView = config->NeuralLookDebugView.value_or_default();
+    const char* debugViews[] = { "Off", "GI Bounce", "Contact AO", "Normals", "Neural Residual", "SSR Reflections" };
+    if (ImGui::Combo("Debug View##NL", &debugView, debugViews, IM_ARRAYSIZE(debugViews)))
+        config->NeuralLookDebugView = debugView;
+
+    ImGui::EndDisabled();
 }
 
 void MenuCommon::RenderUpscaleRatioSettings(RenderMenuContext& ctx)
@@ -11112,6 +11171,14 @@ void MenuCommon::RenderMainMenuTable(RenderMenuContext& ctx)
         ImGui::EndTabItem();
     }
 
+    if (beginTab("Neural Look", MenuTab::NeuralLook))
+    {
+        ImGui::PushItemWidth(itemWidth);
+        RenderNeuralLookTab(ctx);
+        ImGui::PopItemWidth();
+        ImGui::EndTabItem();
+    }
+
     if (beginTab("Interface", MenuTab::Interface))
     {
         ImGui::PushItemWidth(itemWidth);
@@ -11164,6 +11231,7 @@ void MenuCommon::RenderMainMenuTabs(RenderMenuContext& ctx)
         { "main", "Upscaling", RenderUpscalerStateMessage },
         { "main", "Frame Gen" },
         { "main", "Latency" },
+        { "main", "Neural Look", RenderNeuralLookTab },
         { "system", "Textures", nullptr, [](RenderMenuContext& c) { return c.state.swapchainApi != Vulkan; } },
         { "system", "Compatibility" },
         { "advanced", "Menu" },

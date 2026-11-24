@@ -188,6 +188,7 @@ class IFeature
 
     virtual bool CallsUpscalerEndByItself() { return false; }
     int NeuralLookActiveTier() const { return _neuralLookActiveTier; }
+    std::optional<double> LastNeuralLookTime() const { return lastNeuralLookTime; }
 
     IFeature(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters) { SetHandle(InHandleId); }
 

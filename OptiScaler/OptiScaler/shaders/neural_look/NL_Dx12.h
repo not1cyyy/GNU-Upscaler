@@ -20,6 +20,8 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
 
     ID3D12Resource* _giBuffers[2] = { nullptr, nullptr };
     D3D12_RESOURCE_STATES _giBufferStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
+    ID3D12Resource* _ssrBuffers[2] = { nullptr, nullptr };
+    D3D12_RESOURCE_STATES _ssrBufferStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
     uint32_t _giWidth = 0;
     uint32_t _giHeight = 0;
     int _giWriteIdx = 0;

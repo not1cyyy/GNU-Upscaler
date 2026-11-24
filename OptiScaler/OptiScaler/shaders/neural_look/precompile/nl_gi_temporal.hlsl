@@ -41,8 +41,8 @@ cbuffer Params : register(b0)
 
     int HasGBufferNormals;
     int InColorEncodeMode;
-    int _pad0;
-    int _pad1;
+    int SsrEnabled;
+    int SsrSteps;
 };
 
 #ifdef VK_MODE
@@ -73,7 +73,17 @@ Texture2D<float4> GBufferNormalsTex : register(t4);
 #ifdef VK_MODE
 [[vk::binding(6, 0)]]
 #endif
+Texture2D<float4> PrevSsrTex : register(t5);
+
+#ifdef VK_MODE
+[[vk::binding(7, 0)]]
+#endif
 RWTexture2D<float4> OutGiTex : register(u0);
+
+#ifdef VK_MODE
+[[vk::binding(8, 0)]]
+#endif
+RWTexture2D<float4> OutSsrTex : register(u1);
 
 static const float3 kLumaCoeff = float3(0.2126f, 0.7152f, 0.0722f);
 static const float kPi = 3.14159265f;
@@ -165,6 +175,15 @@ float3 ReconstructViewPos(float2 uv, float linearDepth)
     return float3(ndc.x * tanHalfFov * AspectRatio * linearDepth, ndc.y * tanHalfFov * linearDepth, linearDepth);
 }
 
+float2 ProjectViewPosToUv(float3 p)
+{
+    float tanHalfFov = tan(clamp(CameraVFov, 0.25f, 2.4f) * 0.5f);
+    float invZ = 1.0f / max(p.z, 1e-4f);
+    float ndcX = p.x * invZ / (tanHalfFov * AspectRatio);
+    float ndcY = p.y * invZ / tanHalfFov;
+    return float2(ndcX * 0.5f + 0.5f, 0.5f - ndcY * 0.5f);
+}
+
 float3 ReconstructViewNormal(int2 outCoord, float2 uv, float centerDepth, float3 centerPos)
 {
     int stepPx = max(1, OutputWidth / max(DepthWidth, 1));
@@ -200,20 +219,18 @@ float InterleavedGradientNoise(float2 p)
     return frac(magic.z * frac(dot(p, magic.xy)));
 }
 
-float4 SamplePrevGiBilinear(float2 prevUv)
+float4 SamplePrevBilinear(Texture2D<float4> tex, float2 prevUv)
 {
     float2 fCoord = prevUv * float2(GiWidth, GiHeight) - 0.5f;
     int2 iCoord = int2(floor(fCoord));
     float2 f = frac(fCoord);
 
-    float4 c00 = PrevGiTex.Load(int3(ClampGiCoord(iCoord + int2(0, 0)), 0));
-    float4 c10 = PrevGiTex.Load(int3(ClampGiCoord(iCoord + int2(1, 0)), 0));
-    float4 c01 = PrevGiTex.Load(int3(ClampGiCoord(iCoord + int2(0, 1)), 0));
-    float4 c11 = PrevGiTex.Load(int3(ClampGiCoord(iCoord + int2(1, 1)), 0));
+    float4 c00 = tex.Load(int3(ClampGiCoord(iCoord + int2(0, 0)), 0));
+    float4 c10 = tex.Load(int3(ClampGiCoord(iCoord + int2(1, 0)), 0));
+    float4 c01 = tex.Load(int3(ClampGiCoord(iCoord + int2(0, 1)), 0));
+    float4 c11 = tex.Load(int3(ClampGiCoord(iCoord + int2(1, 1)), 0));
 
-    float4 top = lerp(c00, c10, f.x);
-    float4 bot = lerp(c01, c11, f.x);
-    return lerp(top, bot, f.y);
+    return lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
 }
 
 [numthreads(8, 8, 1)]
@@ -234,6 +251,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (isSky)
     {
         OutGiTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        OutSsrTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
         return;
     }
 
@@ -248,17 +266,17 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float gLen = dot(gN, gN);
         if (gLen > 0.1f && gLen < 4.0f)
         {
-            // Keep screen-facing hemisphere consistent with depth normal
             float3 gNorm = gN * rsqrt(gLen);
             if (dot(gNorm, viewNormal) > 0.15f)
-                viewNormal = normalize(lerp(viewNormal, gNorm, 0.35f));
+                viewNormal = normalize(lerp(viewNormal, gNorm, 0.40f));
         }
     }
 
-    float noiseA = InterleavedGradientNoise(float2(giCoord) + float2((FrameIndex & 15) * 5.588238f, (FrameIndex & 15) * 3.1732f));
+    float noiseA = InterleavedGradientNoise(
+        float2(giCoord) + float2((FrameIndex & 15) * 5.588238f, (FrameIndex & 15) * 3.1732f));
     float noiseB = frac(noiseA * 1.6180339f + 0.371f);
 
-    float maxRadiusPx = max(GiRadius, 12.0f);
+    float maxRadiusPx = max(GiRadius, 18.0f);
     float2 invOutSize = 1.0f / float2(OutputWidth, OutputHeight);
 
     float3 accumGi = float3(0.0f, 0.0f, 0.0f);
@@ -266,8 +284,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     int rays = clamp(RayCount, 1, 6);
     int steps = clamp(StepCount, 2, 8);
-    float worldRange = clamp(centerDepth * 0.22f, 1.2f, 18.0f);
-    float thicknessLimit = clamp(centerDepth * 0.16f, 0.35f, 8.0f);
+    float worldRange = clamp(centerDepth * 0.28f, 1.5f, 24.0f);
+    float thicknessLimit = clamp(centerDepth * 0.18f, 0.35f, 9.0f);
 
     [loop]
     for (int r = 0; r < rays; ++r)
@@ -276,6 +294,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float2 dirPx = float2(cos(angle), sin(angle));
 
         float maxHorizonSin = 0.0f;
+        float microContactOcc = 0.0f;
         float3 rayGi = float3(0.0f, 0.0f, 0.0f);
         float rayWeightSum = 0.0f;
 
@@ -306,13 +325,16 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             float3 dir3D = delta / dist;
             float nDotD = dot(viewNormal, dir3D);
 
-            // Thickness rejection prevents thin foreground objects from occluding/bouncing far walls
             float depthDelta = centerDepth - sampleDepth;
             if (depthDelta > thicknessLimit)
                 continue;
 
             float rangeFade = 1.0f - saturate(dist / worldRange);
             float elev = nDotD - GiBias;
+
+            // Tight contact shadow boost on closest steps
+            if (s <= 2 && elev > 0.04f)
+                microContactOcc = max(microContactOcc, saturate(elev * 1.4f) * (1.0f - saturate(dist / max(centerDepth * 0.06f, 0.35f))));
 
             if (elev > maxHorizonSin)
             {
@@ -321,47 +343,137 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
                 float3 hitColor = ToLinearColor(SourceColor.Load(int3(sampleOutCoord, 0)).rgb);
                 float hitLuma = Luma(hitColor);
-                float fireflyScale = min(hitLuma, 3.5f) / max(hitLuma, 1e-4f);
+                float fireflyScale = min(hitLuma, 6.0f) / max(hitLuma, 1e-4f);
                 hitColor *= fireflyScale;
 
-                // Indirect bounce favors lit hits facing back toward the receiver
+                // Boost chromatic saturation of indirect bounce slightly so colored light pops
+                hitColor = lerp(hitLuma.xxx, hitColor, 1.35f);
+
                 float bounceCos = saturate(nDotD);
                 rayGi += hitColor * bounceCos * rangeFade * aoDelta;
                 rayWeightSum += rangeFade;
             }
         }
 
-        accumAo += saturate(1.0f - maxHorizonSin * 0.95f);
+        float rayAo = saturate(1.0f - max(maxHorizonSin * 0.98f, microContactOcc * 0.85f));
+        accumAo += rayAo;
         if (rayWeightSum > 1e-4f)
-            accumGi += rayGi / max(rayWeightSum, 0.75f);
+            accumGi += rayGi / max(rayWeightSum, 0.55f);
     }
 
-    float3 currentGi = accumGi / float(rays);
+    float3 currentGi = max(accumGi / float(rays), 0.0f);
     float currentAo = saturate(accumAo / float(rays));
+
+    // Real-time Half-Res Screen-Space Reflections (SSR)
+    float4 currentSsr = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (SsrEnabled > 0)
+    {
+        float3 viewDir = normalize(centerPos);
+        float3 reflDir = normalize(reflect(viewDir, viewNormal));
+
+        if (reflDir.z > -0.55f)
+        {
+            int ssrSteps = clamp(SsrSteps, 4, 12);
+            float ssrMaxDist = clamp(centerDepth * 0.95f, 3.0f, 45.0f);
+            float ssrThickness = clamp(centerDepth * 0.14f, 0.30f, 6.5f);
+
+            float prevDist = 0.0f;
+            float hitDist = 0.0f;
+            float2 hitUv = uv;
+            bool hit = false;
+
+            [loop]
+            for (int k = 1; k <= ssrSteps; ++k)
+            {
+                float kt = (float(k) + noiseB * 0.45f) / float(ssrSteps);
+                float marchDist = lerp(max(centerDepth * 0.02f, 0.08f), ssrMaxDist, kt * kt);
+                float3 rayPos = centerPos + reflDir * marchDist;
+
+                if (rayPos.z <= 0.05f || rayPos.z >= SkyDepthThreshold)
+                    break;
+
+                float2 rayUv = ProjectViewPosToUv(rayPos);
+                if (any(rayUv < 0.004f) || any(rayUv > 0.996f))
+                    break;
+
+                int2 rayOutCoord = ClampOutputCoord(int2(rayUv * float2(OutputWidth, OutputHeight)));
+                float rayDepth = LinearizeDepth(LoadRawDepthAtOutputCoord(rayOutCoord));
+
+                float diff = rayPos.z - rayDepth;
+                if (diff > 0.0f && diff < ssrThickness)
+                {
+                    hit = true;
+                    hitDist = marchDist;
+                    hitUv = rayUv;
+                    break;
+                }
+
+                prevDist = marchDist;
+            }
+
+            if (hit)
+            {
+                // 1 binary midpoint refinement step for cleaner reflection silhouettes
+                float midDist = 0.5f * (prevDist + hitDist);
+                float3 midPos = centerPos + reflDir * midDist;
+                if (midPos.z > 0.05f)
+                {
+                    float2 midUv = ProjectViewPosToUv(midPos);
+                    if (all(midUv >= 0.002f) && all(midUv <= 0.998f))
+                    {
+                        int2 midCoord = ClampOutputCoord(int2(midUv * float2(OutputWidth, OutputHeight)));
+                        float midDepth = LinearizeDepth(LoadRawDepthAtOutputCoord(midCoord));
+                        float midDiff = midPos.z - midDepth;
+                        if (midDiff > 0.0f && midDiff < ssrThickness)
+                            hitUv = midUv;
+                    }
+                }
+
+                int2 hitCoord = ClampOutputCoord(int2(hitUv * float2(OutputWidth, OutputHeight)));
+                float3 hitCol = ToLinearColor(SourceColor.Load(int3(hitCoord, 0)).rgb);
+                float hitLuma = Luma(hitCol);
+                hitCol *= min(hitLuma, 6.0f) / max(hitLuma, 1e-4f);
+
+                float2 edgeDist = min(hitUv, 1.0f - hitUv);
+                float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 14.0f);
+                float distFade = 1.0f - saturate(hitDist / ssrMaxDist);
+                float conf = edgeFade * lerp(0.45f, 1.0f, distFade);
+
+                currentSsr = float4(hitCol, conf);
+            }
+        }
+    }
 
     // Temporal reprojection using game motion vectors
     int2 mvCoord = DisplaySizeMV > 0 ? outCoord : int2((float2(outCoord) + 0.5f) * MotionTextureScale);
     float2 mv = MotionTex.Load(int3(ClampMotionCoord(mvCoord), 0)).rg * float2(MvScaleX, MvScaleY);
     float2 prevUv = uv + mv * invOutSize;
 
-    float4 result = float4(currentGi, currentAo);
+    float4 giResult = float4(currentGi, currentAo);
+    float4 ssrResult = currentSsr;
 
     if (ResetHistory == 0 && FrameIndex > 2 && all(prevUv >= 0.002f) && all(prevUv <= 0.998f))
     {
-        float4 prev = SamplePrevGiBilinear(prevUv);
         float mvMag = length(mv);
-        float blendAlpha = lerp(0.14f, 0.52f, saturate(mvMag / 16.0f));
+        float baseAlpha = lerp(0.14f, 0.52f, saturate(mvMag / 16.0f));
 
-        // Clamp temporal AO/GI lightly against current frame to eliminate ghost trails
-        float aoDiff = abs(prev.a - currentAo);
-        blendAlpha = max(blendAlpha, saturate(aoDiff * 1.4f));
+        float4 prevGi = SamplePrevBilinear(PrevGiTex, prevUv);
+        float aoDiff = abs(prevGi.a - currentAo);
+        float3 giDiff = abs(prevGi.rgb - currentGi);
+        float giMaxDiff = max(giDiff.r, max(giDiff.g, giDiff.b));
+        float giAlpha = max(baseAlpha, max(saturate(aoDiff * 1.4f), saturate(giMaxDiff * 0.65f)));
+        giResult = lerp(prevGi, giResult, saturate(giAlpha));
 
-        float3 giDiff = abs(prev.rgb - currentGi);
-        float maxDiff = max(giDiff.r, max(giDiff.g, giDiff.b));
-        blendAlpha = max(blendAlpha, saturate(maxDiff * 0.65f));
-
-        result = lerp(prev, result, saturate(blendAlpha));
+        if (SsrEnabled > 0)
+        {
+            float4 prevSsr = SamplePrevBilinear(PrevSsrTex, prevUv);
+            float3 ssrDiff = abs(prevSsr.rgb - currentSsr.rgb);
+            float ssrMaxDiff = max(ssrDiff.r, max(ssrDiff.g, ssrDiff.b));
+            float ssrAlpha = max(lerp(0.18f, 0.65f, saturate(mvMag / 12.0f)), saturate(ssrMaxDiff * 0.55f));
+            ssrResult = lerp(prevSsr, currentSsr, saturate(ssrAlpha));
+        }
     }
 
-    OutGiTex[giCoord] = float4(max(result.rgb, 0.0f), saturate(result.a));
+    OutGiTex[giCoord] = float4(max(giResult.rgb, 0.0f), saturate(giResult.a));
+    OutSsrTex[giCoord] = float4(max(ssrResult.rgb, 0.0f), saturate(ssrResult.a));
 }

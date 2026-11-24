@@ -13,8 +13,11 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
     const uint32_t targetW = std::max(1u, width / 2u);
     const uint32_t targetH = std::max(1u, height / 2u);
 
-    if (_giBuffers[0] != nullptr && _giBuffers[1] != nullptr && _giWidth == targetW && _giHeight == targetH)
+    if (_giBuffers[0] != nullptr && _giBuffers[1] != nullptr && _ssrBuffers[0] != nullptr &&
+        _ssrBuffers[1] != nullptr && _giWidth == targetW && _giHeight == targetH)
+    {
         return true;
+    }
 
     ReleaseGiBuffers();
 
@@ -35,18 +38,23 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
 
     for (int i = 0; i < 2; ++i)
     {
-        auto hr = InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
-                                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                                    IID_PPV_ARGS(&_giBuffers[i]));
-        if (FAILED(hr) || _giBuffers[i] == nullptr)
+        auto hrGi = InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                      IID_PPV_ARGS(&_giBuffers[i]));
+        auto hrSsr = InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                       IID_PPV_ARGS(&_ssrBuffers[i]));
+        if (FAILED(hrGi) || _giBuffers[i] == nullptr || FAILED(hrSsr) || _ssrBuffers[i] == nullptr)
         {
-            LOG_ERROR("[{0}] Failed to create GI ping-pong buffer {1}: {2:x}", _name, i, hr);
+            LOG_ERROR("[{0}] Failed to create GI/SSR ping-pong buffers {1}: {2:x} / {3:x}", _name, i, hrGi, hrSsr);
             ReleaseGiBuffers();
             return false;
         }
 
         _giBuffers[i]->SetName(i == 0 ? L"NL_GI_Buffer_0" : L"NL_GI_Buffer_1");
+        _ssrBuffers[i]->SetName(i == 0 ? L"NL_SSR_Buffer_0" : L"NL_SSR_Buffer_1");
         _giBufferStates[i] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        _ssrBufferStates[i] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     }
 
     _giWidth = targetW;
@@ -64,6 +72,13 @@ void NL_Dx12::ReleaseGiBuffers()
             DeferredRelease::Release(_giBuffers[i]);
             _giBuffers[i] = nullptr;
             _giBufferStates[i] = D3D12_RESOURCE_STATE_COMMON;
+        }
+
+        if (_ssrBuffers[i] != nullptr)
+        {
+            DeferredRelease::Release(_ssrBuffers[i]);
+            _ssrBuffers[i] = nullptr;
+            _ssrBufferStates[i] = D3D12_RESOURCE_STATE_COMMON;
         }
     }
 
@@ -135,11 +150,16 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     const bool hasAlbedo = useGBuffers && InGBufferAlbedo != nullptr;
     const bool hasRoughness = useGBuffers && InGBufferRoughness != nullptr;
 
-    const float giIntensity = Config::Instance()->NeuralLookGiIntensity.value_or_default();
-    const float aoIntensity = Config::Instance()->NeuralLookAoIntensity.value_or_default();
-    const bool runGiPass = (_activeTier > 0) && (giIntensity > 1e-4f || aoIntensity > 1e-4f ||
-                                                 Config::Instance()->NeuralLookDebugView.value_or_default() == 1 ||
-                                                 Config::Instance()->NeuralLookDebugView.value_or_default() == 2);
+    const auto* cfg = Config::Instance();
+    const float giIntensity = cfg->NeuralLookGiIntensity.value_or_default();
+    const float aoIntensity = cfg->NeuralLookAoIntensity.value_or_default();
+    const float ssrIntensity = cfg->NeuralLookSsrIntensity.value_or_default();
+    const float volGlow = cfg->NeuralLookVolumetricGlow.value_or_default();
+    const int debugView = cfg->NeuralLookDebugView.value_or_default();
+
+    const bool ssrEnabled = (_activeTier > 0) && (ssrIntensity > 1e-4f || volGlow > 1e-4f || debugView == 5);
+    const bool runGiPass = (_activeTier > 0) &&
+                           (giIntensity > 1e-4f || aoIntensity > 1e-4f || ssrEnabled || debugView == 1 || debugView == 2);
 
     _giWriteIdx = (_giWriteIdx + 1) & 1;
     const int prevIdx = _giWriteIdx ^ 1;
@@ -150,6 +170,10 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
                                     &_giBufferStates[_giWriteIdx]);
         Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, _giBuffers[prevIdx],
                                     &_giBufferStates[prevIdx]);
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, _ssrBuffers[_giWriteIdx],
+                                    &_ssrBufferStates[_giWriteIdx]);
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, _ssrBuffers[prevIdx],
+                                    &_ssrBufferStates[prevIdx]);
 
         FrameDescriptorHeap& giHeap = _frameHeapsGi[_counter];
         CreateShaderResourceView(_device, InResource, giHeap.GetSrvCPU(0));
@@ -157,7 +181,9 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         CreateShaderResourceView(_device, InMotionVectors, giHeap.GetSrvCPU(2));
         CreateShaderResourceView(_device, _giBuffers[prevIdx], giHeap.GetSrvCPU(3));
         CreateShaderResourceView(_device, hasNormals ? InGBufferNormals : InResource, giHeap.GetSrvCPU(4));
+        CreateShaderResourceView(_device, _ssrBuffers[prevIdx], giHeap.GetSrvCPU(5));
         CreateUnorderedAccessView(_device, _giBuffers[_giWriteIdx], giHeap.GetUavCPU(0), 0);
+        CreateUnorderedAccessView(_device, _ssrBuffers[_giWriteIdx], giHeap.GetUavCPU(1), 0);
 
         NLGiInternalConstants giConstants {};
         giConstants.OutputWidth = static_cast<int32_t>(outDesc.Width);
@@ -175,7 +201,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
             giConstIn.ResetHistory = true;
             _resetGiHistory = false;
         }
-        FillGiConstants(giConstants, giConstIn, hasNormals, inEncodeMode);
+        FillGiConstants(giConstants, giConstIn, hasNormals, inEncodeMode, ssrEnabled);
 
         if (!CreateConstantsBuffer(_device, giHeap, giConstants, giHeap.GetCbvCPU(0)))
         {
@@ -195,6 +221,8 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
 
         Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, _giBuffers[_giWriteIdx],
                                     &_giBufferStates[_giWriteIdx]);
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, _ssrBuffers[_giWriteIdx],
+                                    &_ssrBufferStates[_giWriteIdx]);
     }
 
     // Composite pass
@@ -207,6 +235,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         CreateShaderResourceView(_device, hasNormals ? InGBufferNormals : InResource, compHeap.GetSrvCPU(4));
         CreateShaderResourceView(_device, hasAlbedo ? InGBufferAlbedo : InResource, compHeap.GetSrvCPU(5));
         CreateShaderResourceView(_device, hasRoughness ? InGBufferRoughness : InResource, compHeap.GetSrvCPU(6));
+        CreateShaderResourceView(_device, _ssrBuffers[_giWriteIdx], compHeap.GetSrvCPU(7));
         CreateUnorderedAccessView(_device, OutResource, compHeap.GetUavCPU(0), 0);
 
         NLCompositeInternalConstants compConstants {};
@@ -219,8 +248,8 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         compConstants.MotionWidth = static_cast<int32_t>(mvsDesc.Width);
         compConstants.MotionHeight = static_cast<int32_t>(mvsDesc.Height);
 
-        FillCompositeConstants(compConstants, InConstants, runGiPass, hasNormals, hasAlbedo, hasRoughness, inEncodeMode,
-                               outEncodeMode);
+        FillCompositeConstants(compConstants, InConstants, runGiPass, ssrEnabled, hasNormals, hasAlbedo, hasRoughness,
+                               inEncodeMode, outEncodeMode);
 
         if (!CreateConstantsBuffer(_device, compHeap, compConstants, compHeap.GetCbvCPU(0)))
         {
@@ -250,8 +279,8 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
         return;
     }
 
-    // 1. Setup Composite root signature (7 SRVs, 1 UAV, 1 CBV) and PSO
-    if (!SetupRootSignature(InDevice, 7, 1, 1))
+    // 1. Setup Composite root signature (8 SRVs, 1 UAV, 1 CBV) and PSO
+    if (!SetupRootSignature(InDevice, 8, 1, 1))
     {
         LOG_ERROR("[{0}] Failed to setup Composite root signature", _name);
         return;
@@ -267,11 +296,11 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
     if (!InitHeaps(InDevice, _frameHeapsComposite, NL_NUM_OF_HEAPS))
         return;
 
-    // 2. Setup GI root signature (5 SRVs, 1 UAV, 1 CBV) and PSO
+    // 2. Setup GI+SSR root signature (6 SRVs, 2 UAVs, 1 CBV) and PSO
     {
         CD3DX12_DESCRIPTOR_RANGE1 ranges[3] = {};
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0);
-        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6, 0);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0);
         ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
 
         CD3DX12_ROOT_PARAMETER1 rootParam {};
@@ -300,7 +329,7 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
         ScopedSkipHeapCapture skipHeapCapture {};
         for (int i = 0; i < NL_NUM_OF_HEAPS; ++i)
         {
-            if (!_frameHeapsGi[i].Initialize(InDevice, 5, 1, 1, 0))
+            if (!_frameHeapsGi[i].Initialize(InDevice, 6, 2, 1, 0))
             {
                 LOG_ERROR("[{0}] Failed to init GI descriptor heap", _name);
                 return;
