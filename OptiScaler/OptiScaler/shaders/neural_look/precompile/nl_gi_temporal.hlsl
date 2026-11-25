@@ -266,6 +266,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float3 viewDir = normalize(centerPos);
         float3 reflDir = normalize(reflect(viewDir, viewNormal));
 
+        float steepUp = smoothstep(0.35f, 0.90f, reflDir.y) * smoothstep(0.20f, 0.50f, viewNormal.y);
+        if (steepUp > 1e-3f)
+        {
+            float3 horizonRefl = normalize(float3(reflDir.x, 0.25f, max(reflDir.z, 0.85f)));
+            reflDir = normalize(lerp(reflDir, horizonRefl, steepUp * 0.78f));
+        }
+
         if (reflDir.z > -0.60f)
         {
             float ssrMaxDist = clamp(centerDepth * 2.4f, 8.0f, 75.0f);

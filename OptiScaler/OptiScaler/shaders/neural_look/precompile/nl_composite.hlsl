@@ -550,16 +550,16 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f)
     {
-        // Smooth, angle-consistent Fresnel curve across entire world, protected on 1px silhouette wires
-        float fresnelSsr = lerp(0.30f, 0.82f, pow(1.0f - NdotV, 2.0f));
-        float baseReflWeight = saturate(fresnelSsr * smoothness * SsrIntensity * 0.72f) * solidMask * (1.0f - haloRisk * 0.85f);
+        float fresnelSsr = lerp(0.44f, 0.78f, pow(1.0f - NdotV, 2.0f));
+        float baseReflWeight =
+            saturate(fresnelSsr * smoothness * SsrIntensity * 0.68f) * solidMask * (1.0f - haloRisk * 0.85f);
 
-        // Restrict fallback reflections strictly to upward-facing floors so vertical machinery/walls keep full 3D depth
-        float floorMask = smoothstep(0.35f, 0.75f, viewNormal.y);
-        float3 envFallback = lerp(litColor * 0.90f, giBounce * 1.45f + litColor * 0.45f, 0.55f);
+        // Keep floor sheen consistent from 0 deg horizontal to 60 deg pitched down; never darken vertical walls
+        float floorMask = smoothstep(0.20f, 0.50f, viewNormal.y);
+        float3 envFallback = giBounce * 1.15f + litColor * 0.32f;
         float hitAlpha = saturate(ssrSample.a);
         float3 reflColor = lerp(envFallback, ssrSample.rgb, hitAlpha);
-        float reflWeight = baseReflWeight * lerp(0.45f * floorMask, 1.0f, hitAlpha);
+        float reflWeight = baseReflWeight * lerp(0.82f * floorMask, 1.0f, hitAlpha);
         litColor = lerp(litColor, reflColor, reflWeight);
     }
 
