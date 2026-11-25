@@ -8254,8 +8254,8 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
             config->NeuralLookSsrIntensity = 0.45f;
             config->NeuralLookRelightIntensity = 0.35f;
             config->NeuralLookVolumetricGlow = 0.20f;
-            config->NeuralLookDetail = 0.45f;
-            config->NeuralLookSpecularRelief = 0.35f;
+            config->NeuralLookDetail = 0.35f;
+            config->NeuralLookSpecularRelief = 0.30f;
             config->NeuralLookToneContrast = 0.15f;
         }
         else if (preset == 1) // Balanced
@@ -8265,31 +8265,31 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
             config->NeuralLookSsrIntensity = 0.85f;
             config->NeuralLookRelightIntensity = 0.75f;
             config->NeuralLookVolumetricGlow = 0.45f;
-            config->NeuralLookDetail = 0.80f;
-            config->NeuralLookSpecularRelief = 0.70f;
+            config->NeuralLookDetail = 0.55f;
+            config->NeuralLookSpecularRelief = 0.50f;
             config->NeuralLookToneContrast = 0.32f;
         }
         else if (preset == 2) // Dramatic (DLSS 5)
         {
-            config->NeuralLookGiIntensity = 1.45f;
-            config->NeuralLookAoIntensity = 1.15f;
-            config->NeuralLookSsrIntensity = 1.30f;
-            config->NeuralLookRelightIntensity = 1.20f;
-            config->NeuralLookVolumetricGlow = 0.80f;
-            config->NeuralLookDetail = 1.15f;
-            config->NeuralLookSpecularRelief = 1.05f;
-            config->NeuralLookToneContrast = 0.48f;
+            config->NeuralLookGiIntensity = 1.50f;
+            config->NeuralLookAoIntensity = 1.20f;
+            config->NeuralLookSsrIntensity = 1.35f;
+            config->NeuralLookRelightIntensity = 1.25f;
+            config->NeuralLookVolumetricGlow = 0.85f;
+            config->NeuralLookDetail = 0.65f;
+            config->NeuralLookSpecularRelief = 0.60f;
+            config->NeuralLookToneContrast = 0.50f;
         }
         else // Ultra Cinematic
         {
-            config->NeuralLookGiIntensity = 1.85f;
-            config->NeuralLookAoIntensity = 1.40f;
-            config->NeuralLookSsrIntensity = 1.70f;
+            config->NeuralLookGiIntensity = 1.90f;
+            config->NeuralLookAoIntensity = 1.45f;
+            config->NeuralLookSsrIntensity = 1.75f;
             config->NeuralLookRelightIntensity = 1.60f;
             config->NeuralLookVolumetricGlow = 1.20f;
-            config->NeuralLookDetail = 1.40f;
-            config->NeuralLookSpecularRelief = 1.35f;
-            config->NeuralLookToneContrast = 0.65f;
+            config->NeuralLookDetail = 0.75f;
+            config->NeuralLookSpecularRelief = 0.70f;
+            config->NeuralLookToneContrast = 0.68f;
         }
     }
 

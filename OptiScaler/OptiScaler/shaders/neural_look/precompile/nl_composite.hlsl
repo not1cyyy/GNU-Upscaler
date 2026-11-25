@@ -201,11 +201,8 @@ void FusedDenoiseHalfRes(int2 halfCoord, float centerDepth, bool sampleSsr, bool
 {
     float invSigmaLog2 = 1.442695f / max(centerDepth * 0.045f, 0.02f);
 
-    static const int2 offsetsEven[5] = { int2(0, 0), int2(-2, -2), int2(2, -2), int2(-2, 2), int2(2, 2) };
-    static const int2 offsetsOdd[5]  = { int2(0, 0), int2(-2, 0),  int2(2, 0),  int2(0, -2), int2(0, 2) };
-    static const float weights[5]    = { 0.36f, 0.16f, 0.16f, 0.16f, 0.16f };
-
-    bool useOdd = ((FrameIndex & 1) != 0);
+    static const int2 offsets[5] = { int2(0, 0), int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+    static const float weights[5] = { 0.32f, 0.17f, 0.17f, 0.17f, 0.17f };
 
     float4 giAccum = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 ssrAccum = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -215,8 +212,7 @@ void FusedDenoiseHalfRes(int2 halfCoord, float centerDepth, bool sampleSsr, bool
     [unroll]
     for (int i = 0; i < 5; ++i)
     {
-        int2 off = useOdd ? offsetsOdd[i] : offsetsEven[i];
-        int2 tapGi = ClampGiCoord(halfCoord + off);
+        int2 tapGi = ClampGiCoord(halfCoord + offsets[i]);
         float4 giTap = GiTex.Load(int3(tapGi, 0));
 
         float w = weights[i];
@@ -448,10 +444,33 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float3 viewDir = normalize(viewPos);
     float NdotV = saturate(-dot(viewDir, viewNormal));
 
-    float lumaAvg = (lumaL + lumaR + lumaU + lumaD + Luma(cUL) + Luma(cUR) + Luma(cDL) + Luma(cDR)) * 0.125f;
+    float lumaUL = Luma(cUL);
+    float lumaUR = Luma(cUR);
+    float lumaDL = Luma(cDL);
+    float lumaDR = Luma(cDR);
+    float lumaAvg = (lumaL + lumaR + lumaU + lumaD + lumaUL + lumaUR + lumaDL + lumaDR) * 0.125f;
 
-    float2 microGrad = float2(lumaR - lumaL, lumaD - lumaU) / max(centerLuma + 0.12f, 0.12f);
-    float3 microNormal = normalize(viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (1.85f * (1.0f - haloRisk) * skyMask));
+    // Perceptual sqrt(luma) space stabilizes dark fabrics identically across Linear HDR, sRGB, and PQ
+    float pC  = sqrt(max(centerLuma, 0.0f));
+    float pL  = sqrt(max(lumaL, 0.0f));
+    float pR  = sqrt(max(lumaR, 0.0f));
+    float pU  = sqrt(max(lumaU, 0.0f));
+    float pD  = sqrt(max(lumaD, 0.0f));
+    float pUL = sqrt(max(lumaUL, 0.0f));
+    float pUR = sqrt(max(lumaUR, 0.0f));
+    float pDL = sqrt(max(lumaDL, 0.0f));
+    float pDR = sqrt(max(lumaDR, 0.0f));
+    float pAvg = (pL + pR + pU + pD + pUL + pUR + pDL + pDR) * 0.125f;
+    float pVar = (abs(pL - pAvg) + abs(pR - pAvg) + abs(pU - pAvg) + abs(pD - pAvg)) * 0.25f;
+
+    // Detect 1px high-frequency mesh / lace / hair grids (alternating center vs both opposite neighbors)
+    float meshH = abs(2.0f * pC - pL - pR);
+    float meshV = abs(2.0f * pC - pU - pD);
+    float meshEnergy = max(meshH, meshV) + pVar * 1.5f;
+    float meshGuard = rcp(1.0f + meshEnergy * meshEnergy * 32.0f);
+
+    float2 microGrad = clamp(float2(pR - pL, pD - pU) / max(pC + 0.18f, 0.18f), -0.85f, 0.85f);
+    float3 microNormal = normalize(viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (0.55f * meshGuard * (1.0f - haloRisk) * skyMask));
 
     // Fused 5-tap denoised GI, SSR, and Volumetric Glow
     float3 giBounce = float3(0.0f, 0.0f, 0.0f);
@@ -505,10 +524,11 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     if (RelightIntensity > 1e-4f)
     {
         float3 keyDir = float3(0.45f, 0.78f, -0.43f);
-        float deltaBump = (dot(microNormal, keyDir) - dot(viewNormal, keyDir)) * 0.95f;
-        float hemiTerm = viewNormal.y * 0.16f;
+        float deltaBump = (dot(microNormal, keyDir) - dot(viewNormal, keyDir)) * 0.65f;
+        float macroKey = (dot(viewNormal, keyDir) - 0.18f) * 0.14f;
+        float hemiTerm = viewNormal.y * 0.18f;
 
-        float sculpt = (deltaBump + hemiTerm) * RelightIntensity * skyMask * (1.0f - haloRisk * 0.8f);
+        float sculpt = (deltaBump + macroKey + hemiTerm) * RelightIntensity * skyMask * (1.0f - haloRisk * 0.8f);
         float3 sculptTint = (sculpt >= 0.0f) ? float3(1.04f, 1.01f, 0.96f) : float3(0.90f, 0.95f, 1.06f);
         litColor *= max(1.0f + sculpt * sculptTint, 0.25f);
 
@@ -518,11 +538,11 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     if (SpecularRelief > 1e-4f)
     {
-        float microMag = length(microGrad);
+        float microMag = length(microGrad) * meshGuard;
         float grazing = pow(1.0f - NdotV, 2.5f);
-        float specSignal = (0.35f * grazing + 0.65f * saturate(microMag * 1.8f)) - 0.12f;
-        float specMod = SpecularRelief * skyMask * (1.0f - haloRisk) * smoothness * specSignal * 0.32f;
-        litColor *= max(1.0f + specMod, 0.65f);
+        float specSignal = (0.68f * grazing + 0.32f * saturate(microMag * 1.35f)) - 0.14f;
+        float specMod = SpecularRelief * skyMask * (1.0f - haloRisk) * smoothness * specSignal * 0.26f;
+        litColor *= max(1.0f + specMod, 0.68f);
     }
 
     if (GiEnabled > 0 && VolumetricGlow > 1e-4f)
@@ -535,12 +555,11 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     if (NeuralDetail > 1e-4f || DebugView == 4)
     {
-        float highPass = (centerLuma - lumaAvg) / max(lumaAvg + 0.10f, 0.10f);
-        float variance = (abs(lumaL - lumaAvg) + abs(lumaR - lumaAvg) + abs(lumaU - lumaAvg) + abs(lumaD - lumaAvg)) * 0.25f;
+        float highPass = (pC - pAvg) / max(pAvg + 0.16f, 0.16f);
 
         half_f f0 = half_f(saturate(log2(1.0f + centerLuma) * 0.45f) * 2.0f - 1.0f);
-        half_f f1 = half_f(clamp(highPass * 3.5f, -1.0f, 1.0f));
-        half_f f2 = half_f(saturate((variance / max(lumaAvg + 0.08f, 0.08f)) * 4.5f) * 2.0f - 1.0f);
+        half_f f1 = half_f(clamp(highPass * 2.8f, -1.0f, 1.0f));
+        half_f f2 = half_f(saturate((pVar / max(pAvg + 0.14f, 0.14f)) * 4.0f) * 2.0f - 1.0f);
         half_f f3 = half_f(saturate(log2(1.0f + centerDepth) * 0.125f) * 2.0f - 1.0f);
         half_f f4 = half_f(saturate(abs(microNormal.z)) * 2.0f - 1.0f);
         half_f f5 = half_f(saturate(Luma(giBounce) * 2.2f) * 2.0f - 1.0f);
@@ -551,10 +570,11 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float2 mv = MotionTex.Load(int3(ClampMotionCoord(mvCoord), 0)).rg * float2(MvScaleX, MvScaleY);
         float motionDamp = rcp(1.0f + length(mv) * 0.06f);
 
-        float detailGate = skyMask * (1.0f - haloRisk) * motionDamp * NeuralDetail;
-        detailDelta = (neuralOut.x * 0.45f + clamp(highPass, -0.5f, 0.5f) * 0.55f) * detailGate * 0.48f;
-        lightDelta = neuralOut.y * skyMask * (1.0f - haloRisk) * NeuralDetail * 0.14f;
-        chromaPop = neuralOut.z * skyMask * NeuralDetail * 0.26f;
+        float rcasDamp = lerp(1.0f, 0.35f, saturate(FusedRcasSharpness));
+        float detailGate = skyMask * (1.0f - haloRisk) * motionDamp * meshGuard * NeuralDetail;
+        detailDelta = (neuralOut.x * 0.55f + clamp(highPass, -0.35f, 0.35f) * 0.45f * rcasDamp) * detailGate * 0.30f;
+        lightDelta = neuralOut.y * skyMask * (1.0f - haloRisk) * NeuralDetail * 0.12f;
+        chromaPop = neuralOut.z * skyMask * NeuralDetail * 0.24f;
 
         float lumaScale = max(1.0f + detailDelta + lightDelta, 0.35f);
         finalColor = litColor * lumaScale;
@@ -568,12 +588,13 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     {
         float l = max(Luma(finalColor), 1e-5f);
         float cStr = clamp(ToneContrast, 0.0f, 1.0f);
-        float pivot = max(lumaAvg, 0.08f);
-        float ratio = l / pivot;
-        float contrasted = pow(max(ratio, 1e-4f), 1.0f + cStr * 0.26f) * pivot;
-        float shoulder = l / (1.0f + max(l - 1.0f, 0.0f) * cStr * 0.18f);
-        float targetL = lerp(contrasted, min(contrasted, shoulder), saturate(l * 0.5f));
-        finalColor *= (targetL / l);
+        float midGray = 0.18f;
+        float logRatio = log2(max(l / midGray, 1e-4f));
+        float slope = 1.0f + cStr * 0.24f;
+        float contrasted = midGray * exp2(clamp(logRatio * slope, -10.0f, 6.0f));
+        float shoulder = l / (1.0f + max(l - 0.85f, 0.0f) * cStr * 0.20f);
+        float targetL = lerp(contrasted, min(contrasted, shoulder), smoothstep(0.45f, 1.5f, l));
+        finalColor *= clamp(targetL / l, 0.45f, 1.65f);
     }
 
     // Fused 5-tap AMD RCAS sharpening using groupshared neighborhood (eliminates separate RCAS pass)
@@ -585,7 +606,8 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         maxL = max(maxL, centerLuma);
         float hitMin = minL / max(4.0f * maxL, 1e-5f);
         float hitMax = (1.0f - saturate(maxL)) / min(4.0f * minL - 4.0f, -1e-5f);
-        float w = clamp(max(-0.1875f, min(hitMin, hitMax)) * saturate(FusedRcasSharpness), -0.1875f, 0.0f);
+        float rcasStrength = saturate(FusedRcasSharpness) * lerp(0.45f, 1.0f, meshGuard);
+        float w = clamp(max(-0.1875f, min(hitMin, hitMax)) * rcasStrength, -0.1875f, 0.0f);
         float rcasLuma = (centerLuma + w * (lumaU + lumaL + lumaR + lumaD)) * rcp(1.0f + 4.0f * w);
         float rcasRatio = clamp(rcasLuma / max(centerLuma, 1e-5f), 0.5f, 2.0f);
         finalColor *= rcasRatio;

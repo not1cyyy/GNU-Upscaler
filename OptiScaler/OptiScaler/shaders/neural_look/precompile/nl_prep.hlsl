@@ -163,7 +163,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float2 uv = (float2(halfCoord) + 0.5f) / float2(HalfWidth, HalfHeight);
     int2 outCoord = ClampOutputCoord(int2(uv * float2(OutputWidth, OutputHeight)));
 
-    float3 linColor = ToLinearColor(SourceColor.Load(int3(outCoord, 0)).rgb);
+    int2 baseOut = halfCoord * 2;
+    float3 c00 = ToLinearColor(SourceColor.Load(int3(ClampOutputCoord(baseOut), 0)).rgb);
+    float3 c10 = ToLinearColor(SourceColor.Load(int3(ClampOutputCoord(baseOut + int2(1, 0)), 0)).rgb);
+    float3 c01 = ToLinearColor(SourceColor.Load(int3(ClampOutputCoord(baseOut + int2(0, 1)), 0)).rgb);
+    float3 c11 = ToLinearColor(SourceColor.Load(int3(ClampOutputCoord(baseOut + int2(1, 1)), 0)).rgb);
+    float3 linColor = (c00 + c10 + c01 + c11) * 0.25f;
     float luma = Luma(linColor);
     linColor *= min(luma, 6.0f) / max(luma, 1e-4f);
 

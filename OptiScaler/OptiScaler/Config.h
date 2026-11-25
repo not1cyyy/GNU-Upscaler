@@ -388,8 +388,8 @@ class Config
     CustomOptional<float> NeuralLookSsrIntensity { 0.85f };
     CustomOptional<float> NeuralLookRelightIntensity { 0.75f };
     CustomOptional<float> NeuralLookVolumetricGlow { 0.45f };
-    CustomOptional<float> NeuralLookDetail { 0.80f };
-    CustomOptional<float> NeuralLookSpecularRelief { 0.70f };
+    CustomOptional<float> NeuralLookDetail { 0.55f };
+    CustomOptional<float> NeuralLookSpecularRelief { 0.50f };
     CustomOptional<float> NeuralLookToneContrast { 0.32f };
     CustomOptional<float> NeuralLookMaxGpuMs { 1.80f };
     CustomOptional<float> NeuralLookSplitScreen { 0.0f };

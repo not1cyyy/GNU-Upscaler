@@ -141,11 +141,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     int2 outCoord = int2(uv * float2(OutputWidth, OutputHeight));
     int2 mvCoord = DisplaySizeMV > 0 ? outCoord : int2((float2(outCoord) + 0.5f) * MotionTextureScale);
     float2 mv = MotionTex.Load(int3(ClampMotionCoord(mvCoord), 0)).rg * float2(MvScaleX, MvScaleY);
+    float mvMag = length(mv);
     float2 prevUv = uv + mv / float2(OutputWidth, OutputHeight);
     bool validHistory = (ResetHistory == 0 && FrameIndex > 3 && all(prevUv >= 0.002f) && all(prevUv <= 0.998f));
 
     // Checkerboard temporal raymarching: trace 50% of half-res pixels per frame, reuse reprojected history on the rest
-    bool traceThisFrame = (((giCoord.x ^ giCoord.y) & 1) == (FrameIndex & 1)) || !validHistory;
+    bool traceThisFrame = (((giCoord.x ^ giCoord.y) & 1) == (FrameIndex & 1)) || !validHistory || (mvMag > 6.0f);
     if (!traceThisFrame)
     {
         OutGiTex[giCoord] = PrevGiTex.SampleLevel(LinearClampGi, prevUv, 0.0f);
@@ -337,14 +338,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     if (validHistory)
     {
-        float mvMag = length(mv);
-        float baseAlpha = lerp(0.18f, 0.55f, saturate(mvMag / 16.0f));
+        float baseAlpha = lerp(0.14f, 0.45f, saturate(mvMag / 16.0f));
 
         float4 prevGi = PrevGiTex.SampleLevel(LinearClampGi, prevUv, 0.0f);
         float aoDiff = abs(prevGi.a - currentAo);
         float3 giDiff = abs(prevGi.rgb - currentGi);
         float giMaxDiff = max(giDiff.r, max(giDiff.g, giDiff.b));
-        float giAlpha = max(baseAlpha, max(saturate(aoDiff * 1.4f), saturate(giMaxDiff * 0.65f)));
+        float giAlpha = max(baseAlpha, min(0.65f, max(saturate(aoDiff * 1.15f), saturate(giMaxDiff * 0.50f))));
         giResult = lerp(prevGi, giResult, saturate(giAlpha));
 
         if (SsrEnabled > 0)
@@ -352,7 +352,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             float4 prevSsr = PrevSsrTex.SampleLevel(LinearClampSsr, prevUv, 0.0f);
             float3 ssrDiff = abs(prevSsr.rgb - currentSsr.rgb);
             float ssrMaxDiff = max(ssrDiff.r, max(ssrDiff.g, ssrDiff.b));
-            float ssrAlpha = max(lerp(0.22f, 0.65f, saturate(mvMag / 12.0f)), saturate(ssrMaxDiff * 0.55f));
+            float ssrAlpha = max(lerp(0.18f, 0.55f, saturate(mvMag / 12.0f)), min(0.70f, saturate(ssrMaxDiff * 0.45f)));
             ssrResult = lerp(prevSsr, currentSsr, saturate(ssrAlpha));
         }
     }
