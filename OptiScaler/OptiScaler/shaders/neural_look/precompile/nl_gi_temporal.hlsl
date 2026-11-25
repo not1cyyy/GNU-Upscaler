@@ -119,6 +119,14 @@ float InterleavedGradientNoise(float2 p)
     return frac(magic.z * frac(dot(p, magic.xy)));
 }
 
+void DecodeHalfNormal(float2 raw, out float3 viewNormal, out float ditherMask)
+{
+    float dQ = clamp(floor((raw.x + 2.0f) * 0.25f), 0.0f, 15.0f);
+    float2 nxy = float2(clamp(raw.x - dQ * 4.0f, -1.0f, 1.0f), clamp(raw.y, -1.0f, 1.0f));
+    viewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
+    ditherMask = dQ * (1.0f / 15.0f);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
@@ -132,6 +140,17 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float centerDepth = centerCd.a;
 
     if (centerDepth >= 64000.0f || centerDepth >= SkyDepthThreshold)
+    {
+        OutGiTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        OutSsrTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    float3 viewNormal;
+    float ditherMask;
+    DecodeHalfNormal(HalfNormalTex.Load(int3(giCoord, 0)).xy, viewNormal, ditherMask);
+
+    if (ditherMask > 0.20f)
     {
         OutGiTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
         OutSsrTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -155,8 +174,6 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         return;
     }
 
-    float2 nxy = HalfNormalTex.Load(int3(giCoord, 0)).xy;
-    float3 viewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
     float3 centerPos = ReconstructViewPos(uv, centerDepth);
 
     float noiseA = InterleavedGradientNoise(

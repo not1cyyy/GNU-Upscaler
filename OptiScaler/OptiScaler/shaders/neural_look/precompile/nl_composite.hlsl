@@ -195,9 +195,23 @@ float3 ReconstructViewPos(float2 uv, float linearDepth)
     return float3(ndc.x * TanHalfFovAspect * linearDepth, ndc.y * TanHalfFov * linearDepth, linearDepth);
 }
 
+float DecodeDitherFromRawX(float rawX)
+{
+    float dQ = clamp(floor((rawX + 2.0f) * 0.25f), 0.0f, 15.0f);
+    return dQ * (1.0f / 15.0f);
+}
+
+void DecodeHalfNormal(float2 raw, out float3 viewNormal, out float ditherMask)
+{
+    float dQ = clamp(floor((raw.x + 2.0f) * 0.25f), 0.0f, 15.0f);
+    float2 nxy = float2(clamp(raw.x - dQ * 4.0f, -1.0f, 1.0f), clamp(raw.y, -1.0f, 1.0f));
+    viewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
+    ditherMask = dQ * (1.0f / 15.0f);
+}
+
 // Fused 5-tap depth-guided bilateral filter reading pre-linearized HalfColorDepthTex.a (zero LinearizeDepth!)
-void FusedDenoiseHalfRes(int2 halfCoord, float centerDepth, bool sampleSsr, bool sampleGlow, out float4 outGi,
-                         out float4 outSsr, out float3 outGlow)
+void FusedDenoiseHalfRes(int2 halfCoord, float centerDepth, float centerDither, bool sampleSsr, bool sampleGlow,
+                         out float4 outGi, out float4 outSsr, out float3 outGlow, out float outDither)
 {
     float invSigmaLog2 = 1.442695f / max(centerDepth * 0.045f, 0.02f);
 
@@ -208,6 +222,8 @@ void FusedDenoiseHalfRes(int2 halfCoord, float centerDepth, bool sampleSsr, bool
     float4 ssrAccum = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float3 glowAccum = float3(0.0f, 0.0f, 0.0f);
     float wSum = 0.0f;
+    float maxNeighborDither = 0.0f;
+    float sumNeighborDither = 0.0f;
 
     [unroll]
     for (int i = 0; i < 5; ++i)
@@ -220,6 +236,10 @@ void FusedDenoiseHalfRes(int2 halfCoord, float centerDepth, bool sampleSsr, bool
         {
             float tapDepth = HalfColorDepthTex.Load(int3(tapGi, 0)).a;
             w *= exp2(-abs(centerDepth - tapDepth) * invSigmaLog2);
+
+            float tapDither = DecodeDitherFromRawX(HalfNormalTex.Load(int3(tapGi, 0)).x);
+            maxNeighborDither = max(maxNeighborDither, tapDither);
+            sumNeighborDither += tapDither;
         }
         w += 1e-5f;
 
@@ -246,6 +266,7 @@ void FusedDenoiseHalfRes(int2 halfCoord, float centerDepth, bool sampleSsr, bool
     outGi = giAccum * invWSum;
     outSsr = sampleSsr ? (ssrAccum * invWSum) : float4(0.0f, 0.0f, 0.0f, 0.0f);
     outGlow = sampleGlow ? (glowAccum * 0.25f) : float3(0.0f, 0.0f, 0.0f);
+    outDither = saturate(max(centerDither, maxNeighborDither * 0.70f + sumNeighborDither * 0.075f));
 }
 
 #ifdef VK_MODE
@@ -436,9 +457,10 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     int2 halfCoord = ClampGiCoord(int2((float2(outCoord) + 0.5f) * outToGi));
 
-    // Single-fetch view normal from HalfNormalTex (replaces 5 DepthTex.Load + 5 LinearizeDepth + cross)
-    float2 nxy = HalfNormalTex.Load(int3(halfCoord, 0)).xy;
-    float3 viewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
+    // Single-fetch view normal + packed DitherTemporalAA flag from HalfNormalTex
+    float3 viewNormal;
+    float centerDither;
+    DecodeHalfNormal(HalfNormalTex.Load(int3(halfCoord, 0)).xy, viewNormal, centerDither);
 
     float3 viewPos = ReconstructViewPos(uv, centerDepth);
     float3 viewDir = normalize(viewPos);
@@ -470,23 +492,42 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float meshGuard = rcp(1.0f + meshEnergy * meshEnergy * 32.0f);
 
     float2 microGrad = clamp(float2(pR - pL, pD - pU) / max(pC + 0.18f, 0.18f), -0.85f, 0.85f);
-    float3 microNormal = normalize(viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (0.55f * meshGuard * (1.0f - haloRisk) * skyMask));
 
-    // Fused 5-tap denoised GI, SSR, and Volumetric Glow
+    // Fused 5-tap denoised GI, SSR, Volumetric Glow, and dilated DitherTemporalAA mask
     float3 giBounce = float3(0.0f, 0.0f, 0.0f);
     float contactAo = 1.0f;
     float4 ssrSample = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float3 brightGlow = float3(0.0f, 0.0f, 0.0f);
+    float ditherSoft = centerDither;
 
     if (GiEnabled > 0)
     {
         float4 giSample;
         bool needSsr = (SsrEnabled > 0 && SsrIntensity > 1e-4f) || (DebugView == 5);
         bool needGlow = (VolumetricGlow > 1e-4f);
-        FusedDenoiseHalfRes(halfCoord, centerDepth, needSsr, needGlow, giSample, ssrSample, brightGlow);
+        FusedDenoiseHalfRes(halfCoord, centerDepth, centerDither, needSsr, needGlow, giSample, ssrSample, brightGlow,
+                            ditherSoft);
         giBounce = max(giSample.rgb, 0.0f);
-        contactAo = lerp(1.0f, saturate(giSample.a), saturate(AoIntensity) * skyMask);
+        contactAo = lerp(1.0f, saturate(giSample.a), saturate(AoIntensity) * skyMask * (1.0f - ditherSoft));
     }
+    else
+    {
+        static const int2 dOffsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+        float maxNeighborDither = 0.0f;
+        float sumNeighborDither = 0.0f;
+        [unroll]
+        for (int i = 0; i < 4; ++i)
+        {
+            float tapD = DecodeDitherFromRawX(HalfNormalTex.Load(int3(ClampGiCoord(halfCoord + dOffsets[i]), 0)).x);
+            maxNeighborDither = max(maxNeighborDither, tapD);
+            sumNeighborDither += tapD;
+        }
+        ditherSoft = saturate(max(centerDither, maxNeighborDither * 0.70f + sumNeighborDither * 0.075f));
+    }
+
+    float solidMask = skyMask * (1.0f - ditherSoft);
+    float3 microNormal = normalize(
+        viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (0.55f * meshGuard * (1.0f - haloRisk) * solidMask));
 
     float3 albedoApprox = saturate(centerColor / max(centerLuma, 0.06f)) * saturate(centerLuma * 1.4f);
     if (HasGBufferAlbedo > 0)
@@ -496,7 +537,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     if (GiEnabled > 0)
     {
-        float ambientDelight = lerp(1.0f, 0.84f, saturate(GiIntensity * 0.45f) * skyMask);
+        float ambientDelight = lerp(1.0f, 0.84f, saturate(GiIntensity * 0.45f) * solidMask);
         float aoProtect = rcp(1.0f + centerLuma * 0.85f);
         float3 coloredAo = lerp(float3(1.0f, 1.0f, 1.0f),
                                 float3(MultiBounceAO(half_f(contactAo), half_f3(albedoApprox))), aoProtect);
@@ -504,45 +545,56 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         litColor = litColor * coloredAo * ambientDelight;
 
         float shadowFocus = rcp(1.0f + centerLuma * 1.35f);
-        litColor += giBounce * albedoApprox * (GiIntensity * (0.65f + 0.75f * shadowFocus)) * skyMask;
+        litColor += giBounce * albedoApprox * (GiIntensity * (0.65f + 0.75f * shadowFocus)) * solidMask;
     }
 
-    float smoothness = saturate(0.28f + saturate(centerLuma * 0.55f) * 0.35f);
+    float smoothness;
     if (HasGBufferRoughness > 0)
     {
         float rough = saturate(GBufferRoughnessTex.Load(int3(outCoord, 0)).r);
         smoothness = saturate(1.0f - rough);
     }
+    else
+    {
+        // Estimate dielectric smoothness from local micro-roughness (gritty concrete = rough; metal/wet = glossy)
+        float texRough = saturate(pVar * 10.0f + length(microGrad) * 0.55f);
+        smoothness = saturate(0.36f * (1.0f - texRough * 0.85f));
+    }
 
     if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && ssrSample.a > 1e-3f)
     {
-        float fresnelSsr = 0.04f + 0.96f * pow(1.0f - NdotV, 4.0f);
-        float reflWeight = saturate(ssrSample.a * fresnelSsr * smoothness * SsrIntensity * 0.85f) * skyMask;
-        litColor = lerp(litColor, ssrSample.rgb, reflWeight);
+        float f0 = 0.04f;
+        float maxFresnel = max(smoothness * smoothness, f0);
+        float fresnelSsr = f0 + (maxFresnel - f0) * pow(1.0f - NdotV, 5.0f);
+        float maxReflCap = (HasGBufferRoughness > 0) ? 0.85f : 0.28f;
+        float reflWeight = min(ssrSample.a * fresnelSsr * SsrIntensity * 1.15f, maxReflCap) * solidMask;
+        float3 safeRefl = (HasGBufferRoughness > 0) ? ssrSample.rgb : max(ssrSample.rgb, litColor * 0.72f);
+        litColor = lerp(litColor, safeRefl, reflWeight);
     }
 
     if (RelightIntensity > 1e-4f)
     {
         float3 keyDir = float3(0.45f, 0.78f, -0.43f);
         float deltaBump = (dot(microNormal, keyDir) - dot(viewNormal, keyDir)) * 0.65f;
-        float macroKey = (dot(viewNormal, keyDir) - 0.18f) * 0.14f;
-        float hemiTerm = viewNormal.y * 0.18f;
+        float macroKey = (dot(viewNormal, keyDir) - 0.18f) * 0.05f;
+        float hemiTerm = viewNormal.y * 0.08f;
 
-        float sculpt = (deltaBump + macroKey + hemiTerm) * RelightIntensity * skyMask * (1.0f - haloRisk * 0.8f);
+        float sculpt = (deltaBump + macroKey + hemiTerm) * RelightIntensity * solidMask * (1.0f - haloRisk * 0.8f);
         float3 sculptTint = (sculpt >= 0.0f) ? float3(1.04f, 1.01f, 0.96f) : float3(0.90f, 0.95f, 1.06f);
         litColor *= max(1.0f + sculpt * sculptTint, 0.25f);
 
-        float rim = pow(1.0f - NdotV, 3.5f) * RelightIntensity * skyMask * 0.22f;
+        float verticalMask = smoothstep(0.08f, 0.45f, 1.0f - abs(viewNormal.y));
+        float rim = pow(1.0f - NdotV, 3.5f) * verticalMask * RelightIntensity * solidMask * 0.18f;
         litColor += litColor * rim * saturate(Luma(giBounce) * 1.5f + 0.35f);
     }
 
     if (SpecularRelief > 1e-4f)
     {
         float microMag = length(microGrad) * meshGuard;
-        float grazing = pow(1.0f - NdotV, 2.5f);
-        float specSignal = (0.68f * grazing + 0.32f * saturate(microMag * 1.35f)) - 0.14f;
-        float specMod = SpecularRelief * skyMask * (1.0f - haloRisk) * smoothness * specSignal * 0.26f;
-        litColor *= max(1.0f + specMod, 0.68f);
+        float grazing = pow(1.0f - NdotV, 3.0f) * smoothness;
+        float specSignal = 0.55f * grazing + 0.45f * saturate(microMag * 1.25f) * smoothness;
+        float specMod = SpecularRelief * solidMask * (1.0f - haloRisk) * specSignal * 0.28f;
+        litColor *= (1.0f + specMod);
     }
 
     if (GiEnabled > 0 && VolumetricGlow > 1e-4f)
@@ -571,10 +623,10 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float motionDamp = rcp(1.0f + length(mv) * 0.06f);
 
         float rcasDamp = lerp(1.0f, 0.35f, saturate(FusedRcasSharpness));
-        float detailGate = skyMask * (1.0f - haloRisk) * motionDamp * meshGuard * NeuralDetail;
+        float detailGate = solidMask * (1.0f - haloRisk) * motionDamp * meshGuard * NeuralDetail;
         detailDelta = (neuralOut.x * 0.55f + clamp(highPass, -0.35f, 0.35f) * 0.45f * rcasDamp) * detailGate * 0.30f;
-        lightDelta = neuralOut.y * skyMask * (1.0f - haloRisk) * NeuralDetail * 0.12f;
-        chromaPop = neuralOut.z * skyMask * NeuralDetail * 0.24f;
+        lightDelta = neuralOut.y * solidMask * (1.0f - haloRisk) * NeuralDetail * 0.12f;
+        chromaPop = neuralOut.z * solidMask * NeuralDetail * 0.24f;
 
         float lumaScale = max(1.0f + detailDelta + lightDelta, 0.35f);
         finalColor = litColor * lumaScale;
@@ -606,7 +658,8 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         maxL = max(maxL, centerLuma);
         float hitMin = minL / max(4.0f * maxL, 1e-5f);
         float hitMax = (1.0f - saturate(maxL)) / min(4.0f * minL - 4.0f, -1e-5f);
-        float rcasStrength = saturate(FusedRcasSharpness) * lerp(0.45f, 1.0f, meshGuard);
+        float rcasStrength = saturate(FusedRcasSharpness) * lerp(0.45f, 1.0f, meshGuard) *
+                             lerp(0.50f, 1.0f, 1.0f - ditherSoft);
         float w = clamp(max(-0.1875f, min(hitMin, hitMax)) * rcasStrength, -0.1875f, 0.0f);
         float rcasLuma = (centerLuma + w * (lumaU + lumaL + lumaR + lumaD)) * rcp(1.0f + 4.0f * w);
         float rcasRatio = clamp(rcasLuma / max(centerLuma, 1e-5f), 0.5f, 2.0f);

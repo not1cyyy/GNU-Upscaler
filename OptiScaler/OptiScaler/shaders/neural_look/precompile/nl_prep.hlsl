@@ -122,16 +122,18 @@ float3 ReconstructViewPos(float2 uv, float linearDepth)
     return float3(ndc.x * TanHalfFovAspect * linearDepth, ndc.y * TanHalfFov * linearDepth, linearDepth);
 }
 
-float3 ReconstructViewNormalFromDepthTexel(float2 uv, float dC)
+float LoadLinearDepth(int2 coord)
 {
-    int2 dCoord = ClampDepthCoord(int2(uv * float2(DepthWidth, DepthHeight)));
+    float rawDepth = DepthTex.Load(int3(ClampDepthCoord(coord), 0)).r;
+    bool rawSky = (DepthIsReversed > 0 && rawDepth <= 1e-6f) || (DepthIsReversed == 0 && rawDepth >= 0.99999f);
+    float linDepth = rawSky ? 65000.0f : LinearizeDepth(rawDepth);
+    return (linDepth >= SkyDepthThreshold) ? 65000.0f : linDepth;
+}
+
+float3 ReconstructViewNormalFromDepths(int2 dCoord, float dC, float dL, float dR, float dU, float dD)
+{
     float2 dUv = (float2(dCoord) + 0.5f) / float2(DepthWidth, DepthHeight);
     float2 invDepth = 1.0f / float2(DepthWidth, DepthHeight);
-
-    float dL = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(-1, 0)), 0)).r);
-    float dR = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(1, 0)), 0)).r);
-    float dU = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(0, -1)), 0)).r);
-    float dD = LinearizeDepth(DepthTex.Load(int3(ClampDepthCoord(dCoord + int2(0, 1)), 0)).r);
 
     float3 pC = ReconstructViewPos(dUv, dC);
     float3 pL = ReconstructViewPos(dUv + float2(-invDepth.x, 0.0f), dL);
@@ -173,22 +175,63 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     linColor *= min(luma, 6.0f) / max(luma, 1e-4f);
 
     int2 dCoord = ClampDepthCoord(int2(uv * float2(DepthWidth, DepthHeight)));
-    float rawDepth = DepthTex.Load(int3(dCoord, 0)).r;
+    float dC  = LoadLinearDepth(dCoord);
+    float dL  = LoadLinearDepth(dCoord + int2(-1, 0));
+    float dR  = LoadLinearDepth(dCoord + int2(1, 0));
+    float dU  = LoadLinearDepth(dCoord + int2(0, -1));
+    float dD  = LoadLinearDepth(dCoord + int2(0, 1));
+    float dUL = LoadLinearDepth(dCoord + int2(-1, -1));
+    float dUR = LoadLinearDepth(dCoord + int2(1, -1));
+    float dDL = LoadLinearDepth(dCoord + int2(-1, 1));
+    float dDR = LoadLinearDepth(dCoord + int2(1, 1));
 
-    bool rawSky = (DepthIsReversed > 0 && rawDepth <= 1e-6f) || (DepthIsReversed == 0 && rawDepth >= 0.99999f);
-    float linDepth = rawSky ? 65000.0f : LinearizeDepth(rawDepth);
-    if (linDepth >= SkyDepthThreshold)
-        linDepth = 65000.0f;
+    float minD = min(dC, min(min(min(dL, dR), min(dU, dD)), min(min(dUL, dUR), min(dDL, dDR))));
+    float maxD = max(dC, max(max(max(dL, dR), max(dU, dD)), max(max(dUL, dUR), max(dDL, dDR))));
 
-    OutHalfColorDepth[halfCoord] = float4(linColor, min(linDepth, 65000.0f));
+    if (minD >= 64000.0f)
+    {
+        OutHalfColorDepth[halfCoord] = float4(linColor, 65000.0f);
+        OutHalfNormal[halfCoord] = float2(0.0f, 0.0f);
+        return;
+    }
 
-    if (linDepth >= 64000.0f)
+    // Detect UE4 DitherTemporalAA depth stippling without triggering on smooth slopes or solid silhouettes
+    float ditherMask = 0.0f;
+    float relRange = (maxD - minD) / max(minD, 0.05f);
+    if (relRange > 0.045f)
+    {
+        float midD = 0.5f * (minD + maxD);
+        int bC  = (dC  > midD) ? 1 : 0;
+        int bL  = (dL  > midD) ? 1 : 0;
+        int bR  = (dR  > midD) ? 1 : 0;
+        int bU  = (dU  > midD) ? 1 : 0;
+        int bD  = (dD  > midD) ? 1 : 0;
+        int bUL = (dUL > midD) ? 1 : 0;
+        int bUR = (dUR > midD) ? 1 : 0;
+        int bDL = (dDL > midD) ? 1 : 0;
+        int bDR = (dDR > midD) ? 1 : 0;
+
+        int ringTransitions = (bUL != bU ? 1 : 0) + (bU != bUR ? 1 : 0) + (bUR != bR ? 1 : 0) + (bR != bDR ? 1 : 0) +
+                              (bDR != bD ? 1 : 0) + (bD != bDL ? 1 : 0) + (bDL != bL ? 1 : 0) + (bL != bUL ? 1 : 0);
+        bool centerSpike = (bC != bU && bC != bD) || (bC != bL && bC != bR) || (bC != bUL && bC != bDR) ||
+                           (bC != bUR && bC != bDL);
+        int nearCount = (1 - bC) + (1 - bL) + (1 - bR) + (1 - bU) + (1 - bD) + (1 - bUL) + (1 - bUR) + (1 - bDL) +
+                        (1 - bDR);
+
+        if ((ringTransitions >= 4) || centerSpike || (nearCount == 1) || (nearCount == 8))
+            ditherMask = smoothstep(0.045f, 0.14f, relRange);
+    }
+
+    float outDepth = (ditherMask > 0.20f) ? minD : dC;
+    OutHalfColorDepth[halfCoord] = float4(linColor, min(outDepth, 65000.0f));
+
+    if (outDepth >= 64000.0f)
     {
         OutHalfNormal[halfCoord] = float2(0.0f, 0.0f);
         return;
     }
 
-    float3 viewNormal = ReconstructViewNormalFromDepthTexel(uv, linDepth);
+    float3 viewNormal = ReconstructViewNormalFromDepths(dCoord, dC, dL, dR, dU, dD);
     if (HasGBufferNormals > 0)
     {
         float3 gN = GBufferNormalsTex.Load(int3(outCoord, 0)).xyz;
@@ -203,5 +246,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
     }
 
-    OutHalfNormal[halfCoord] = viewNormal.xy;
+    if (ditherMask > 0.0f)
+        viewNormal = normalize(lerp(viewNormal, float3(0.0f, 0.0f, -1.0f), ditherMask * 0.85f));
+
+    // Losslessly pack 4-bit quantized ditherMask into OutHalfNormal.x (read only via .Load())
+    float dQ = round(saturate(ditherMask) * 15.0f);
+    OutHalfNormal[halfCoord] = float2(viewNormal.x + dQ * 4.0f, viewNormal.y);
 }
