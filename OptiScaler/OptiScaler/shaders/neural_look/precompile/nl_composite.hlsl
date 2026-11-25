@@ -262,11 +262,21 @@ void FusedDenoiseHalfRes(int2 halfCoord, float centerDepth, float centerDither, 
         }
     }
 
+    static const int2 diagOffsets[4] = { int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1) };
+    [unroll]
+    for (int d = 0; d < 4; ++d)
+    {
+        float tapD = DecodeDitherFromRawX(HalfNormalTex.Load(int3(ClampGiCoord(halfCoord + diagOffsets[d]), 0)).x);
+        maxNeighborDither = max(maxNeighborDither, tapD);
+        sumNeighborDither += tapD;
+    }
+
     float invWSum = rcp(max(wSum, 1e-5f));
     outGi = giAccum * invWSum;
     outSsr = sampleSsr ? (ssrAccum * invWSum) : float4(0.0f, 0.0f, 0.0f, 0.0f);
     outGlow = sampleGlow ? (glowAccum * 0.25f) : float3(0.0f, 0.0f, 0.0f);
-    outDither = saturate(max(centerDither, maxNeighborDither * 0.85f + sumNeighborDither * 0.05f));
+    float avgNeighborDither = sumNeighborDither * 0.125f;
+    outDither = saturate(max(centerDither, maxNeighborDither * 0.85f + avgNeighborDither * 0.15f));
 }
 
 #ifdef VK_MODE
@@ -512,20 +522,26 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     }
     else
     {
-        static const int2 dOffsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+        static const int2 dOffsets[8] = {
+            int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1),
+            int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1)
+        };
         float maxNeighborDither = 0.0f;
         float sumNeighborDither = 0.0f;
         [unroll]
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < 8; ++i)
         {
             float tapD = DecodeDitherFromRawX(HalfNormalTex.Load(int3(ClampGiCoord(halfCoord + dOffsets[i]), 0)).x);
             maxNeighborDither = max(maxNeighborDither, tapD);
             sumNeighborDither += tapD;
         }
-        ditherSoft = saturate(max(centerDither, maxNeighborDither * 0.85f + sumNeighborDither * 0.05f));
+        float avgNeighborDither = sumNeighborDither * 0.125f;
+        ditherSoft = saturate(max(centerDither, maxNeighborDither * 0.85f + avgNeighborDither * 0.15f));
     }
 
     float solidMask = skyMask * (1.0f - ditherSoft);
+    float ssrDistFade = 1.0f - smoothstep(22.0f, 55.0f, centerDepth);
+    float relightDistFade = 1.0f - smoothstep(25.0f, 70.0f, centerDepth);
     float3 microNormal = normalize(
         viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (0.55f * meshGuard * (1.0f - haloRisk) * solidMask));
 
@@ -537,7 +553,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     if (GiEnabled > 0)
     {
-        float ambientDelight = lerp(1.0f, 0.84f, saturate(GiIntensity * 0.45f) * solidMask);
+        float ambientDelight = lerp(1.0f, 0.88f, saturate(GiIntensity * 0.45f) * skyMask);
         float aoProtect = rcp(1.0f + centerLuma * 0.85f);
         float3 coloredAo = lerp(float3(1.0f, 1.0f, 1.0f),
                                 float3(MultiBounceAO(half_f(contactAo), half_f3(albedoApprox))), aoProtect);
@@ -561,41 +577,44 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         smoothness = saturate((0.46f + saturate(centerLuma * 0.35f) * 0.24f) * (1.0f - texRough * 0.30f));
     }
 
-    if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f)
+    if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && ssrDistFade > 1e-3f)
     {
-        // Smooth, angle-consistent Fresnel curve so reflections stay rich from both grazing and pitched-down angles
+        // Smooth, angle-consistent Fresnel curve so reflections stay rich on foreground/midground from any angle
         float fresnelSsr = lerp(0.30f, 0.82f, pow(1.0f - NdotV, 2.0f));
-        float baseReflWeight = saturate(fresnelSsr * smoothness * SsrIntensity * 0.72f) * solidMask;
+        float baseReflWeight = saturate(fresnelSsr * smoothness * SsrIntensity * 0.72f) * solidMask * ssrDistFade;
 
-        // Seamless fallback to local GI environment reflection when pitched-down SSR rays clip off-screen
-        float3 envFallback = lerp(litColor * 0.78f, giBounce * 1.35f + litColor * 0.35f, 0.55f);
-        float3 reflColor = lerp(envFallback, ssrSample.rgb, saturate(ssrSample.a));
-        float reflWeight = baseReflWeight * lerp(0.55f, 1.0f, saturate(ssrSample.a));
+        // Gentle GI environment fallback when SSR rays miss, biased toward floors so distant walls stay clean
+        float floorBias = lerp(0.25f, 1.0f, saturate(viewNormal.y * 1.6f + 0.25f));
+        float3 envFallback = lerp(litColor * 0.90f, giBounce * 1.45f + litColor * 0.45f, 0.55f);
+        float hitAlpha = saturate(ssrSample.a);
+        float3 reflColor = lerp(envFallback, ssrSample.rgb, hitAlpha);
+        float reflWeight = baseReflWeight * lerp(0.45f * floorBias, 1.0f, hitAlpha);
         litColor = lerp(litColor, reflColor, reflWeight);
     }
 
-    if (RelightIntensity > 1e-4f)
+    if (RelightIntensity > 1e-4f && relightDistFade > 1e-3f)
     {
         float3 keyDir = float3(0.45f, 0.78f, -0.43f);
         float deltaBump = (dot(microNormal, keyDir) - dot(viewNormal, keyDir)) * 0.65f;
         float macroKey = (dot(viewNormal, keyDir) - 0.18f) * 0.05f;
         float hemiTerm = viewNormal.y * 0.08f;
 
-        float sculpt = (deltaBump + macroKey + hemiTerm) * RelightIntensity * solidMask * (1.0f - haloRisk * 0.8f);
+        float sculpt = (deltaBump + macroKey + hemiTerm) * RelightIntensity * solidMask * relightDistFade *
+                       (1.0f - haloRisk * 0.8f);
         float3 sculptTint = (sculpt >= 0.0f) ? float3(1.04f, 1.01f, 0.96f) : float3(0.90f, 0.95f, 1.06f);
         litColor *= max(1.0f + sculpt * sculptTint, 0.25f);
 
         float verticalMask = smoothstep(0.08f, 0.45f, 1.0f - abs(viewNormal.y));
-        float rim = pow(1.0f - NdotV, 3.5f) * verticalMask * RelightIntensity * solidMask * 0.18f;
+        float rim = pow(1.0f - NdotV, 3.5f) * verticalMask * RelightIntensity * solidMask * relightDistFade * 0.18f;
         litColor += litColor * rim * saturate(Luma(giBounce) * 1.5f + 0.35f);
     }
 
-    if (SpecularRelief > 1e-4f)
+    if (SpecularRelief > 1e-4f && relightDistFade > 1e-3f)
     {
         float microMag = length(microGrad) * meshGuard;
         float grazing = pow(1.0f - NdotV, 3.0f) * smoothness;
         float specSignal = 0.55f * grazing + 0.45f * saturate(microMag * 1.25f) * smoothness;
-        float specMod = SpecularRelief * solidMask * (1.0f - haloRisk) * specSignal * 0.28f;
+        float specMod = SpecularRelief * solidMask * relightDistFade * (1.0f - haloRisk) * specSignal * 0.28f;
         litColor *= (1.0f + specMod);
     }
 

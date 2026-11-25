@@ -150,7 +150,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float ditherMask;
     DecodeHalfNormal(HalfNormalTex.Load(int3(giCoord, 0)).xy, viewNormal, ditherMask);
 
-    if (ditherMask > 0.20f)
+    if (ditherMask > 0.85f)
     {
         OutGiTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
         OutSsrTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -268,7 +268,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     // Screen-space clipped linear SSR raymarching using L2-cached half-res color/depth
     float4 currentSsr = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    if (SsrEnabled > 0)
+    float ssrDistFade = 1.0f - smoothstep(22.0f, 55.0f, centerDepth);
+    if (SsrEnabled > 0 && ssrDistFade > 1e-3f)
     {
         float3 viewDir = normalize(centerPos);
         float3 reflDir = normalize(reflect(viewDir, viewNormal));
@@ -349,6 +350,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             }
         }
     }
+
+    float aoDistFade = 1.0f - smoothstep(28.0f, 75.0f, centerDepth);
+    float solidTrust = 1.0f - ditherMask;
+    currentGi *= solidTrust;
+    currentAo = lerp(1.0f, currentAo, solidTrust * aoDistFade);
+    currentSsr.a *= solidTrust * ssrDistFade;
 
     float4 giResult = float4(currentGi, currentAo);
     float4 ssrResult = currentSsr;

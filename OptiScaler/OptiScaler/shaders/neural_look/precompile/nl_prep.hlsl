@@ -155,6 +155,15 @@ float3 ReconstructViewNormalFromDepths(int2 dCoord, float dC, float dL, float dR
     return n;
 }
 
+// Mathematically 0.0 on any flat plane at any angle and on any clean straight silhouette edge;
+// fires continuously whenever midpoint c sticks out from BOTH collinear neighbors a and b.
+float SignedSpike(float c, float a, float b)
+{
+    float da = a - c;
+    float db = b - c;
+    return (da * db > 0.0f) ? min(abs(da), abs(db)) : 0.0f;
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
@@ -195,42 +204,22 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         return;
     }
 
-    // Detect UE4 DitherTemporalAA depth stippling (including close-range sheer sleeves/stockings over skin)
-    float ditherMask = 0.0f;
-    float relRange = (maxD - minD) / max(minD, 0.05f);
-    float lapH  = abs(2.0f * dC - dL  - dR);
-    float lapV  = abs(2.0f * dC - dU  - dD);
-    float lapD1 = abs(2.0f * dC - dUL - dDR);
-    float lapD2 = abs(2.0f * dC - dUR - dDL);
-    float relLap = max(max(lapH, lapV), max(lapD1, lapD2)) / max(minD, 0.05f);
+    // Continuous collinear-triple spike detector across 3x3 depth neighborhood
+    float spH     = SignedSpike(dC, dL,  dR);
+    float spV     = SignedSpike(dC, dU,  dD);
+    float spD1    = SignedSpike(dC, dUL, dDR);
+    float spD2    = SignedSpike(dC, dUR, dDL);
+    float spTop   = SignedSpike(dU, dUL, dUR);
+    float spBot   = SignedSpike(dD, dDL, dDR);
+    float spLeft  = SignedSpike(dL, dUL, dDL);
+    float spRight = SignedSpike(dR, dUR, dDR);
 
-    if (relRange > 0.005f)
-    {
-        float midD = 0.5f * (minD + maxD);
-        int bC  = (dC  > midD) ? 1 : 0;
-        int bL  = (dL  > midD) ? 1 : 0;
-        int bR  = (dR  > midD) ? 1 : 0;
-        int bU  = (dU  > midD) ? 1 : 0;
-        int bD  = (dD  > midD) ? 1 : 0;
-        int bUL = (dUL > midD) ? 1 : 0;
-        int bUR = (dUR > midD) ? 1 : 0;
-        int bDL = (dDL > midD) ? 1 : 0;
-        int bDR = (dDR > midD) ? 1 : 0;
+    float maxSpike = max(max(max(spH, spV), max(spD1, spD2)), max(max(spTop, spBot), max(spLeft, spRight)));
+    float relSpike = maxSpike / max(minD, 0.05f);
+    float ditherMask = smoothstep(0.004f, 0.018f, relSpike);
 
-        int ringTransitions = (bUL != bU ? 1 : 0) + (bU != bUR ? 1 : 0) + (bUR != bR ? 1 : 0) + (bR != bDR ? 1 : 0) +
-                              (bDR != bD ? 1 : 0) + (bD != bDL ? 1 : 0) + (bDL != bL ? 1 : 0) + (bL != bUL ? 1 : 0);
-        bool centerSpike = (bC != bU && bC != bD) || (bC != bL && bC != bR) || (bC != bUL && bC != bDR) ||
-                           (bC != bUR && bC != bDL);
-        int nearCount = (1 - bC) + (1 - bL) + (1 - bR) + (1 - bU) + (1 - bD) + (1 - bUL) + (1 - bUR) + (1 - bDL) +
-                        (1 - bDR);
-
-        if ((ringTransitions >= 4) || (centerSpike && relLap > 0.004f))
-            ditherMask = smoothstep(0.005f, 0.022f, relRange);
-        else if ((nearCount == 1 || nearCount == 8) && relRange > 0.020f)
-            ditherMask = smoothstep(0.020f, 0.060f, relRange);
-    }
-
-    float outDepth = (ditherMask > 0.20f) ? minD : dC;
+    float safeDC = (dC >= 64000.0f && ditherMask > 0.15f) ? minD : dC;
+    float outDepth = lerp(safeDC, minD, smoothstep(0.15f, 0.55f, ditherMask));
     OutHalfColorDepth[halfCoord] = float4(linColor, min(outDepth, 65000.0f));
 
     if (outDepth >= 64000.0f)
