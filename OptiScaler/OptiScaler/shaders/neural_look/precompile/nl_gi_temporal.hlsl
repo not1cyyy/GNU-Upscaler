@@ -273,10 +273,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float3 viewDir = normalize(centerPos);
         float3 reflDir = normalize(reflect(viewDir, viewNormal));
 
-        if (reflDir.z > -0.45f)
+        if (reflDir.z > -0.60f)
         {
-            float ssrMaxDist = clamp(centerDepth * 1.15f, 3.0f, 55.0f);
-            float ssrThickness = clamp(centerDepth * 0.085f, 0.16f, 3.8f);
+            float ssrMaxDist = clamp(centerDepth * 2.4f, 8.0f, 75.0f);
+            float ssrThickness = clamp(centerDepth * 0.11f, 0.22f, 4.5f);
 
             float rayLen = ssrMaxDist;
             if (reflDir.z < 0.0f)
@@ -342,8 +342,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                                         : HalfColorDepthTex.Load(int3(ClampGiCoord(int2(hitUv * halfSize)), 0)).rgb;
 
                     float2 edgeDist = min(hitUv, 1.0f - hitUv);
-                    float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 14.0f);
-                    float distFade = 1.0f - saturate(hitKt * maxT);
+                    float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 9.0f);
+                    float distFade = 1.0f - saturate(hitKt * maxT * 0.75f);
                     currentSsr = float4(hitCol, edgeFade * lerp(0.50f, 1.0f, distFade));
                 }
             }

@@ -195,10 +195,16 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         return;
     }
 
-    // Detect UE4 DitherTemporalAA depth stippling without triggering on smooth slopes or solid silhouettes
+    // Detect UE4 DitherTemporalAA depth stippling (including close-range sheer sleeves/stockings over skin)
     float ditherMask = 0.0f;
     float relRange = (maxD - minD) / max(minD, 0.05f);
-    if (relRange > 0.045f)
+    float lapH  = abs(2.0f * dC - dL  - dR);
+    float lapV  = abs(2.0f * dC - dU  - dD);
+    float lapD1 = abs(2.0f * dC - dUL - dDR);
+    float lapD2 = abs(2.0f * dC - dUR - dDL);
+    float relLap = max(max(lapH, lapV), max(lapD1, lapD2)) / max(minD, 0.05f);
+
+    if (relRange > 0.005f)
     {
         float midD = 0.5f * (minD + maxD);
         int bC  = (dC  > midD) ? 1 : 0;
@@ -218,8 +224,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         int nearCount = (1 - bC) + (1 - bL) + (1 - bR) + (1 - bU) + (1 - bD) + (1 - bUL) + (1 - bUR) + (1 - bDL) +
                         (1 - bDR);
 
-        if ((ringTransitions >= 4) || centerSpike || (nearCount == 1) || (nearCount == 8))
-            ditherMask = smoothstep(0.045f, 0.14f, relRange);
+        if ((ringTransitions >= 4) || (centerSpike && relLap > 0.004f))
+            ditherMask = smoothstep(0.005f, 0.022f, relRange);
+        else if ((nearCount == 1 || nearCount == 8) && relRange > 0.020f)
+            ditherMask = smoothstep(0.020f, 0.060f, relRange);
     }
 
     float outDepth = (ditherMask > 0.20f) ? minD : dC;

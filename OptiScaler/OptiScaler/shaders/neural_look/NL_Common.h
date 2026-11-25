@@ -272,7 +272,7 @@ class NL_Common
         c.StepCount = (_activeTier >= 2) ? 5 : 4;
         c.FrameIndex = static_cast<int32_t>(_frameIndex);
         c.SsrEnabled = ssrEnabled ? 1 : 0;
-        c.SsrSteps = (_activeTier >= 2) ? 8 : 6;
+        c.SsrSteps = (_activeTier >= 2) ? 12 : 8;
     }
 
     void FillCompositeConstants(NLCompositeInternalConstants& c, const NeuralLookConstants& inConst, bool giEnabled,

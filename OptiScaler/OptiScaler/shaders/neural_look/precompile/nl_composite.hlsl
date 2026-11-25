@@ -266,7 +266,7 @@ void FusedDenoiseHalfRes(int2 halfCoord, float centerDepth, float centerDither, 
     outGi = giAccum * invWSum;
     outSsr = sampleSsr ? (ssrAccum * invWSum) : float4(0.0f, 0.0f, 0.0f, 0.0f);
     outGlow = sampleGlow ? (glowAccum * 0.25f) : float3(0.0f, 0.0f, 0.0f);
-    outDither = saturate(max(centerDither, maxNeighborDither * 0.70f + sumNeighborDither * 0.075f));
+    outDither = saturate(max(centerDither, maxNeighborDither * 0.85f + sumNeighborDither * 0.05f));
 }
 
 #ifdef VK_MODE
@@ -522,7 +522,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             maxNeighborDither = max(maxNeighborDither, tapD);
             sumNeighborDither += tapD;
         }
-        ditherSoft = saturate(max(centerDither, maxNeighborDither * 0.70f + sumNeighborDither * 0.075f));
+        ditherSoft = saturate(max(centerDither, maxNeighborDither * 0.85f + sumNeighborDither * 0.05f));
     }
 
     float solidMask = skyMask * (1.0f - ditherSoft);
@@ -556,20 +556,22 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     }
     else
     {
-        // Estimate dielectric smoothness from local micro-roughness (gritty concrete = rough; metal/wet = glossy)
-        float texRough = saturate(pVar * 10.0f + length(microGrad) * 0.55f);
-        smoothness = saturate(0.36f * (1.0f - texRough * 0.85f));
+        // Balanced surface sheen: preserves rich floor/metal reflections while slightly softer on coarse detail
+        float texRough = saturate(pVar * 4.5f);
+        smoothness = saturate((0.46f + saturate(centerLuma * 0.35f) * 0.24f) * (1.0f - texRough * 0.30f));
     }
 
-    if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && ssrSample.a > 1e-3f)
+    if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f)
     {
-        float f0 = 0.04f;
-        float maxFresnel = max(smoothness * smoothness, f0);
-        float fresnelSsr = f0 + (maxFresnel - f0) * pow(1.0f - NdotV, 5.0f);
-        float maxReflCap = (HasGBufferRoughness > 0) ? 0.85f : 0.28f;
-        float reflWeight = min(ssrSample.a * fresnelSsr * SsrIntensity * 1.15f, maxReflCap) * solidMask;
-        float3 safeRefl = (HasGBufferRoughness > 0) ? ssrSample.rgb : max(ssrSample.rgb, litColor * 0.72f);
-        litColor = lerp(litColor, safeRefl, reflWeight);
+        // Smooth, angle-consistent Fresnel curve so reflections stay rich from both grazing and pitched-down angles
+        float fresnelSsr = lerp(0.30f, 0.82f, pow(1.0f - NdotV, 2.0f));
+        float baseReflWeight = saturate(fresnelSsr * smoothness * SsrIntensity * 0.72f) * solidMask;
+
+        // Seamless fallback to local GI environment reflection when pitched-down SSR rays clip off-screen
+        float3 envFallback = lerp(litColor * 0.78f, giBounce * 1.35f + litColor * 0.35f, 0.55f);
+        float3 reflColor = lerp(envFallback, ssrSample.rgb, saturate(ssrSample.a));
+        float reflWeight = baseReflWeight * lerp(0.55f, 1.0f, saturate(ssrSample.a));
+        litColor = lerp(litColor, reflColor, reflWeight);
     }
 
     if (RelightIntensity > 1e-4f)
@@ -598,7 +600,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     }
 
     if (GiEnabled > 0 && VolumetricGlow > 1e-4f)
-        litColor += brightGlow * (VolumetricGlow * 0.30f);
+        litColor += brightGlow * (VolumetricGlow * 0.30f * (0.25f + 0.75f * (1.0f - ditherSoft)));
 
     float detailDelta = 0.0f;
     float lightDelta = 0.0f;
@@ -658,8 +660,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         maxL = max(maxL, centerLuma);
         float hitMin = minL / max(4.0f * maxL, 1e-5f);
         float hitMax = (1.0f - saturate(maxL)) / min(4.0f * minL - 4.0f, -1e-5f);
-        float rcasStrength = saturate(FusedRcasSharpness) * lerp(0.45f, 1.0f, meshGuard) *
-                             lerp(0.50f, 1.0f, 1.0f - ditherSoft);
+        float rcasStrength = saturate(FusedRcasSharpness) * lerp(0.45f, 1.0f, meshGuard) * (1.0f - ditherSoft);
         float w = clamp(max(-0.1875f, min(hitMin, hitMax)) * rcasStrength, -0.1875f, 0.0f);
         float rcasLuma = (centerLuma + w * (lumaU + lumaL + lumaR + lumaD)) * rcp(1.0f + 4.0f * w);
         float rcasRatio = clamp(rcasLuma / max(centerLuma, 1e-5f), 0.5f, 2.0f);
