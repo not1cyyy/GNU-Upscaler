@@ -23,6 +23,16 @@ cbuffer Params : register(b0)
     float TanHalfFovAspect;
     int HasGBufferNormals;
     int InColorEncodeMode;
+
+    int MotionWidth;
+    int MotionHeight;
+    int DisplaySizeMV;
+    int ResetHistory;
+
+    float MvScaleX;
+    float MvScaleY;
+    float MotionTextureScale;
+    int FrameIndex;
 };
 
 #ifdef VK_MODE
@@ -41,14 +51,31 @@ Texture2D<float> DepthTex : register(t1);
 Texture2D<float4> GBufferNormalsTex : register(t2);
 
 #ifdef VK_MODE
-[[vk::binding(4, 0)]] [[vk::image_format("rgba16f")]]
+[[vk::binding(4, 0)]]
+#endif
+Texture2D<float2> MotionTex : register(t3);
+
+#ifdef VK_MODE
+[[vk::combinedImageSampler]] [[vk::binding(5, 0)]]
+#endif
+Texture2D<float4> PrevHalfNormalTex : register(t4);
+
+#ifdef VK_MODE
+[[vk::combinedImageSampler]] [[vk::binding(5, 0)]]
+SamplerState LinearClamp : register(s0);
+#else
+SamplerState LinearClamp : register(s0);
+#endif
+
+#ifdef VK_MODE
+[[vk::binding(6, 0)]] [[vk::image_format("rgba16f")]]
 #endif
 RWTexture2D<float4> OutHalfColorDepth : register(u0);
 
 #ifdef VK_MODE
-[[vk::binding(5, 0)]] [[vk::image_format("rg16f")]]
+[[vk::binding(7, 0)]] [[vk::image_format("rgba16f")]]
 #endif
-RWTexture2D<float2> OutHalfNormal : register(u1);
+RWTexture2D<float4> OutHalfNormal : register(u1);
 
 static const float3 kLumaCoeff = float3(0.2126f, 0.7152f, 0.0722f);
 
@@ -97,6 +124,16 @@ int2 ClampOutputCoord(int2 p)
 int2 ClampDepthCoord(int2 p)
 {
     return int2(clamp(p.x, 0, DepthWidth - 1), clamp(p.y, 0, DepthHeight - 1));
+}
+
+int2 ClampHalfCoord(int2 p)
+{
+    return int2(clamp(p.x, 0, HalfWidth - 1), clamp(p.y, 0, HalfHeight - 1));
+}
+
+int2 ClampMotionCoord(int2 p)
+{
+    return int2(clamp(p.x, 0, max(MotionWidth - 1, 0)), clamp(p.y, 0, max(MotionHeight - 1, 0)));
 }
 
 float LinearizeDepth(float rawDepth)
@@ -200,11 +237,11 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (minD >= 64000.0f)
     {
         OutHalfColorDepth[halfCoord] = float4(linColor, 65000.0f);
-        OutHalfNormal[halfCoord] = float2(0.0f, 0.0f);
+        OutHalfNormal[halfCoord] = float4(0.0f, 0.0f, 0.0f, 65000.0f);
         return;
     }
 
-    // Continuous collinear-triple spike detector across 3x3 depth neighborhood
+    // Strict 2D collinear-triple stipple seed (0.0 on any 1D pipe/beam/floor/straight silhouette)
     float spH     = SignedSpike(dC, dL,  dR);
     float spV     = SignedSpike(dC, dU,  dD);
     float spD1    = SignedSpike(dC, dUL, dDR);
@@ -214,17 +251,47 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float spLeft  = SignedSpike(dL, dUL, dDL);
     float spRight = SignedSpike(dR, dUR, dDR);
 
-    float maxSpike = max(max(max(spH, spV), max(spD1, spD2)), max(max(spTop, spBot), max(spLeft, spRight)));
-    float relSpike = maxSpike / max(minD, 0.05f);
-    float ditherMask = smoothstep(0.004f, 0.018f, relSpike);
+    float orthoSpike = max(min(spH, spV), min(spD1, spD2));
+    float ringSpike = min(min(spTop, spBot), min(spLeft, spRight));
+    float relSpike = max(orthoSpike, ringSpike) / max(minD, 0.05f);
+    float spatialDither = smoothstep(0.005f, 0.020f, relSpike);
 
-    float safeDC = (dC >= 64000.0f && ditherMask > 0.15f) ? minD : dC;
-    float outDepth = lerp(safeDC, minD, smoothstep(0.15f, 0.55f, ditherMask));
+    // Temporal depth-flip & normal stabilization via reprojected RGBA16F G-Proxy history
+    int2 mvCoord = DisplaySizeMV > 0 ? outCoord : int2((float2(outCoord) + 0.5f) * MotionTextureScale);
+    float2 mv = MotionTex.Load(int3(ClampMotionCoord(mvCoord), 0)).rg * float2(MvScaleX, MvScaleY);
+    float mvMag = length(mv);
+    float2 prevUv = uv + mv / float2(OutputWidth, OutputHeight);
+    bool validHistory = (ResetHistory == 0 && FrameIndex > 2 && all(prevUv >= 0.002f) && all(prevUv <= 0.998f));
+
+    float4 prevSample =
+        validHistory ? PrevHalfNormalTex.SampleLevel(LinearClamp, prevUv, 0.0f) : float4(0.0f, 0.0f, 0.0f, dC);
+    float prevRawD =
+        validHistory
+            ? PrevHalfNormalTex.Load(int3(ClampHalfCoord(int2(prevUv * float2(HalfWidth, HalfHeight))), 0)).w
+            : dC;
+
+    float depthDiff = min(abs(dC - prevRawD), abs(dC - prevSample.w));
+    float relTempDiff = depthDiff / max(min(dC, min(prevRawD, prevSample.w)), 0.05f);
+    float motionTrust = rcp(1.0f + mvMag * 0.20f);
+    float temporalFlip = validHistory ? (smoothstep(0.005f, 0.024f, relTempDiff) * motionTrust) : 0.0f;
+
+    float instantFlicker = max(spatialDither, temporalFlip);
+    float flickerEma = instantFlicker;
+    if (validHistory)
+    {
+        float prevEma = saturate(prevSample.z);
+        float decayAlpha = lerp(0.08f, 0.25f, saturate(mvMag / 8.0f));
+        float alpha = (instantFlicker > prevEma) ? 0.50f : decayAlpha;
+        flickerEma = lerp(prevEma, instantFlicker, alpha);
+    }
+
+    float safeDC = (dC >= 64000.0f && flickerEma > 0.15f) ? minD : dC;
+    float outDepth = lerp(safeDC, minD, smoothstep(0.15f, 0.55f, flickerEma));
     OutHalfColorDepth[halfCoord] = float4(linColor, min(outDepth, 65000.0f));
 
     if (outDepth >= 64000.0f)
     {
-        OutHalfNormal[halfCoord] = float2(0.0f, 0.0f);
+        OutHalfNormal[halfCoord] = float4(0.0f, 0.0f, saturate(flickerEma), min(dC, 65000.0f));
         return;
     }
 
@@ -243,10 +310,19 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
     }
 
-    if (ditherMask > 0.0f)
-        viewNormal = normalize(lerp(viewNormal, float3(0.0f, 0.0f, -1.0f), ditherMask * 0.85f));
+    if (validHistory && relTempDiff < 0.025f && flickerEma < 0.35f)
+    {
+        float2 pnxy = clamp(prevSample.xy, -1.0f, 1.0f);
+        float3 prevNormal = float3(pnxy, -sqrt(max(0.0f, 1.0f - dot(pnxy, pnxy))));
+        if (dot(prevNormal, viewNormal) > 0.35f)
+        {
+            float normAlpha = lerp(0.25f, 0.75f, saturate(mvMag / 8.0f));
+            viewNormal = normalize(lerp(prevNormal, viewNormal, normAlpha));
+        }
+    }
 
-    // Losslessly pack 4-bit quantized ditherMask into OutHalfNormal.x (read only via .Load())
-    float dQ = round(saturate(ditherMask) * 15.0f);
-    OutHalfNormal[halfCoord] = float2(viewNormal.x + dQ * 4.0f, viewNormal.y);
+    if (flickerEma > 0.0f)
+        viewNormal = normalize(lerp(viewNormal, float3(0.0f, 0.0f, -1.0f), saturate(flickerEma) * 0.80f));
+
+    OutHalfNormal[halfCoord] = float4(viewNormal.xy, saturate(flickerEma), min(dC, 65000.0f));
 }

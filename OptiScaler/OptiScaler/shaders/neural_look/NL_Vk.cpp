@@ -56,9 +56,10 @@ bool NL_Vk::CreateGiImages(uint32_t width, uint32_t height)
     const uint32_t targetW = std::max(1u, width / 2u);
     const uint32_t targetH = std::max(1u, height / 2u);
 
-    if (_halfColorDepthImage != VK_NULL_HANDLE && _halfNormalImage != VK_NULL_HANDLE &&
-        _giImages[0] != VK_NULL_HANDLE && _giImages[1] != VK_NULL_HANDLE && _ssrImages[0] != VK_NULL_HANDLE &&
-        _ssrImages[1] != VK_NULL_HANDLE && _giWidth == targetW && _giHeight == targetH)
+    if (_halfColorDepthImage != VK_NULL_HANDLE && _halfNormalImages[0] != VK_NULL_HANDLE &&
+        _halfNormalImages[1] != VK_NULL_HANDLE && _giImages[0] != VK_NULL_HANDLE && _giImages[1] != VK_NULL_HANDLE &&
+        _ssrImages[0] != VK_NULL_HANDLE && _ssrImages[1] != VK_NULL_HANDLE && _giWidth == targetW &&
+        _giHeight == targetH)
     {
         return true;
     }
@@ -66,29 +67,29 @@ bool NL_Vk::CreateGiImages(uint32_t width, uint32_t height)
     ReleaseGiImages();
 
     if (!CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16B16A16_SFLOAT, _halfColorDepthImage,
-                            _halfColorDepthView, _halfColorDepthMemory) ||
-        !CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16_SFLOAT, _halfNormalImage, _halfNormalView,
-                            _halfNormalMemory))
+                            _halfColorDepthView, _halfColorDepthMemory))
     {
-        LOG_ERROR("[{0}] Failed to create half-res G-proxy VkImages", _name);
+        LOG_ERROR("[{0}] Failed to create half-res ColorDepth VkImage", _name);
         ReleaseGiImages();
         return false;
     }
     _halfColorDepthInit = false;
-    _halfNormalInit = false;
 
     for (int i = 0; i < 2; ++i)
     {
-        if (!CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16B16A16_SFLOAT, _giImages[i], _giImageViews[i],
+        if (!CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16B16A16_SFLOAT, _halfNormalImages[i],
+                                _halfNormalImageViews[i], _halfNormalMemories[i]) ||
+            !CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16B16A16_SFLOAT, _giImages[i], _giImageViews[i],
                                 _giMemories[i]) ||
             !CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16B16A16_SFLOAT, _ssrImages[i], _ssrImageViews[i],
                                 _ssrMemories[i]))
         {
-            LOG_ERROR("[{0}] Failed to create GI/SSR VkImages {1}", _name, i);
+            LOG_ERROR("[{0}] Failed to create Temporal G-Proxy/GI/SSR VkImages {1}", _name, i);
             ReleaseGiImages();
             return false;
         }
 
+        _halfNormalImageInitialized[i] = false;
         _giImageInitialized[i] = false;
         _ssrImageInitialized[i] = false;
     }
@@ -102,12 +103,11 @@ bool NL_Vk::CreateGiImages(uint32_t width, uint32_t height)
 void NL_Vk::ReleaseGiImages()
 {
     if (_halfColorDepthView != VK_NULL_HANDLE || _halfColorDepthImage != VK_NULL_HANDLE ||
-        _halfColorDepthMemory != VK_NULL_HANDLE || _halfNormalView != VK_NULL_HANDLE ||
-        _halfNormalImage != VK_NULL_HANDLE || _halfNormalMemory != VK_NULL_HANDLE)
+        _halfColorDepthMemory != VK_NULL_HANDLE)
     {
         DeferredRelease::Enqueue(
             [device = _device, cdView = _halfColorDepthView, cdImg = _halfColorDepthImage,
-             cdMem = _halfColorDepthMemory, nView = _halfNormalView, nImg = _halfNormalImage, nMem = _halfNormalMemory]()
+             cdMem = _halfColorDepthMemory]()
             {
                 if (cdView != VK_NULL_HANDLE)
                     vkDestroyImageView(device, cdView, nullptr);
@@ -115,12 +115,6 @@ void NL_Vk::ReleaseGiImages()
                     vkDestroyImage(device, cdImg, nullptr);
                 if (cdMem != VK_NULL_HANDLE)
                     vkFreeMemory(device, cdMem, nullptr);
-                if (nView != VK_NULL_HANDLE)
-                    vkDestroyImageView(device, nView, nullptr);
-                if (nImg != VK_NULL_HANDLE)
-                    vkDestroyImage(device, nImg, nullptr);
-                if (nMem != VK_NULL_HANDLE)
-                    vkFreeMemory(device, nMem, nullptr);
             },
             (uint64_t) _device);
     }
@@ -130,20 +124,26 @@ void NL_Vk::ReleaseGiImages()
     _halfColorDepthMemory = VK_NULL_HANDLE;
     _halfColorDepthInit = false;
 
-    _halfNormalView = VK_NULL_HANDLE;
-    _halfNormalImage = VK_NULL_HANDLE;
-    _halfNormalMemory = VK_NULL_HANDLE;
-    _halfNormalInit = false;
-
     for (int i = 0; i < 2; ++i)
     {
-        if (_giImageViews[i] != VK_NULL_HANDLE || _giImages[i] != VK_NULL_HANDLE || _giMemories[i] != VK_NULL_HANDLE ||
-            _ssrImageViews[i] != VK_NULL_HANDLE || _ssrImages[i] != VK_NULL_HANDLE || _ssrMemories[i] != VK_NULL_HANDLE)
+        if (_halfNormalImageViews[i] != VK_NULL_HANDLE || _halfNormalImages[i] != VK_NULL_HANDLE ||
+            _halfNormalMemories[i] != VK_NULL_HANDLE || _giImageViews[i] != VK_NULL_HANDLE ||
+            _giImages[i] != VK_NULL_HANDLE || _giMemories[i] != VK_NULL_HANDLE ||
+            _ssrImageViews[i] != VK_NULL_HANDLE || _ssrImages[i] != VK_NULL_HANDLE ||
+            _ssrMemories[i] != VK_NULL_HANDLE)
         {
             DeferredRelease::Enqueue(
-                [device = _device, giView = _giImageViews[i], giImg = _giImages[i], giMem = _giMemories[i],
-                 ssrView = _ssrImageViews[i], ssrImg = _ssrImages[i], ssrMem = _ssrMemories[i]]()
+                [device = _device, nView = _halfNormalImageViews[i], nImg = _halfNormalImages[i],
+                 nMem = _halfNormalMemories[i], giView = _giImageViews[i], giImg = _giImages[i],
+                 giMem = _giMemories[i], ssrView = _ssrImageViews[i], ssrImg = _ssrImages[i],
+                 ssrMem = _ssrMemories[i]]()
                 {
+                    if (nView != VK_NULL_HANDLE)
+                        vkDestroyImageView(device, nView, nullptr);
+                    if (nImg != VK_NULL_HANDLE)
+                        vkDestroyImage(device, nImg, nullptr);
+                    if (nMem != VK_NULL_HANDLE)
+                        vkFreeMemory(device, nMem, nullptr);
                     if (giView != VK_NULL_HANDLE)
                         vkDestroyImageView(device, giView, nullptr);
                     if (giImg != VK_NULL_HANDLE)
@@ -159,6 +159,11 @@ void NL_Vk::ReleaseGiImages()
                 },
                 (uint64_t) _device);
         }
+
+        _halfNormalImageViews[i] = VK_NULL_HANDLE;
+        _halfNormalImages[i] = VK_NULL_HANDLE;
+        _halfNormalMemories[i] = VK_NULL_HANDLE;
+        _halfNormalImageInitialized[i] = false;
 
         _giImageViews[i] = VK_NULL_HANDLE;
         _giImages[i] = VK_NULL_HANDLE;
@@ -217,15 +222,17 @@ NL_Vk::NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalD
         return;
     }
 
-    // 2. Prep pipeline (UBO 0, 3x combined image samplers 1..3, 2x storage images 4..5)
+    // 2. Prep pipeline (UBO 0, 5x combined image samplers 1..5, 2x storage images 6..7)
     {
         std::vector<VkDescriptorSetLayoutBinding> prepBindings = {
             CreateBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
             CreateBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
             CreateBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
             CreateBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
-            CreateBinding(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
-            CreateBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            CreateBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+            CreateBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
         };
 
         VkDescriptorSetLayoutCreateInfo prepLayoutInfo {};
@@ -250,7 +257,7 @@ NL_Vk::NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalD
 
         std::vector<VkDescriptorPoolSize> prepPoolSizes = {
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, _maxFramesInFlight },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * _maxFramesInFlight },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 * _maxFramesInFlight },
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * _maxFramesInFlight }
         };
         VkDescriptorPoolCreateInfo prepPoolInfo {};
@@ -396,11 +403,14 @@ NL_Vk::~NL_Vk()
 
 void NL_Vk::UpdatePrepDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
                                     VkImageView colorView, VkImageView depthView, VkImageView normalsView,
+                                    VkImageView motionView, VkImageView prevHalfNormalView,
                                     VkImageView outColorDepthView, VkImageView outNormalView)
 {
     VkDescriptorImageInfo colorInfo { _textureSampler, colorView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo depthInfo { _textureSampler, depthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo normInfo { _textureSampler, normalsView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo mvInfo { _textureSampler, motionView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo prevNormInfo { _textureSampler, prevHalfNormalView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo outCdInfo { VK_NULL_HANDLE, outColorDepthView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo outNInfo { VK_NULL_HANDLE, outNormalView, VK_IMAGE_LAYOUT_GENERAL };
 
@@ -413,9 +423,13 @@ void NL_Vk::UpdatePrepDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorB
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 3, 0, 1,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &normInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 4, 0, 1,
+          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &mvInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 5, 0, 1,
+          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &prevNormInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
           &outCdInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
           &outNInfo, nullptr, nullptr }
     };
 
@@ -543,17 +557,38 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
 
     const VkImageSubresourceRange giRange { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-    // Pass 0: Half-res G-Proxy Prep
+    _giWriteIdx = (_giWriteIdx + 1) & 1;
+    const int prevIdx = _giWriteIdx ^ 1;
+
+    NeuralLookConstants temporalConstIn = InConstants;
+    if (_resetGiHistory)
+    {
+        temporalConstIn.ResetHistory = true;
+        _resetGiHistory = false;
+    }
+
+    const VkImageView mvView =
+        (InMotionVectorsInfo.ImageView != VK_NULL_HANDLE) ? InMotionVectorsInfo.ImageView : InResourceInfo.ImageView;
+
+    if (!_halfNormalImageInitialized[prevIdx])
+    {
+        SetImageLayout(InCmdList, _halfNormalImages[prevIdx], VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, giRange);
+        _halfNormalImageInitialized[prevIdx] = true;
+    }
+
+    // Pass 0: Half-res Temporal G-Proxy Prep
     {
         SetImageLayout(InCmdList, _halfColorDepthImage,
                        _halfColorDepthInit ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
                        VK_IMAGE_LAYOUT_GENERAL, giRange);
         _halfColorDepthInit = true;
 
-        SetImageLayout(InCmdList, _halfNormalImage,
-                       _halfNormalInit ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                       VK_IMAGE_LAYOUT_GENERAL, giRange);
-        _halfNormalInit = true;
+        const VkImageLayout prevNormLayout =
+            _halfNormalImageInitialized[_giWriteIdx] ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                     : VK_IMAGE_LAYOUT_UNDEFINED;
+        SetImageLayout(InCmdList, _halfNormalImages[_giWriteIdx], prevNormLayout, VK_IMAGE_LAYOUT_GENERAL, giRange);
+        _halfNormalImageInitialized[_giWriteIdx] = true;
 
         NLPrepInternalConstants prepConst {};
         prepConst.OutputWidth = static_cast<int32_t>(OutResourceInfo.Width);
@@ -562,7 +597,9 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         prepConst.HalfHeight = static_cast<int32_t>(_giHeight);
         prepConst.DepthWidth = static_cast<int32_t>(InDepthInfo->Width);
         prepConst.DepthHeight = static_cast<int32_t>(InDepthInfo->Height);
-        FillPrepConstants(prepConst, InConstants, hasNormals, inEncodeMode);
+        prepConst.MotionWidth = static_cast<int32_t>(InMotionVectorsInfo.Width);
+        prepConst.MotionHeight = static_cast<int32_t>(InMotionVectorsInfo.Height);
+        FillPrepConstants(prepConst, temporalConstIn, hasNormals, inEncodeMode);
 
         const VkDescriptorBufferInfo prepBufInfo { _constantBufferPrep, _constantStridePrep * _currentSetIndex,
                                                    sizeof(NLPrepInternalConstants) };
@@ -571,8 +608,9 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
 
         UpdatePrepDescriptorSet(_descriptorSetsPrep[_currentSetIndex], prepBufInfo, InResourceInfo.ImageView,
                                 InDepthInfo->ImageView,
-                                hasNormals ? InGBufferNormals->ImageView : InResourceInfo.ImageView,
-                                _halfColorDepthView, _halfNormalView);
+                                hasNormals ? InGBufferNormals->ImageView : InResourceInfo.ImageView, mvView,
+                                _halfNormalImageViews[prevIdx], _halfColorDepthView,
+                                _halfNormalImageViews[_giWriteIdx]);
 
         vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelinePrep);
         vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelineLayoutPrep, 0, 1,
@@ -581,12 +619,9 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
 
         SetImageLayout(InCmdList, _halfColorDepthImage, VK_IMAGE_LAYOUT_GENERAL,
                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, giRange);
-        SetImageLayout(InCmdList, _halfNormalImage, VK_IMAGE_LAYOUT_GENERAL,
+        SetImageLayout(InCmdList, _halfNormalImages[_giWriteIdx], VK_IMAGE_LAYOUT_GENERAL,
                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, giRange);
     }
-
-    _giWriteIdx = (_giWriteIdx + 1) & 1;
-    const int prevIdx = _giWriteIdx ^ 1;
 
     if (!_giImageInitialized[prevIdx])
     {
@@ -601,9 +636,6 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, giRange);
         _ssrImageInitialized[prevIdx] = true;
     }
-
-    const VkImageView mvView =
-        (InMotionVectorsInfo.ImageView != VK_NULL_HANDLE) ? InMotionVectorsInfo.ImageView : InResourceInfo.ImageView;
 
     // Pass 1: Checkerboard Temporal SSGI + SSR
     if (runGiPass)
@@ -626,22 +658,16 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         giConst.MotionWidth = static_cast<int32_t>(InMotionVectorsInfo.Width);
         giConst.MotionHeight = static_cast<int32_t>(InMotionVectorsInfo.Height);
 
-        NeuralLookConstants giConstIn = InConstants;
-        if (_resetGiHistory)
-        {
-            giConstIn.ResetHistory = true;
-            _resetGiHistory = false;
-        }
-        FillGiConstants(giConst, giConstIn, ssrEnabled);
+        FillGiConstants(giConst, temporalConstIn, ssrEnabled);
 
         const VkDescriptorBufferInfo giBufInfo { _constantBufferGi, _constantStrideGi * _currentSetIndex,
                                                  sizeof(NLGiInternalConstants) };
         if (_mappedConstantBufferGi != nullptr)
             memcpy((uint8_t*) _mappedConstantBufferGi + giBufInfo.offset, &giConst, sizeof(NLGiInternalConstants));
 
-        UpdateGiDescriptorSet(_descriptorSetsGi[_currentSetIndex], giBufInfo, _halfColorDepthView, _halfNormalView,
-                              mvView, _giImageViews[prevIdx], _ssrImageViews[prevIdx], _giImageViews[_giWriteIdx],
-                              _ssrImageViews[_giWriteIdx]);
+        UpdateGiDescriptorSet(_descriptorSetsGi[_currentSetIndex], giBufInfo, _halfColorDepthView,
+                              _halfNormalImageViews[_giWriteIdx], mvView, _giImageViews[prevIdx],
+                              _ssrImageViews[prevIdx], _giImageViews[_giWriteIdx], _ssrImageViews[_giWriteIdx]);
 
         vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelineGi);
         vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelineLayoutGi, 0, 1,
@@ -688,7 +714,8 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         const VkDescriptorBufferInfo compBufInfo = WriteConstants(&compConst, sizeof(NLCompositeInternalConstants));
 
         UpdateCompositeDescriptorSet(_descriptorSets[_currentSetIndex], compBufInfo, InResourceInfo.ImageView,
-                                     _halfColorDepthView, mvView, _giImageViews[_giWriteIdx], _halfNormalView,
+                                     _halfColorDepthView, mvView, _giImageViews[_giWriteIdx],
+                                     _halfNormalImageViews[_giWriteIdx],
                                      hasAlbedo ? InGBufferAlbedo->ImageView : InResourceInfo.ImageView,
                                      hasRoughness ? InGBufferRoughness->ImageView : InResourceInfo.ImageView,
                                      _ssrImageViews[_giWriteIdx], OutResourceInfo.ImageView);

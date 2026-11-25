@@ -34,10 +34,10 @@ class NL_Vk : public Shader_Vk, public NL_Common
     VkDeviceMemory _halfColorDepthMemory = VK_NULL_HANDLE;
     bool _halfColorDepthInit = false;
 
-    VkImage _halfNormalImage = VK_NULL_HANDLE;
-    VkImageView _halfNormalView = VK_NULL_HANDLE;
-    VkDeviceMemory _halfNormalMemory = VK_NULL_HANDLE;
-    bool _halfNormalInit = false;
+    VkImage _halfNormalImages[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView _halfNormalImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceMemory _halfNormalMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    bool _halfNormalImageInitialized[2] = { false, false };
 
     VkImage _giImages[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkImageView _giImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
@@ -60,7 +60,8 @@ class NL_Vk : public Shader_Vk, public NL_Common
     void ReleaseGiImages();
 
     void UpdatePrepDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo, VkImageView colorView,
-                                 VkImageView depthView, VkImageView normalsView, VkImageView outColorDepthView,
+                                 VkImageView depthView, VkImageView normalsView, VkImageView motionView,
+                                 VkImageView prevHalfNormalView, VkImageView outColorDepthView,
                                  VkImageView outNormalView);
 
     void UpdateGiDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,

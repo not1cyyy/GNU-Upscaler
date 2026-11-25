@@ -21,8 +21,8 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
 
     ID3D12Resource* _halfColorDepthBuffer = nullptr;
     D3D12_RESOURCE_STATES _halfColorDepthState = D3D12_RESOURCE_STATE_COMMON;
-    ID3D12Resource* _halfNormalBuffer = nullptr;
-    D3D12_RESOURCE_STATES _halfNormalState = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* _halfNormalBuffers[2] = { nullptr, nullptr };
+    D3D12_RESOURCE_STATES _halfNormalStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
 
     ID3D12Resource* _giBuffers[2] = { nullptr, nullptr };
     D3D12_RESOURCE_STATES _giBufferStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };

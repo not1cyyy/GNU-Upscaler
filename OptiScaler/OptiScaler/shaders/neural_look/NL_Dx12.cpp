@@ -14,9 +14,9 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
     const uint32_t targetW = std::max(1u, width / 2u);
     const uint32_t targetH = std::max(1u, height / 2u);
 
-    if (_halfColorDepthBuffer != nullptr && _halfNormalBuffer != nullptr && _giBuffers[0] != nullptr &&
-        _giBuffers[1] != nullptr && _ssrBuffers[0] != nullptr && _ssrBuffers[1] != nullptr && _giWidth == targetW &&
-        _giHeight == targetH)
+    if (_halfColorDepthBuffer != nullptr && _halfNormalBuffers[0] != nullptr && _halfNormalBuffers[1] != nullptr &&
+        _giBuffers[0] != nullptr && _giBuffers[1] != nullptr && _ssrBuffers[0] != nullptr && _ssrBuffers[1] != nullptr &&
+        _giWidth == targetW && _giHeight == targetH)
     {
         return true;
     }
@@ -50,35 +50,28 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
     _halfColorDepthBuffer->SetName(L"NL_HalfColorDepth");
     _halfColorDepthState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-    D3D12_RESOURCE_DESC normDesc = desc;
-    normDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
-    if (FAILED(InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &normDesc,
-                                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                                 IID_PPV_ARGS(&_halfNormalBuffer))) ||
-        _halfNormalBuffer == nullptr)
-    {
-        LOG_ERROR("[{0}] Failed to create half-res Normal buffer", _name);
-        ReleaseGiBuffers();
-        return false;
-    }
-    _halfNormalBuffer->SetName(L"NL_HalfNormal");
-    _halfNormalState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
     for (int i = 0; i < 2; ++i)
     {
+        auto hrNorm = InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                        IID_PPV_ARGS(&_halfNormalBuffers[i]));
         auto hrGi = InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
                                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
                                                       IID_PPV_ARGS(&_giBuffers[i]));
         auto hrSsr = InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
                                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
                                                        IID_PPV_ARGS(&_ssrBuffers[i]));
-        if (FAILED(hrGi) || _giBuffers[i] == nullptr || FAILED(hrSsr) || _ssrBuffers[i] == nullptr)
+        if (FAILED(hrNorm) || _halfNormalBuffers[i] == nullptr || FAILED(hrGi) || _giBuffers[i] == nullptr ||
+            FAILED(hrSsr) || _ssrBuffers[i] == nullptr)
         {
-            LOG_ERROR("[{0}] Failed to create GI/SSR ping-pong buffers {1}: {2:x} / {3:x}", _name, i, hrGi, hrSsr);
+            LOG_ERROR("[{0}] Failed to create Temporal G-Proxy/GI/SSR buffers {1}: {2:x} / {3:x} / {4:x}", _name, i,
+                      hrNorm, hrGi, hrSsr);
             ReleaseGiBuffers();
             return false;
         }
 
+        _halfNormalBuffers[i]->SetName(i == 0 ? L"NL_HalfNormal_0" : L"NL_HalfNormal_1");
+        _halfNormalStates[i] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         _giBuffers[i]->SetName(i == 0 ? L"NL_GI_Buffer_0" : L"NL_GI_Buffer_1");
         _ssrBuffers[i]->SetName(i == 0 ? L"NL_SSR_Buffer_0" : L"NL_SSR_Buffer_1");
         _giBufferStates[i] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -100,15 +93,15 @@ void NL_Dx12::ReleaseGiBuffers()
         _halfColorDepthState = D3D12_RESOURCE_STATE_COMMON;
     }
 
-    if (_halfNormalBuffer != nullptr)
-    {
-        DeferredRelease::Release(_halfNormalBuffer);
-        _halfNormalBuffer = nullptr;
-        _halfNormalState = D3D12_RESOURCE_STATE_COMMON;
-    }
-
     for (int i = 0; i < 2; ++i)
     {
+        if (_halfNormalBuffers[i] != nullptr)
+        {
+            DeferredRelease::Release(_halfNormalBuffers[i]);
+            _halfNormalBuffers[i] = nullptr;
+            _halfNormalStates[i] = D3D12_RESOURCE_STATE_COMMON;
+        }
+
         if (_giBuffers[i] != nullptr)
         {
             DeferredRelease::Release(_giBuffers[i]);
@@ -203,19 +196,33 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     const bool runGiPass = (_activeTier > 0) &&
                            (giIntensity > 1e-4f || aoIntensity > 1e-4f || ssrEnabled || debugView == 1 || debugView == 2);
 
-    // Pass 0: Half-res L2-resident G-Proxy (pre-linearized Color+Depth + packed view Normals)
+    _giWriteIdx = (_giWriteIdx + 1) & 1;
+    const int prevIdx = _giWriteIdx ^ 1;
+
+    NeuralLookConstants temporalConstIn = InConstants;
+    if (_resetGiHistory)
+    {
+        temporalConstIn.ResetHistory = true;
+        _resetGiHistory = false;
+    }
+
+    // Pass 0: Half-res L2-resident Temporal G-Proxy (pre-linearized Color+Depth + temporal Normal/Flicker/RawDepth)
     {
         Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, _halfColorDepthBuffer,
                                     &_halfColorDepthState);
-        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, _halfNormalBuffer,
-                                    &_halfNormalState);
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, _halfNormalBuffers[_giWriteIdx],
+                                    &_halfNormalStates[_giWriteIdx]);
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    _halfNormalBuffers[prevIdx], &_halfNormalStates[prevIdx]);
 
         FrameDescriptorHeap& prepHeap = _frameHeapsPrep[_counter];
         CreateShaderResourceView(_device, InResource, prepHeap.GetSrvCPU(0));
         CreateShaderResourceView(_device, InDepth, prepHeap.GetSrvCPU(1));
         CreateShaderResourceView(_device, hasNormals ? InGBufferNormals : InResource, prepHeap.GetSrvCPU(2));
+        CreateShaderResourceView(_device, InMotionVectors, prepHeap.GetSrvCPU(3));
+        CreateShaderResourceView(_device, _halfNormalBuffers[prevIdx], prepHeap.GetSrvCPU(4));
         CreateUnorderedAccessView(_device, _halfColorDepthBuffer, prepHeap.GetUavCPU(0), 0);
-        CreateUnorderedAccessView(_device, _halfNormalBuffer, prepHeap.GetUavCPU(1), 0);
+        CreateUnorderedAccessView(_device, _halfNormalBuffers[_giWriteIdx], prepHeap.GetUavCPU(1), 0);
 
         NLPrepInternalConstants prepConstants {};
         prepConstants.OutputWidth = static_cast<int32_t>(outDesc.Width);
@@ -224,7 +231,9 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         prepConstants.HalfHeight = static_cast<int32_t>(_giHeight);
         prepConstants.DepthWidth = static_cast<int32_t>(depthDesc.Width);
         prepConstants.DepthHeight = static_cast<int32_t>(depthDesc.Height);
-        FillPrepConstants(prepConstants, InConstants, hasNormals, inEncodeMode);
+        prepConstants.MotionWidth = static_cast<int32_t>(mvsDesc.Width);
+        prepConstants.MotionHeight = static_cast<int32_t>(mvsDesc.Height);
+        FillPrepConstants(prepConstants, temporalConstIn, hasNormals, inEncodeMode);
 
         if (!CreateConstantsBuffer(_device, prepHeap, prepConstants, prepHeap.GetCbvCPU(0)))
         {
@@ -242,12 +251,9 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
 
         Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, _halfColorDepthBuffer,
                                     &_halfColorDepthState);
-        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, _halfNormalBuffer,
-                                    &_halfNormalState);
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    _halfNormalBuffers[_giWriteIdx], &_halfNormalStates[_giWriteIdx]);
     }
-
-    _giWriteIdx = (_giWriteIdx + 1) & 1;
-    const int prevIdx = _giWriteIdx ^ 1;
 
     // Pass 1: Checkerboard Temporal SSGI + Clipped Linear SSR
     if (runGiPass)
@@ -263,7 +269,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
 
         FrameDescriptorHeap& giHeap = _frameHeapsGi[_counter];
         CreateShaderResourceView(_device, _halfColorDepthBuffer, giHeap.GetSrvCPU(0));
-        CreateShaderResourceView(_device, _halfNormalBuffer, giHeap.GetSrvCPU(1));
+        CreateShaderResourceView(_device, _halfNormalBuffers[_giWriteIdx], giHeap.GetSrvCPU(1));
         CreateShaderResourceView(_device, InMotionVectors, giHeap.GetSrvCPU(2));
         CreateShaderResourceView(_device, _giBuffers[prevIdx], giHeap.GetSrvCPU(3));
         CreateShaderResourceView(_device, _ssrBuffers[prevIdx], giHeap.GetSrvCPU(4));
@@ -278,13 +284,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         giConstants.MotionWidth = static_cast<int32_t>(mvsDesc.Width);
         giConstants.MotionHeight = static_cast<int32_t>(mvsDesc.Height);
 
-        NeuralLookConstants giConstIn = InConstants;
-        if (_resetGiHistory)
-        {
-            giConstIn.ResetHistory = true;
-            _resetGiHistory = false;
-        }
-        FillGiConstants(giConstants, giConstIn, ssrEnabled);
+        FillGiConstants(giConstants, temporalConstIn, ssrEnabled);
 
         if (!CreateConstantsBuffer(_device, giHeap, giConstants, giHeap.GetCbvCPU(0)))
         {
@@ -313,7 +313,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         CreateShaderResourceView(_device, _halfColorDepthBuffer, compHeap.GetSrvCPU(1));
         CreateShaderResourceView(_device, InMotionVectors, compHeap.GetSrvCPU(2));
         CreateShaderResourceView(_device, _giBuffers[_giWriteIdx], compHeap.GetSrvCPU(3));
-        CreateShaderResourceView(_device, _halfNormalBuffer, compHeap.GetSrvCPU(4));
+        CreateShaderResourceView(_device, _halfNormalBuffers[_giWriteIdx], compHeap.GetSrvCPU(4));
         CreateShaderResourceView(_device, hasAlbedo ? InGBufferAlbedo : InResource, compHeap.GetSrvCPU(5));
         CreateShaderResourceView(_device, hasRoughness ? InGBufferRoughness : InResource, compHeap.GetSrvCPU(6));
         CreateShaderResourceView(_device, _ssrBuffers[_giWriteIdx], compHeap.GetSrvCPU(7));
@@ -377,18 +377,21 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
     if (!InitHeaps(InDevice, _frameHeapsComposite, NL_NUM_OF_HEAPS))
         return;
 
-    // 2. Setup Prep root signature (3 SRVs, 2 UAVs, 1 CBV) and PSO
+    // 2. Setup Prep root signature (5 SRVs, 2 UAVs, 1 CBV + static linear sampler) and PSO
     {
         CD3DX12_DESCRIPTOR_RANGE1 ranges[3] = {};
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0);
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0);
         ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0);
         ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
 
         CD3DX12_ROOT_PARAMETER1 rootParam {};
         rootParam.InitAsDescriptorTable(3, ranges);
 
+        CD3DX12_STATIC_SAMPLER_DESC linearClamp(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                                D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc {};
-        rootSigDesc.Init_1_1(1, &rootParam, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init_1_1(1, &rootParam, 1, &linearClamp, D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
         Microsoft::WRL::ComPtr<ID3DBlob> sigBlob;
         Microsoft::WRL::ComPtr<ID3DBlob> errBlob;
@@ -410,7 +413,7 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
         ScopedSkipHeapCapture skipHeapCapture {};
         for (int i = 0; i < NL_NUM_OF_HEAPS; ++i)
         {
-            if (!_frameHeapsPrep[i].Initialize(InDevice, 3, 2, 1, 0))
+            if (!_frameHeapsPrep[i].Initialize(InDevice, 5, 2, 1, 0))
             {
                 LOG_ERROR("[{0}] Failed to init Prep descriptor heap", _name);
                 return;

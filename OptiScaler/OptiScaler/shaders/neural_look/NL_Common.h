@@ -29,8 +29,8 @@ class NL_Common
     enum class BudgetTier : int
     {
         Light = 0,  // Prep + Composite + Relight + Neural Detail only (skip SSGI/SSR)
-        Medium = 1, // Prep + 3-ray Checkerboard SSGI + 6-step SSR + Composite
-        Full = 2    // Prep + 4-ray Checkerboard SSGI + 8-step SSR + Composite
+        Medium = 1, // Prep + 3-ray Checkerboard SSGI + 8-step SSR + Composite
+        Full = 2    // Prep + 4-ray Checkerboard SSGI + 12-step SSR + Composite
     };
 
     void UpdateBudget(double gpuMs)
@@ -98,6 +98,16 @@ class NL_Common
         float TanHalfFovAspect = 1.02640048f;
         int32_t HasGBufferNormals = 0;
         int32_t InColorEncodeMode = 0;
+
+        int32_t MotionWidth = 0;
+        int32_t MotionHeight = 0;
+        int32_t DisplaySizeMV = 0;
+        int32_t ResetHistory = 0;
+
+        float MvScaleX = 1.0f;
+        float MvScaleY = 1.0f;
+        float MotionTextureScale = 1.0f;
+        int32_t FrameIndex = 0;
     };
 
     struct alignas(256) NLGiInternalConstants
@@ -250,6 +260,13 @@ class NL_Common
         ComputeTanFov(c.OutputWidth, c.OutputHeight, inConst, c.TanHalfFov, c.TanHalfFovAspect);
         c.HasGBufferNormals = hasNormals ? 1 : 0;
         c.InColorEncodeMode = inEncodeMode;
+
+        c.DisplaySizeMV = (c.MotionWidth == c.OutputWidth) ? 1 : 0;
+        c.ResetHistory = inConst.ResetHistory ? 1 : 0;
+        c.MvScaleX = inConst.MvScaleX;
+        c.MvScaleY = inConst.MvScaleY;
+        c.MotionTextureScale = c.DisplaySizeMV ? 1.0f : ((float) c.MotionWidth / (float) std::max(c.OutputWidth, 1));
+        c.FrameIndex = static_cast<int32_t>(_frameIndex);
     }
 
     void FillGiConstants(NLGiInternalConstants& c, const NeuralLookConstants& inConst, bool ssrEnabled) const

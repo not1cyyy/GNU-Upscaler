@@ -43,7 +43,7 @@ Texture2D<float4> HalfColorDepthTex : register(t0);
 #ifdef VK_MODE
 [[vk::binding(2, 0)]]
 #endif
-Texture2D<float2> HalfNormalTex : register(t1);
+Texture2D<float4> HalfNormalTex : register(t1);
 
 #ifdef VK_MODE
 [[vk::binding(3, 0)]]
@@ -119,14 +119,6 @@ float InterleavedGradientNoise(float2 p)
     return frac(magic.z * frac(dot(p, magic.xy)));
 }
 
-void DecodeHalfNormal(float2 raw, out float3 viewNormal, out float ditherMask)
-{
-    float dQ = clamp(floor((raw.x + 2.0f) * 0.25f), 0.0f, 15.0f);
-    float2 nxy = float2(clamp(raw.x - dQ * 4.0f, -1.0f, 1.0f), clamp(raw.y, -1.0f, 1.0f));
-    viewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
-    ditherMask = dQ * (1.0f / 15.0f);
-}
-
 [numthreads(8, 8, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID)
 {
@@ -146,11 +138,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         return;
     }
 
-    float3 viewNormal;
-    float ditherMask;
-    DecodeHalfNormal(HalfNormalTex.Load(int3(giCoord, 0)).xy, viewNormal, ditherMask);
+    float4 hNorm = HalfNormalTex.Load(int3(giCoord, 0));
+    float2 nxy = clamp(hNorm.xy, -1.0f, 1.0f);
+    float3 viewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
+    float flickerMask = saturate(hNorm.z);
 
-    if (ditherMask > 0.85f)
+    if (flickerMask > 0.85f)
     {
         OutGiTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
         OutSsrTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -268,8 +261,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     // Screen-space clipped linear SSR raymarching using L2-cached half-res color/depth
     float4 currentSsr = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float ssrDistFade = 1.0f - smoothstep(22.0f, 55.0f, centerDepth);
-    if (SsrEnabled > 0 && ssrDistFade > 1e-3f)
+    if (SsrEnabled > 0)
     {
         float3 viewDir = normalize(centerPos);
         float3 reflDir = normalize(reflect(viewDir, viewNormal));
@@ -351,11 +343,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
     }
 
-    float aoDistFade = 1.0f - smoothstep(28.0f, 75.0f, centerDepth);
-    float solidTrust = 1.0f - ditherMask;
+    float solidTrust = 1.0f - flickerMask;
     currentGi *= solidTrust;
-    currentAo = lerp(1.0f, currentAo, solidTrust * aoDistFade);
-    currentSsr.a *= solidTrust * ssrDistFade;
+    currentAo = lerp(1.0f, currentAo, solidTrust);
+    currentSsr.a *= solidTrust;
 
     float4 giResult = float4(currentGi, currentAo);
     float4 ssrResult = currentSsr;
