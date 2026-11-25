@@ -182,11 +182,11 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     int rays = clamp(RayCount, 1, 8);
     int steps = clamp(StepCount, 2, 8);
-    float worldRange = clamp(centerDepth * 0.32f, 1.5f, 26.0f);
+    float worldRange = max(centerDepth * 0.32f, 1e-3f);
     float worldRangeSq = worldRange * worldRange;
     float invWorldRange = rcp(worldRange);
-    float invContactRange = rcp(max(centerDepth * 0.075f, 0.45f));
-    float thicknessLimit = clamp(centerDepth * 0.16f, 0.25f, 7.0f);
+    float invContactRange = rcp(max(centerDepth * 0.08f, 1e-4f));
+    float thicknessLimit = max(centerDepth * 0.16f, 1e-4f);
 
     [loop]
     for (int r = 0; r < rays; ++r)
@@ -269,18 +269,18 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float steepUp = smoothstep(0.35f, 0.90f, reflDir.y) * smoothstep(0.20f, 0.50f, viewNormal.y);
         if (steepUp > 1e-3f)
         {
-            float3 horizonRefl = normalize(float3(reflDir.x, 0.25f, max(reflDir.z, 0.85f)));
-            reflDir = normalize(lerp(reflDir, horizonRefl, steepUp * 0.78f));
+            float3 horizonRefl = normalize(float3(reflDir.x, 0.35f, max(reflDir.z, 0.80f)));
+            reflDir = normalize(lerp(reflDir, horizonRefl, steepUp * 0.72f));
         }
 
         if (reflDir.z > -0.60f)
         {
-            float ssrMaxDist = clamp(centerDepth * 2.4f, 8.0f, 75.0f);
-            float ssrThickness = clamp(centerDepth * 0.11f, 0.22f, 4.5f);
+            float ssrMaxDist = max(centerDepth * 3.0f, 1e-3f);
+            float minZClip = max(centerPos.z * 0.05f, 1e-4f);
 
             float rayLen = ssrMaxDist;
             if (reflDir.z < 0.0f)
-                rayLen = min(rayLen, max((0.1f - centerPos.z) / reflDir.z, 0.05f));
+                rayLen = min(rayLen, max((minZClip - centerPos.z) / reflDir.z, centerPos.z * 0.01f));
 
             float3 endPos = centerPos + reflDir * rayLen;
             float invTanHalfFov = rcp(max(TanHalfFov, 1e-4f));
@@ -299,14 +299,16 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             {
                 float2 clippedEndUv = uv + deltaUv * maxT;
                 float invZ0 = rcp(centerPos.z);
-                float endZ = rcp(lerp(invZ0, rcp(max(endPos.z, 0.1f)), maxT));
+                float endZ = rcp(lerp(invZ0, rcp(max(endPos.z, minZClip)), maxT));
                 float invZ1 = rcp(endZ);
 
                 int ssrSteps = clamp(SsrSteps, 4, 12);
                 float invSsrSteps = rcp(float(ssrSteps));
                 float prevKt = 0.0f;
+                float prevRayZ = centerPos.z;
                 float hitKt = 0.0f;
                 float2 hitUv = uv;
+                float hitThickness = 0.0f;
                 bool hit = false;
 
                 [loop]
@@ -318,33 +320,52 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     float rayZ = rcp(lerp(invZ0, invZ1, kt2));
 
                     float rayDepth = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rayUv * halfSize)), 0)).a;
-                    float diff = rayZ - rayDepth;
-                    if (diff > 0.0f && diff < ssrThickness)
+                    if (rayDepth < 64000.0f)
                     {
-                        hit = true;
-                        hitKt = kt2;
-                        hitUv = rayUv;
-                        break;
+                        float diff = rayZ - rayDepth;
+                        float stepThickness = max(rayDepth * 0.14f, abs(rayZ - prevRayZ) * 1.40f);
+                        if (diff > rayZ * 0.002f && diff < stepThickness)
+                        {
+                            hit = true;
+                            hitKt = kt2;
+                            hitUv = rayUv;
+                            hitThickness = stepThickness;
+                            break;
+                        }
                     }
 
                     prevKt = kt2;
+                    prevRayZ = rayZ;
                 }
 
                 if (hit)
                 {
-                    float midKt = 0.5f * (prevKt + hitKt);
-                    float2 midUv = lerp(uv, clippedEndUv, midKt);
-                    float midZ = rcp(lerp(invZ0, invZ1, midKt));
-                    float4 midCd = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(midUv * halfSize)), 0));
-                    float midDiff = midZ - midCd.a;
-                    float3 hitCol = (midDiff > 0.0f && midDiff < ssrThickness)
-                                        ? midCd.rgb
-                                        : HalfColorDepthTex.Load(int3(ClampGiCoord(int2(hitUv * halfSize)), 0)).rgb;
+                    float loKt = prevKt;
+                    float hiKt = hitKt;
+                    [unroll]
+                    for (int b = 0; b < 2; ++b)
+                    {
+                        float midKt = 0.5f * (loKt + hiKt);
+                        float2 midUv = lerp(uv, clippedEndUv, midKt);
+                        float midZ = rcp(lerp(invZ0, invZ1, midKt));
+                        float midDepth = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(midUv * halfSize)), 0)).a;
+                        float midDiff = midZ - midDepth;
+                        if (midDepth < 64000.0f && midDiff > midZ * 0.002f && midDiff < hitThickness)
+                        {
+                            hiKt = midKt;
+                            hitUv = midUv;
+                        }
+                        else
+                        {
+                            loKt = midKt;
+                        }
+                    }
 
+                    float3 hitCol = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(hitUv * halfSize)), 0)).rgb;
                     float2 edgeDist = min(hitUv, 1.0f - hitUv);
                     float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 9.0f);
-                    float distFade = 1.0f - saturate(hitKt * maxT * 0.75f);
-                    currentSsr = float4(hitCol, edgeFade * lerp(0.50f, 1.0f, distFade));
+                    float distFade = 1.0f - saturate(hiKt * maxT * 0.75f);
+                    currentSsr = float4(hitCol, edgeFade * lerp(0.55f, 1.0f, distFade));
                 }
             }
         }

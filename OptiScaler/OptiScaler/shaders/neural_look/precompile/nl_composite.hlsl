@@ -556,10 +556,10 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
         // Keep floor sheen consistent from 0 deg horizontal to 60 deg pitched down; never darken vertical walls
         float floorMask = smoothstep(0.20f, 0.50f, viewNormal.y);
-        float3 envFallback = giBounce * 1.15f + litColor * 0.32f;
+        float3 envFallback = giBounce * 1.15f + litColor * 0.60f;
         float hitAlpha = saturate(ssrSample.a);
         float3 reflColor = lerp(envFallback, ssrSample.rgb, hitAlpha);
-        float reflWeight = baseReflWeight * lerp(0.82f * floorMask, 1.0f, hitAlpha);
+        float reflWeight = baseReflWeight * lerp(0.38f * floorMask, 1.0f, hitAlpha);
         litColor = lerp(litColor, reflColor, reflWeight);
     }
 
