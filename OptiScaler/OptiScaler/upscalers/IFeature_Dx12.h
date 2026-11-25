@@ -47,7 +47,7 @@ class IFeature_Dx12 : public virtual IFeature
 
     void RestoreBarriers(ID3D12GraphicsCommandList* InCommandList);
     RcasConstants BuildRcasConstants(NVSDK_NGX_Parameter* InParameters);
-    NeuralLookConstants BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters);
+    NeuralLookConstants BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters, bool fuseRcas);
     bool ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const PendingAsyncPostPasses& passes);
 
   protected:

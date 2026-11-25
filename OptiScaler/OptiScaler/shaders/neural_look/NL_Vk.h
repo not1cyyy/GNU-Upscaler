@@ -7,6 +7,17 @@
 class NL_Vk : public Shader_Vk, public NL_Common
 {
   private:
+    VkBuffer _constantBufferPrep = VK_NULL_HANDLE;
+    VkDeviceMemory _constantBufferMemoryPrep = VK_NULL_HANDLE;
+    void* _mappedConstantBufferPrep = nullptr;
+    VkDeviceSize _constantStridePrep = 0;
+
+    VkDescriptorPool _descriptorPoolPrep = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> _descriptorSetsPrep;
+    VkDescriptorSetLayout _descriptorSetLayoutPrep = VK_NULL_HANDLE;
+    VkPipelineLayout _pipelineLayoutPrep = VK_NULL_HANDLE;
+    VkPipeline _pipelinePrep = VK_NULL_HANDLE;
+
     VkBuffer _constantBufferGi = VK_NULL_HANDLE;
     VkDeviceMemory _constantBufferMemoryGi = VK_NULL_HANDLE;
     void* _mappedConstantBufferGi = nullptr;
@@ -17,6 +28,16 @@ class NL_Vk : public Shader_Vk, public NL_Common
     VkDescriptorSetLayout _descriptorSetLayoutGi = VK_NULL_HANDLE;
     VkPipelineLayout _pipelineLayoutGi = VK_NULL_HANDLE;
     VkPipeline _pipelineGi = VK_NULL_HANDLE;
+
+    VkImage _halfColorDepthImage = VK_NULL_HANDLE;
+    VkImageView _halfColorDepthView = VK_NULL_HANDLE;
+    VkDeviceMemory _halfColorDepthMemory = VK_NULL_HANDLE;
+    bool _halfColorDepthInit = false;
+
+    VkImage _halfNormalImage = VK_NULL_HANDLE;
+    VkImageView _halfNormalView = VK_NULL_HANDLE;
+    VkDeviceMemory _halfNormalMemory = VK_NULL_HANDLE;
+    bool _halfNormalInit = false;
 
     VkImage _giImages[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkImageView _giImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
@@ -33,19 +54,23 @@ class NL_Vk : public Shader_Vk, public NL_Common
     int _giWriteIdx = 0;
     bool _resetGiHistory = true;
 
-    bool CreateHalfResImage(uint32_t width, uint32_t height, VkImage& outImg, VkImageView& outView,
+    bool CreateHalfResImage(uint32_t width, uint32_t height, VkFormat format, VkImage& outImg, VkImageView& outView,
                             VkDeviceMemory& outMem);
     bool CreateGiImages(uint32_t width, uint32_t height);
     void ReleaseGiImages();
 
-    void UpdateGiDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo, VkImageView colorView,
-                               VkImageView depthView, VkImageView motionView, VkImageView prevGiView,
-                               VkImageView normalsView, VkImageView prevSsrView, VkImageView outGiView,
+    void UpdatePrepDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo, VkImageView colorView,
+                                 VkImageView depthView, VkImageView normalsView, VkImageView outColorDepthView,
+                                 VkImageView outNormalView);
+
+    void UpdateGiDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
+                               VkImageView halfColorDepthView, VkImageView halfNormalView, VkImageView motionView,
+                               VkImageView prevGiView, VkImageView prevSsrView, VkImageView outGiView,
                                VkImageView outSsrView);
 
     void UpdateCompositeDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
-                                      VkImageView colorView, VkImageView depthView, VkImageView motionView,
-                                      VkImageView giView, VkImageView normalsView, VkImageView albedoView,
+                                      VkImageView colorView, VkImageView halfColorDepthView, VkImageView motionView,
+                                      VkImageView giView, VkImageView halfNormalView, VkImageView albedoView,
                                       VkImageView roughnessView, VkImageView ssrView, VkImageView outColorView);
 
   public:

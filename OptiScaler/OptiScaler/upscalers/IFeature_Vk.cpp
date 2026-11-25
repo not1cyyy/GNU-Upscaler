@@ -102,6 +102,11 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
     const bool useNeuralLook = Config::Instance()->NeuralLookEnabled.value_or_default() && NeuralLook != nullptr &&
                                NeuralLook->IsInit() && paramDepth != nullptr && paramMotion != nullptr;
 
+    const bool fuseRcasIntoNeuralLook =
+        useNeuralLook && useRcas && Config::Instance()->SharpnessShader.value_or_default() == SharpenShader::RCAS &&
+        !Config::Instance()->MotionSharpnessEnabled.value_or_default() &&
+        !Config::Instance()->MotionSharpnessDebug.value_or_default();
+
     // Save the original output so we can restore it later
     VkImageInfo originalOutput {};
     if (paramOutput)
@@ -135,7 +140,7 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
         pipeline[passCount++].stage = PostPassStage::NeuralLook;
 
     _actualSharpness.reset();
-    if (useRcas)
+    if (useRcas && !fuseRcasIntoNeuralLook)
         pipeline[passCount++].stage = PostPassStage::Rcas;
 
     if (Magnifier->ShouldRun())
@@ -177,6 +182,13 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
                 NeuralLook->CreateImageResource(Device, PhysicalDevice, currentTarget.Width, currentTarget.Height,
                                                 currentTarget.Format, intermediateUsage))
             {
+                if (fuseRcasIntoNeuralLook)
+                {
+                    InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
+                    _actualSharpness = _sharpness;
+                    _sharpness = 0.0f;
+                }
+
                 NeuralLook->SetImageLayout(InCmdBuffer, NeuralLook->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
                                            VK_IMAGE_LAYOUT_GENERAL, currentTarget.SubresourceRange);
 
@@ -302,6 +314,12 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
                 nlConstants.DepthIsReversed = DepthInverted();
                 nlConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
                                     State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+                if (fuseRcasIntoNeuralLook)
+                {
+                    nlConstants.FusedRcasSharpness = _actualSharpness.value_or(_sharpness);
+                    _sharpness = _actualSharpness.value_or(_sharpness);
+                    _actualSharpness.reset();
+                }
 
                 InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &nlConstants.MvScaleX);
                 InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &nlConstants.MvScaleY);

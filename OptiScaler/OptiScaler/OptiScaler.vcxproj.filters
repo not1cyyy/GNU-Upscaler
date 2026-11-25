@@ -995,6 +995,12 @@
     <ClInclude Include="shaders\neural_look\precompile\nl_gi_temporal_Shader_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="shaders\neural_look\precompile\nl_prep_Shader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\neural_look\precompile\nl_prep_Shader_Vk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="shaders\rcas\precompile\da_das_sharpen_Shader_Dx11.h">
       <Filter>Header Files</Filter>
     </ClInclude>

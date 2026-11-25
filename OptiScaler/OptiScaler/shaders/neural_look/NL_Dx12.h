@@ -14,9 +14,15 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
   private:
     FrameDescriptorHeap _frameHeapsComposite[NL_NUM_OF_HEAPS];
     FrameDescriptorHeap _frameHeapsGi[NL_NUM_OF_HEAPS];
+    FrameDescriptorHeap _frameHeapsPrep[NL_NUM_OF_HEAPS];
 
     ID3D12Resource* _buffer = nullptr;
     D3D12_RESOURCE_STATES _bufferState = D3D12_RESOURCE_STATE_COMMON;
+
+    ID3D12Resource* _halfColorDepthBuffer = nullptr;
+    D3D12_RESOURCE_STATES _halfColorDepthState = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* _halfNormalBuffer = nullptr;
+    D3D12_RESOURCE_STATES _halfNormalState = D3D12_RESOURCE_STATE_COMMON;
 
     ID3D12Resource* _giBuffers[2] = { nullptr, nullptr };
     D3D12_RESOURCE_STATES _giBufferStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
@@ -27,6 +33,8 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
     int _giWriteIdx = 0;
     bool _resetGiHistory = true;
 
+    ID3D12RootSignature* _rootSignaturePrep = nullptr;
+    ID3D12PipelineState* _pipelineStatePrep = nullptr;
     ID3D12RootSignature* _rootSignatureGi = nullptr;
     ID3D12PipelineState* _pipelineStateGi = nullptr;
 

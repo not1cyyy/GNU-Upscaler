@@ -100,7 +100,7 @@ RcasConstants IFeature_Dx12::BuildRcasConstants(NVSDK_NGX_Parameter* InParameter
     return rcasConstants;
 }
 
-NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters)
+NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters, bool fuseRcas)
 {
     NeuralLookConstants nlConstants {};
 
@@ -108,6 +108,13 @@ NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter*
     nlConstants.DepthIsReversed = DepthInverted();
     nlConstants.IsHdr =
         IsHdr() || State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+
+    if (fuseRcas)
+    {
+        nlConstants.FusedRcasSharpness = _actualSharpness.value_or(_sharpness);
+        _sharpness = _actualSharpness.value_or(_sharpness);
+        _actualSharpness.reset();
+    }
 
     InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &nlConstants.MvScaleX);
     InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &nlConstants.MvScaleY);
@@ -318,6 +325,11 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     const bool useNeuralLook = Config::Instance()->NeuralLookEnabled.value_or_default() && NeuralLook != nullptr &&
                                NeuralLook->IsInit() && paramDepth != nullptr && paramMotion != nullptr;
 
+    const bool fuseRcasIntoNeuralLook =
+        useNeuralLook && useRcas && Config::Instance()->SharpnessShader.value_or_default() == SharpenShader::RCAS &&
+        !Config::Instance()->MotionSharpnessEnabled.value_or_default() &&
+        !Config::Instance()->MotionSharpnessDebug.value_or_default();
+
     // Order is important as that's the order of shader dispatch
     struct PostPass
     {
@@ -336,7 +348,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
         pipeline[passCount++].stage = PostPassStage::NeuralLook;
 
     _actualSharpness.reset();
-    if (useRcas)
+    if (useRcas && !fuseRcasIntoNeuralLook)
         pipeline[passCount++].stage = PostPassStage::Rcas;
 
     if (Magnifier->ShouldRun())
@@ -370,6 +382,13 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
                 NeuralLook->CreateBufferResource(Device, currentTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
                 NeuralLook->CanRender())
             {
+                if (fuseRcasIntoNeuralLook)
+                {
+                    InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
+                    _actualSharpness = _sharpness;
+                    _sharpness = 0.0f;
+                }
+
                 NeuralLook->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 requiredInput = NeuralLook->Buffer();
             }
@@ -481,7 +500,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
                     pending.paramGBufferNormals = paramGBufferNormals;
                     pending.paramGBufferAlbedo = paramGBufferAlbedo;
                     pending.paramGBufferRoughness = paramGBufferRoughness;
-                    pending.nlConstants = BuildNeuralLookConstants(InParameters);
+                    pending.nlConstants = BuildNeuralLookConstants(InParameters, fuseRcasIntoNeuralLook);
                     pending.active = true;
                 }
                 break;
@@ -543,7 +562,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
             if (NeuralLook && NeuralLook->CanRender() && paramMotion && paramDepth && paramOutput)
             {
                 NeuralLook->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                const NeuralLookConstants nlConstants = BuildNeuralLookConstants(InParameters);
+                const NeuralLookConstants nlConstants = BuildNeuralLookConstants(InParameters, fuseRcasIntoNeuralLook);
 
                 if (!NeuralLook->Dispatch(InCommandList, pass.inputBuffer, paramMotion, paramDepth, nlConstants,
                                           pass.outputBuffer, paramGBufferNormals, paramGBufferAlbedo,

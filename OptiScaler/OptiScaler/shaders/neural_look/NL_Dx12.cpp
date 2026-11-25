@@ -3,6 +3,7 @@
 #include "NL_Dx12.h"
 #include "precompile/nl_composite_Shader.h"
 #include "precompile/nl_gi_temporal_Shader.h"
+#include "precompile/nl_prep_Shader.h"
 
 #include <State.h>
 #include <misc/DeferredRelease.h>
@@ -13,8 +14,9 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
     const uint32_t targetW = std::max(1u, width / 2u);
     const uint32_t targetH = std::max(1u, height / 2u);
 
-    if (_giBuffers[0] != nullptr && _giBuffers[1] != nullptr && _ssrBuffers[0] != nullptr &&
-        _ssrBuffers[1] != nullptr && _giWidth == targetW && _giHeight == targetH)
+    if (_halfColorDepthBuffer != nullptr && _halfNormalBuffer != nullptr && _giBuffers[0] != nullptr &&
+        _giBuffers[1] != nullptr && _ssrBuffers[0] != nullptr && _ssrBuffers[1] != nullptr && _giWidth == targetW &&
+        _giHeight == targetH)
     {
         return true;
     }
@@ -35,6 +37,32 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
     auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+
+    if (FAILED(InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                 IID_PPV_ARGS(&_halfColorDepthBuffer))) ||
+        _halfColorDepthBuffer == nullptr)
+    {
+        LOG_ERROR("[{0}] Failed to create half-res ColorDepth buffer", _name);
+        ReleaseGiBuffers();
+        return false;
+    }
+    _halfColorDepthBuffer->SetName(L"NL_HalfColorDepth");
+    _halfColorDepthState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    D3D12_RESOURCE_DESC normDesc = desc;
+    normDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    if (FAILED(InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &normDesc,
+                                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                 IID_PPV_ARGS(&_halfNormalBuffer))) ||
+        _halfNormalBuffer == nullptr)
+    {
+        LOG_ERROR("[{0}] Failed to create half-res Normal buffer", _name);
+        ReleaseGiBuffers();
+        return false;
+    }
+    _halfNormalBuffer->SetName(L"NL_HalfNormal");
+    _halfNormalState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     for (int i = 0; i < 2; ++i)
     {
@@ -65,6 +93,20 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
 
 void NL_Dx12::ReleaseGiBuffers()
 {
+    if (_halfColorDepthBuffer != nullptr)
+    {
+        DeferredRelease::Release(_halfColorDepthBuffer);
+        _halfColorDepthBuffer = nullptr;
+        _halfColorDepthState = D3D12_RESOURCE_STATE_COMMON;
+    }
+
+    if (_halfNormalBuffer != nullptr)
+    {
+        DeferredRelease::Release(_halfNormalBuffer);
+        _halfNormalBuffer = nullptr;
+        _halfNormalState = D3D12_RESOURCE_STATE_COMMON;
+    }
+
     for (int i = 0; i < 2; ++i)
     {
         if (_giBuffers[i] != nullptr)
@@ -161,9 +203,53 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     const bool runGiPass = (_activeTier > 0) &&
                            (giIntensity > 1e-4f || aoIntensity > 1e-4f || ssrEnabled || debugView == 1 || debugView == 2);
 
+    // Pass 0: Half-res L2-resident G-Proxy (pre-linearized Color+Depth + packed view Normals)
+    {
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, _halfColorDepthBuffer,
+                                    &_halfColorDepthState);
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, _halfNormalBuffer,
+                                    &_halfNormalState);
+
+        FrameDescriptorHeap& prepHeap = _frameHeapsPrep[_counter];
+        CreateShaderResourceView(_device, InResource, prepHeap.GetSrvCPU(0));
+        CreateShaderResourceView(_device, InDepth, prepHeap.GetSrvCPU(1));
+        CreateShaderResourceView(_device, hasNormals ? InGBufferNormals : InResource, prepHeap.GetSrvCPU(2));
+        CreateUnorderedAccessView(_device, _halfColorDepthBuffer, prepHeap.GetUavCPU(0), 0);
+        CreateUnorderedAccessView(_device, _halfNormalBuffer, prepHeap.GetUavCPU(1), 0);
+
+        NLPrepInternalConstants prepConstants {};
+        prepConstants.OutputWidth = static_cast<int32_t>(outDesc.Width);
+        prepConstants.OutputHeight = static_cast<int32_t>(outDesc.Height);
+        prepConstants.HalfWidth = static_cast<int32_t>(_giWidth);
+        prepConstants.HalfHeight = static_cast<int32_t>(_giHeight);
+        prepConstants.DepthWidth = static_cast<int32_t>(depthDesc.Width);
+        prepConstants.DepthHeight = static_cast<int32_t>(depthDesc.Height);
+        FillPrepConstants(prepConstants, InConstants, hasNormals, inEncodeMode);
+
+        if (!CreateConstantsBuffer(_device, prepHeap, prepConstants, prepHeap.GetCbvCPU(0)))
+        {
+            LOG_ERROR("[{0}] Failed to create Prep constants buffer", _name);
+            return false;
+        }
+
+        ID3D12DescriptorHeap* heaps[] = { prepHeap.GetHeapCSU() };
+        InCmdList->SetDescriptorHeaps(_countof(heaps), heaps);
+        InCmdList->SetComputeRootSignature(_rootSignaturePrep);
+        InCmdList->SetPipelineState(_pipelineStatePrep);
+        InCmdList->SetComputeRootDescriptorTable(0, prepHeap.GetTableGPUStart());
+
+        InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
+
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, _halfColorDepthBuffer,
+                                    &_halfColorDepthState);
+        Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, _halfNormalBuffer,
+                                    &_halfNormalState);
+    }
+
     _giWriteIdx = (_giWriteIdx + 1) & 1;
     const int prevIdx = _giWriteIdx ^ 1;
 
+    // Pass 1: Checkerboard Temporal SSGI + Clipped Linear SSR
     if (runGiPass)
     {
         Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, _giBuffers[_giWriteIdx],
@@ -176,12 +262,11 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
                                     &_ssrBufferStates[prevIdx]);
 
         FrameDescriptorHeap& giHeap = _frameHeapsGi[_counter];
-        CreateShaderResourceView(_device, InResource, giHeap.GetSrvCPU(0));
-        CreateShaderResourceView(_device, InDepth, giHeap.GetSrvCPU(1));
+        CreateShaderResourceView(_device, _halfColorDepthBuffer, giHeap.GetSrvCPU(0));
+        CreateShaderResourceView(_device, _halfNormalBuffer, giHeap.GetSrvCPU(1));
         CreateShaderResourceView(_device, InMotionVectors, giHeap.GetSrvCPU(2));
         CreateShaderResourceView(_device, _giBuffers[prevIdx], giHeap.GetSrvCPU(3));
-        CreateShaderResourceView(_device, hasNormals ? InGBufferNormals : InResource, giHeap.GetSrvCPU(4));
-        CreateShaderResourceView(_device, _ssrBuffers[prevIdx], giHeap.GetSrvCPU(5));
+        CreateShaderResourceView(_device, _ssrBuffers[prevIdx], giHeap.GetSrvCPU(4));
         CreateUnorderedAccessView(_device, _giBuffers[_giWriteIdx], giHeap.GetUavCPU(0), 0);
         CreateUnorderedAccessView(_device, _ssrBuffers[_giWriteIdx], giHeap.GetUavCPU(1), 0);
 
@@ -190,8 +275,6 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         giConstants.OutputHeight = static_cast<int32_t>(outDesc.Height);
         giConstants.GiWidth = static_cast<int32_t>(_giWidth);
         giConstants.GiHeight = static_cast<int32_t>(_giHeight);
-        giConstants.DepthWidth = static_cast<int32_t>(depthDesc.Width);
-        giConstants.DepthHeight = static_cast<int32_t>(depthDesc.Height);
         giConstants.MotionWidth = static_cast<int32_t>(mvsDesc.Width);
         giConstants.MotionHeight = static_cast<int32_t>(mvsDesc.Height);
 
@@ -201,7 +284,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
             giConstIn.ResetHistory = true;
             _resetGiHistory = false;
         }
-        FillGiConstants(giConstants, giConstIn, hasNormals, inEncodeMode, ssrEnabled);
+        FillGiConstants(giConstants, giConstIn, ssrEnabled);
 
         if (!CreateConstantsBuffer(_device, giHeap, giConstants, giHeap.GetCbvCPU(0)))
         {
@@ -215,9 +298,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         InCmdList->SetPipelineState(_pipelineStateGi);
         InCmdList->SetComputeRootDescriptorTable(0, giHeap.GetTableGPUStart());
 
-        const UINT gx = (_giWidth + 7u) / 8u;
-        const UINT gy = (_giHeight + 7u) / 8u;
-        InCmdList->Dispatch(gx, gy, 1);
+        InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
 
         Shader_Dx12::SetBufferState(InCmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, _giBuffers[_giWriteIdx],
                                     &_giBufferStates[_giWriteIdx]);
@@ -225,14 +306,14 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
                                     &_ssrBufferStates[_giWriteIdx]);
     }
 
-    // Composite pass
+    // Pass 2: Full-res Composite (with fused 5-tap denoise, packed FP16 MLP, and optional fused RCAS)
     {
         FrameDescriptorHeap& compHeap = _frameHeapsComposite[_counter];
         CreateShaderResourceView(_device, InResource, compHeap.GetSrvCPU(0));
-        CreateShaderResourceView(_device, InDepth, compHeap.GetSrvCPU(1));
+        CreateShaderResourceView(_device, _halfColorDepthBuffer, compHeap.GetSrvCPU(1));
         CreateShaderResourceView(_device, InMotionVectors, compHeap.GetSrvCPU(2));
         CreateShaderResourceView(_device, _giBuffers[_giWriteIdx], compHeap.GetSrvCPU(3));
-        CreateShaderResourceView(_device, hasNormals ? InGBufferNormals : InResource, compHeap.GetSrvCPU(4));
+        CreateShaderResourceView(_device, _halfNormalBuffer, compHeap.GetSrvCPU(4));
         CreateShaderResourceView(_device, hasAlbedo ? InGBufferAlbedo : InResource, compHeap.GetSrvCPU(5));
         CreateShaderResourceView(_device, hasRoughness ? InGBufferRoughness : InResource, compHeap.GetSrvCPU(6));
         CreateShaderResourceView(_device, _ssrBuffers[_giWriteIdx], compHeap.GetSrvCPU(7));
@@ -296,10 +377,10 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
     if (!InitHeaps(InDevice, _frameHeapsComposite, NL_NUM_OF_HEAPS))
         return;
 
-    // 2. Setup GI+SSR root signature (6 SRVs, 2 UAVs, 1 CBV) and PSO
+    // 2. Setup Prep root signature (3 SRVs, 2 UAVs, 1 CBV) and PSO
     {
         CD3DX12_DESCRIPTOR_RANGE1 ranges[3] = {};
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6, 0);
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0);
         ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0);
         ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
 
@@ -308,6 +389,50 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
 
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc {};
         rootSigDesc.Init_1_1(1, &rootParam, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        Microsoft::WRL::ComPtr<ID3DBlob> sigBlob;
+        Microsoft::WRL::ComPtr<ID3DBlob> errBlob;
+        if (FAILED(D3D12SerializeVersionedRootSignature(&rootSigDesc, &sigBlob, &errBlob)) ||
+            FAILED(InDevice->CreateRootSignature(0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(),
+                                                 IID_PPV_ARGS(&_rootSignaturePrep))))
+        {
+            LOG_ERROR("[{0}] Failed to create Prep root signature", _name);
+            return;
+        }
+
+        if (!CreateComputeShader(InDevice, _rootSignaturePrep, &_pipelineStatePrep, nullptr,
+                                 CD3DX12_SHADER_BYTECODE(nl_prep_cso, sizeof(nl_prep_cso))))
+        {
+            LOG_ERROR("[{0}] Failed to create Prep compute PSO", _name);
+            return;
+        }
+
+        ScopedSkipHeapCapture skipHeapCapture {};
+        for (int i = 0; i < NL_NUM_OF_HEAPS; ++i)
+        {
+            if (!_frameHeapsPrep[i].Initialize(InDevice, 3, 2, 1, 0))
+            {
+                LOG_ERROR("[{0}] Failed to init Prep descriptor heap", _name);
+                return;
+            }
+        }
+    }
+
+    // 3. Setup GI+SSR root signature (5 SRVs, 2 UAVs, 1 CBV + static linear sampler) and PSO
+    {
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[3] = {};
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0);
+        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
+
+        CD3DX12_ROOT_PARAMETER1 rootParam {};
+        rootParam.InitAsDescriptorTable(3, ranges);
+
+        CD3DX12_STATIC_SAMPLER_DESC linearClamp(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                                D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc {};
+        rootSigDesc.Init_1_1(1, &rootParam, 1, &linearClamp, D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
         Microsoft::WRL::ComPtr<ID3DBlob> sigBlob;
         Microsoft::WRL::ComPtr<ID3DBlob> errBlob;
@@ -329,7 +454,7 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
         ScopedSkipHeapCapture skipHeapCapture {};
         for (int i = 0; i < NL_NUM_OF_HEAPS; ++i)
         {
-            if (!_frameHeapsGi[i].Initialize(InDevice, 6, 2, 1, 0))
+            if (!_frameHeapsGi[i].Initialize(InDevice, 5, 2, 1, 0))
             {
                 LOG_ERROR("[{0}] Failed to init GI descriptor heap", _name);
                 return;
@@ -345,12 +470,15 @@ NL_Dx12::~NL_Dx12()
     if (State::Instance().isShuttingDown)
         return;
 
+    DeferredRelease::Release(_pipelineStatePrep);
+    DeferredRelease::Release(_rootSignaturePrep);
     DeferredRelease::Release(_pipelineStateGi);
     DeferredRelease::Release(_rootSignatureGi);
 
     for (int i = 0; i < NL_NUM_OF_HEAPS; ++i)
     {
         _frameHeapsComposite[i].ReleaseHeaps();
+        _frameHeapsPrep[i].ReleaseHeaps();
         _frameHeapsGi[i].ReleaseHeaps();
     }
 

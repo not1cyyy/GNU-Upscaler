@@ -301,6 +301,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\neural_look\precompile\nl_composite_Shader_Vk.h" />
     <ClInclude Include="shaders\neural_look\precompile\nl_gi_temporal_Shader.h" />
     <ClInclude Include="shaders\neural_look\precompile\nl_gi_temporal_Shader_Vk.h" />
+    <ClInclude Include="shaders\neural_look\precompile\nl_prep_Shader.h" />
+    <ClInclude Include="shaders\neural_look\precompile\nl_prep_Shader_Vk.h" />
     <ClInclude Include="shaders\rcas\precompile\da_das_sharpen_Shader.h" />
     <ClInclude Include="shaders\rcas\precompile\da_das_sharpen_Shader_Dx11.h" />
     <ClInclude Include="shaders\rcas\precompile\da_das_sharpen_Shader_Vk.h" />

@@ -3,11 +3,12 @@
 #include "NL_Vk.h"
 #include "precompile/nl_composite_Shader_Vk.h"
 #include "precompile/nl_gi_temporal_Shader_Vk.h"
+#include "precompile/nl_prep_Shader_Vk.h"
 
 #include <State.h>
 #include <misc/DeferredRelease.h>
 
-bool NL_Vk::CreateHalfResImage(uint32_t width, uint32_t height, VkImage& outImg, VkImageView& outView,
+bool NL_Vk::CreateHalfResImage(uint32_t width, uint32_t height, VkFormat format, VkImage& outImg, VkImageView& outView,
                                VkDeviceMemory& outMem)
 {
     VkImageCreateInfo imageInfo {};
@@ -16,7 +17,7 @@ bool NL_Vk::CreateHalfResImage(uint32_t width, uint32_t height, VkImage& outImg,
     imageInfo.extent = { width, height, 1 };
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
-    imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    imageInfo.format = format;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -44,7 +45,7 @@ bool NL_Vk::CreateHalfResImage(uint32_t width, uint32_t height, VkImage& outImg,
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = outImg;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    viewInfo.format = format;
     viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
     return vkCreateImageView(_device, &viewInfo, nullptr, &outView) == VK_SUCCESS;
@@ -55,7 +56,8 @@ bool NL_Vk::CreateGiImages(uint32_t width, uint32_t height)
     const uint32_t targetW = std::max(1u, width / 2u);
     const uint32_t targetH = std::max(1u, height / 2u);
 
-    if (_giImages[0] != VK_NULL_HANDLE && _giImages[1] != VK_NULL_HANDLE && _ssrImages[0] != VK_NULL_HANDLE &&
+    if (_halfColorDepthImage != VK_NULL_HANDLE && _halfNormalImage != VK_NULL_HANDLE &&
+        _giImages[0] != VK_NULL_HANDLE && _giImages[1] != VK_NULL_HANDLE && _ssrImages[0] != VK_NULL_HANDLE &&
         _ssrImages[1] != VK_NULL_HANDLE && _giWidth == targetW && _giHeight == targetH)
     {
         return true;
@@ -63,10 +65,24 @@ bool NL_Vk::CreateGiImages(uint32_t width, uint32_t height)
 
     ReleaseGiImages();
 
+    if (!CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16B16A16_SFLOAT, _halfColorDepthImage,
+                            _halfColorDepthView, _halfColorDepthMemory) ||
+        !CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16_SFLOAT, _halfNormalImage, _halfNormalView,
+                            _halfNormalMemory))
+    {
+        LOG_ERROR("[{0}] Failed to create half-res G-proxy VkImages", _name);
+        ReleaseGiImages();
+        return false;
+    }
+    _halfColorDepthInit = false;
+    _halfNormalInit = false;
+
     for (int i = 0; i < 2; ++i)
     {
-        if (!CreateHalfResImage(targetW, targetH, _giImages[i], _giImageViews[i], _giMemories[i]) ||
-            !CreateHalfResImage(targetW, targetH, _ssrImages[i], _ssrImageViews[i], _ssrMemories[i]))
+        if (!CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16B16A16_SFLOAT, _giImages[i], _giImageViews[i],
+                                _giMemories[i]) ||
+            !CreateHalfResImage(targetW, targetH, VK_FORMAT_R16G16B16A16_SFLOAT, _ssrImages[i], _ssrImageViews[i],
+                                _ssrMemories[i]))
         {
             LOG_ERROR("[{0}] Failed to create GI/SSR VkImages {1}", _name, i);
             ReleaseGiImages();
@@ -85,6 +101,40 @@ bool NL_Vk::CreateGiImages(uint32_t width, uint32_t height)
 
 void NL_Vk::ReleaseGiImages()
 {
+    if (_halfColorDepthView != VK_NULL_HANDLE || _halfColorDepthImage != VK_NULL_HANDLE ||
+        _halfColorDepthMemory != VK_NULL_HANDLE || _halfNormalView != VK_NULL_HANDLE ||
+        _halfNormalImage != VK_NULL_HANDLE || _halfNormalMemory != VK_NULL_HANDLE)
+    {
+        DeferredRelease::Enqueue(
+            [device = _device, cdView = _halfColorDepthView, cdImg = _halfColorDepthImage,
+             cdMem = _halfColorDepthMemory, nView = _halfNormalView, nImg = _halfNormalImage, nMem = _halfNormalMemory]()
+            {
+                if (cdView != VK_NULL_HANDLE)
+                    vkDestroyImageView(device, cdView, nullptr);
+                if (cdImg != VK_NULL_HANDLE)
+                    vkDestroyImage(device, cdImg, nullptr);
+                if (cdMem != VK_NULL_HANDLE)
+                    vkFreeMemory(device, cdMem, nullptr);
+                if (nView != VK_NULL_HANDLE)
+                    vkDestroyImageView(device, nView, nullptr);
+                if (nImg != VK_NULL_HANDLE)
+                    vkDestroyImage(device, nImg, nullptr);
+                if (nMem != VK_NULL_HANDLE)
+                    vkFreeMemory(device, nMem, nullptr);
+            },
+            (uint64_t) _device);
+    }
+
+    _halfColorDepthView = VK_NULL_HANDLE;
+    _halfColorDepthImage = VK_NULL_HANDLE;
+    _halfColorDepthMemory = VK_NULL_HANDLE;
+    _halfColorDepthInit = false;
+
+    _halfNormalView = VK_NULL_HANDLE;
+    _halfNormalImage = VK_NULL_HANDLE;
+    _halfNormalMemory = VK_NULL_HANDLE;
+    _halfNormalInit = false;
+
     for (int i = 0; i < 2; ++i)
     {
         if (_giImageViews[i] != VK_NULL_HANDLE || _giImages[i] != VK_NULL_HANDLE || _giMemories[i] != VK_NULL_HANDLE ||
@@ -134,7 +184,7 @@ NL_Vk::NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalD
         return;
     }
 
-    CreateSampler(VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    CreateSampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
     CreateConstantBuffer(sizeof(NLCompositeInternalConstants));
 
     // 1. Composite pipeline (UBO 0, 8x combined image samplers 1..8, storage image 9)
@@ -167,71 +217,138 @@ NL_Vk::NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalD
         return;
     }
 
-    // 2. GI+SSR temporal pipeline (UBO 0, 6x combined image samplers 1..6, 2x storage images 7..8)
-    std::vector<VkDescriptorSetLayoutBinding> giBindings = {
-        CreateBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
-        CreateBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
-        CreateBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
-        CreateBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
-        CreateBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
-        CreateBinding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
-        CreateBinding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
-        CreateBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
-        CreateBinding(8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-    };
-
-    VkDescriptorSetLayoutCreateInfo giLayoutInfo {};
-    giLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    giLayoutInfo.bindingCount = static_cast<uint32_t>(giBindings.size());
-    giLayoutInfo.pBindings = giBindings.data();
-    if (vkCreateDescriptorSetLayout(_device, &giLayoutInfo, nullptr, &_descriptorSetLayoutGi) != VK_SUCCESS)
+    // 2. Prep pipeline (UBO 0, 3x combined image samplers 1..3, 2x storage images 4..5)
     {
-        LOG_ERROR("[{0}] Failed to create GI descriptor set layout", _name);
-        return;
+        std::vector<VkDescriptorSetLayoutBinding> prepBindings = {
+            CreateBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
+            CreateBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+            CreateBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+        };
+
+        VkDescriptorSetLayoutCreateInfo prepLayoutInfo {};
+        prepLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        prepLayoutInfo.bindingCount = static_cast<uint32_t>(prepBindings.size());
+        prepLayoutInfo.pBindings = prepBindings.data();
+        if (vkCreateDescriptorSetLayout(_device, &prepLayoutInfo, nullptr, &_descriptorSetLayoutPrep) != VK_SUCCESS)
+        {
+            LOG_ERROR("[{0}] Failed to create Prep descriptor set layout", _name);
+            return;
+        }
+
+        VkPipelineLayoutCreateInfo prepPipeLayoutInfo {};
+        prepPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        prepPipeLayoutInfo.setLayoutCount = 1;
+        prepPipeLayoutInfo.pSetLayouts = &_descriptorSetLayoutPrep;
+        if (vkCreatePipelineLayout(_device, &prepPipeLayoutInfo, nullptr, &_pipelineLayoutPrep) != VK_SUCCESS)
+        {
+            LOG_ERROR("[{0}] Failed to create Prep pipeline layout", _name);
+            return;
+        }
+
+        std::vector<VkDescriptorPoolSize> prepPoolSizes = {
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, _maxFramesInFlight },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * _maxFramesInFlight },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * _maxFramesInFlight }
+        };
+        VkDescriptorPoolCreateInfo prepPoolInfo {};
+        prepPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        prepPoolInfo.poolSizeCount = static_cast<uint32_t>(prepPoolSizes.size());
+        prepPoolInfo.pPoolSizes = prepPoolSizes.data();
+        prepPoolInfo.maxSets = _maxFramesInFlight;
+        if (vkCreateDescriptorPool(_device, &prepPoolInfo, nullptr, &_descriptorPoolPrep) != VK_SUCCESS)
+        {
+            LOG_ERROR("[{0}] Failed to create Prep descriptor pool", _name);
+            return;
+        }
+
+        Shader_Vk::CreateDescriptorSets(_descriptorSetLayoutPrep, _descriptorPoolPrep, _descriptorSetsPrep);
+
+        _constantStridePrep = UniformStride(_physicalDevice, sizeof(NLPrepInternalConstants));
+        const VkDeviceSize prepBufSize = _constantStridePrep * _maxFramesInFlight;
+        if (Shader_Vk::CreateBufferResource(_device, _physicalDevice, &_constantBufferPrep, &_constantBufferMemoryPrep,
+                                            prepBufSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        {
+            vkMapMemory(_device, _constantBufferMemoryPrep, 0, prepBufSize, 0, &_mappedConstantBufferPrep);
+        }
+
+        std::vector<char> prepCode(nl_prep_spv, nl_prep_spv + sizeof(nl_prep_spv));
+        if (!CreateComputePipeline(_device, _pipelineLayoutPrep, &_pipelinePrep, prepCode))
+        {
+            LOG_ERROR("[{0}] Failed to create Prep pipeline", _name);
+            return;
+        }
     }
 
-    VkPipelineLayoutCreateInfo giPipeLayoutInfo {};
-    giPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    giPipeLayoutInfo.setLayoutCount = 1;
-    giPipeLayoutInfo.pSetLayouts = &_descriptorSetLayoutGi;
-    if (vkCreatePipelineLayout(_device, &giPipeLayoutInfo, nullptr, &_pipelineLayoutGi) != VK_SUCCESS)
+    // 3. GI+SSR temporal pipeline (UBO 0, 5x combined image samplers 1..5, 2x storage images 6..7)
     {
-        LOG_ERROR("[{0}] Failed to create GI pipeline layout", _name);
-        return;
-    }
+        std::vector<VkDescriptorSetLayoutBinding> giBindings = {
+            CreateBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
+            CreateBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+            CreateBinding(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+        };
 
-    std::vector<VkDescriptorPoolSize> giPoolSizes = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, _maxFramesInFlight },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6 * _maxFramesInFlight },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * _maxFramesInFlight }
-    };
-    VkDescriptorPoolCreateInfo giPoolInfo {};
-    giPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    giPoolInfo.poolSizeCount = static_cast<uint32_t>(giPoolSizes.size());
-    giPoolInfo.pPoolSizes = giPoolSizes.data();
-    giPoolInfo.maxSets = _maxFramesInFlight;
-    if (vkCreateDescriptorPool(_device, &giPoolInfo, nullptr, &_descriptorPoolGi) != VK_SUCCESS)
-    {
-        LOG_ERROR("[{0}] Failed to create GI descriptor pool", _name);
-        return;
-    }
+        VkDescriptorSetLayoutCreateInfo giLayoutInfo {};
+        giLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        giLayoutInfo.bindingCount = static_cast<uint32_t>(giBindings.size());
+        giLayoutInfo.pBindings = giBindings.data();
+        if (vkCreateDescriptorSetLayout(_device, &giLayoutInfo, nullptr, &_descriptorSetLayoutGi) != VK_SUCCESS)
+        {
+            LOG_ERROR("[{0}] Failed to create GI descriptor set layout", _name);
+            return;
+        }
 
-    Shader_Vk::CreateDescriptorSets(_descriptorSetLayoutGi, _descriptorPoolGi, _descriptorSetsGi);
+        VkPipelineLayoutCreateInfo giPipeLayoutInfo {};
+        giPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        giPipeLayoutInfo.setLayoutCount = 1;
+        giPipeLayoutInfo.pSetLayouts = &_descriptorSetLayoutGi;
+        if (vkCreatePipelineLayout(_device, &giPipeLayoutInfo, nullptr, &_pipelineLayoutGi) != VK_SUCCESS)
+        {
+            LOG_ERROR("[{0}] Failed to create GI pipeline layout", _name);
+            return;
+        }
 
-    _constantStrideGi = UniformStride(_physicalDevice, sizeof(NLGiInternalConstants));
-    const VkDeviceSize giBufSize = _constantStrideGi * _maxFramesInFlight;
-    if (Shader_Vk::CreateBufferResource(_device, _physicalDevice, &_constantBufferGi, &_constantBufferMemoryGi,
-                                        giBufSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-    {
-        vkMapMemory(_device, _constantBufferMemoryGi, 0, giBufSize, 0, &_mappedConstantBufferGi);
-    }
+        std::vector<VkDescriptorPoolSize> giPoolSizes = {
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, _maxFramesInFlight },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 * _maxFramesInFlight },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * _maxFramesInFlight }
+        };
+        VkDescriptorPoolCreateInfo giPoolInfo {};
+        giPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        giPoolInfo.poolSizeCount = static_cast<uint32_t>(giPoolSizes.size());
+        giPoolInfo.pPoolSizes = giPoolSizes.data();
+        giPoolInfo.maxSets = _maxFramesInFlight;
+        if (vkCreateDescriptorPool(_device, &giPoolInfo, nullptr, &_descriptorPoolGi) != VK_SUCCESS)
+        {
+            LOG_ERROR("[{0}] Failed to create GI descriptor pool", _name);
+            return;
+        }
 
-    std::vector<char> giCode(nl_gi_temporal_spv, nl_gi_temporal_spv + sizeof(nl_gi_temporal_spv));
-    if (!CreateComputePipeline(_device, _pipelineLayoutGi, &_pipelineGi, giCode))
-    {
-        LOG_ERROR("[{0}] Failed to create GI pipeline", _name);
-        return;
+        Shader_Vk::CreateDescriptorSets(_descriptorSetLayoutGi, _descriptorPoolGi, _descriptorSetsGi);
+
+        _constantStrideGi = UniformStride(_physicalDevice, sizeof(NLGiInternalConstants));
+        const VkDeviceSize giBufSize = _constantStrideGi * _maxFramesInFlight;
+        if (Shader_Vk::CreateBufferResource(_device, _physicalDevice, &_constantBufferGi, &_constantBufferMemoryGi,
+                                            giBufSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        {
+            vkMapMemory(_device, _constantBufferMemoryGi, 0, giBufSize, 0, &_mappedConstantBufferGi);
+        }
+
+        std::vector<char> giCode(nl_gi_temporal_spv, nl_gi_temporal_spv + sizeof(nl_gi_temporal_spv));
+        if (!CreateComputePipeline(_device, _pipelineLayoutGi, &_pipelineGi, giCode))
+        {
+            LOG_ERROR("[{0}] Failed to create GI pipeline", _name);
+            return;
+        }
     }
 
     _init = true;
@@ -242,10 +359,25 @@ NL_Vk::~NL_Vk()
     ReleaseGiImages();
 
     DeferredRelease::Enqueue(
-        [device = _device, pipelineGi = _pipelineGi, descriptorPoolGi = _descriptorPoolGi,
-         descriptorSetLayoutGi = _descriptorSetLayoutGi, pipelineLayoutGi = _pipelineLayoutGi,
-         constantBufferGi = _constantBufferGi, constantBufferMemoryGi = _constantBufferMemoryGi]()
+        [device = _device, pipelinePrep = _pipelinePrep, descriptorPoolPrep = _descriptorPoolPrep,
+         descriptorSetLayoutPrep = _descriptorSetLayoutPrep, pipelineLayoutPrep = _pipelineLayoutPrep,
+         constantBufferPrep = _constantBufferPrep, constantBufferMemoryPrep = _constantBufferMemoryPrep,
+         pipelineGi = _pipelineGi, descriptorPoolGi = _descriptorPoolGi, descriptorSetLayoutGi = _descriptorSetLayoutGi,
+         pipelineLayoutGi = _pipelineLayoutGi, constantBufferGi = _constantBufferGi,
+         constantBufferMemoryGi = _constantBufferMemoryGi]()
         {
+            if (pipelinePrep != VK_NULL_HANDLE)
+                vkDestroyPipeline(device, pipelinePrep, nullptr);
+            if (descriptorPoolPrep != VK_NULL_HANDLE)
+                vkDestroyDescriptorPool(device, descriptorPoolPrep, nullptr);
+            if (descriptorSetLayoutPrep != VK_NULL_HANDLE)
+                vkDestroyDescriptorSetLayout(device, descriptorSetLayoutPrep, nullptr);
+            if (pipelineLayoutPrep != VK_NULL_HANDLE)
+                vkDestroyPipelineLayout(device, pipelineLayoutPrep, nullptr);
+            if (constantBufferPrep != VK_NULL_HANDLE)
+                vkDestroyBuffer(device, constantBufferPrep, nullptr);
+            if (constantBufferMemoryPrep != VK_NULL_HANDLE)
+                vkFreeMemory(device, constantBufferMemoryPrep, nullptr);
             if (pipelineGi != VK_NULL_HANDLE)
                 vkDestroyPipeline(device, pipelineGi, nullptr);
             if (descriptorPoolGi != VK_NULL_HANDLE)
@@ -262,19 +394,15 @@ NL_Vk::~NL_Vk()
         (uint64_t) _device);
 }
 
-void NL_Vk::UpdateGiDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
-                                  VkImageView colorView, VkImageView depthView, VkImageView motionView,
-                                  VkImageView prevGiView, VkImageView normalsView, VkImageView prevSsrView,
-                                  VkImageView outGiView, VkImageView outSsrView)
+void NL_Vk::UpdatePrepDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
+                                    VkImageView colorView, VkImageView depthView, VkImageView normalsView,
+                                    VkImageView outColorDepthView, VkImageView outNormalView)
 {
     VkDescriptorImageInfo colorInfo { _textureSampler, colorView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo depthInfo { _textureSampler, depthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo motionInfo { _textureSampler, motionView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo prevGiInfo { _textureSampler, prevGiView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo normInfo { _textureSampler, normalsView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo prevSsrInfo { _textureSampler, prevSsrView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo outGiInfo { VK_NULL_HANDLE, outGiView, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo outSsrInfo { VK_NULL_HANDLE, outSsrView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo outCdInfo { VK_NULL_HANDLE, outColorDepthView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo outNInfo { VK_NULL_HANDLE, outNormalView, VK_IMAGE_LAYOUT_GENERAL };
 
     std::vector<VkWriteDescriptorSet> writes = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -284,16 +412,45 @@ void NL_Vk::UpdateGiDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBuf
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 2, 0, 1,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 3, 0, 1,
+          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &normInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+          &outCdInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+          &outNInfo, nullptr, nullptr }
+    };
+
+    vkUpdateDescriptorSets(_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+void NL_Vk::UpdateGiDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
+                                  VkImageView halfColorDepthView, VkImageView halfNormalView, VkImageView motionView,
+                                  VkImageView prevGiView, VkImageView prevSsrView, VkImageView outGiView,
+                                  VkImageView outSsrView)
+{
+    VkDescriptorImageInfo cdInfo { _textureSampler, halfColorDepthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo normInfo { _textureSampler, halfNormalView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo motionInfo { _textureSampler, motionView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo prevGiInfo { _textureSampler, prevGiView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo prevSsrInfo { _textureSampler, prevSsrView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo outGiInfo { VK_NULL_HANDLE, outGiView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo outSsrInfo { VK_NULL_HANDLE, outSsrView, VK_IMAGE_LAYOUT_GENERAL };
+
+    std::vector<VkWriteDescriptorSet> writes = {
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+          nullptr, &bufferInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 1, 0, 1,
+          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cdInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 2, 0, 1,
+          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &normInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 3, 0, 1,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &motionInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 4, 0, 1,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &prevGiInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 5, 0, 1,
-          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &normInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 6, 0, 1,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &prevSsrInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
           &outGiInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
           &outSsrInfo, nullptr, nullptr }
     };
 
@@ -301,15 +458,15 @@ void NL_Vk::UpdateGiDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBuf
 }
 
 void NL_Vk::UpdateCompositeDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
-                                         VkImageView colorView, VkImageView depthView, VkImageView motionView,
-                                         VkImageView giView, VkImageView normalsView, VkImageView albedoView,
+                                         VkImageView colorView, VkImageView halfColorDepthView, VkImageView motionView,
+                                         VkImageView giView, VkImageView halfNormalView, VkImageView albedoView,
                                          VkImageView roughnessView, VkImageView ssrView, VkImageView outColorView)
 {
     VkDescriptorImageInfo colorInfo { _textureSampler, colorView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo depthInfo { _textureSampler, depthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo cdInfo { _textureSampler, halfColorDepthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo motionInfo { _textureSampler, motionView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo giInfo { _textureSampler, giView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo normInfo { _textureSampler, normalsView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorImageInfo normInfo { _textureSampler, halfNormalView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo albedoInfo { _textureSampler, albedoView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo roughInfo { _textureSampler, roughnessView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo ssrInfo { _textureSampler, ssrView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -321,7 +478,7 @@ void NL_Vk::UpdateCompositeDescriptorSet(VkDescriptorSet descriptorSet, VkDescri
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 1, 0, 1,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &colorInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 2, 0, 1,
-          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &depthInfo, nullptr, nullptr },
+          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &cdInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 3, 0, 1,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &motionInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 4, 0, 1,
@@ -384,9 +541,52 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
     const bool runGiPass = (_activeTier > 0) &&
                            (giIntensity > 1e-4f || aoIntensity > 1e-4f || ssrEnabled || debugView == 1 || debugView == 2);
 
+    const VkImageSubresourceRange giRange { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    // Pass 0: Half-res G-Proxy Prep
+    {
+        SetImageLayout(InCmdList, _halfColorDepthImage,
+                       _halfColorDepthInit ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_GENERAL, giRange);
+        _halfColorDepthInit = true;
+
+        SetImageLayout(InCmdList, _halfNormalImage,
+                       _halfNormalInit ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_GENERAL, giRange);
+        _halfNormalInit = true;
+
+        NLPrepInternalConstants prepConst {};
+        prepConst.OutputWidth = static_cast<int32_t>(OutResourceInfo.Width);
+        prepConst.OutputHeight = static_cast<int32_t>(OutResourceInfo.Height);
+        prepConst.HalfWidth = static_cast<int32_t>(_giWidth);
+        prepConst.HalfHeight = static_cast<int32_t>(_giHeight);
+        prepConst.DepthWidth = static_cast<int32_t>(InDepthInfo->Width);
+        prepConst.DepthHeight = static_cast<int32_t>(InDepthInfo->Height);
+        FillPrepConstants(prepConst, InConstants, hasNormals, inEncodeMode);
+
+        const VkDescriptorBufferInfo prepBufInfo { _constantBufferPrep, _constantStridePrep * _currentSetIndex,
+                                                   sizeof(NLPrepInternalConstants) };
+        if (_mappedConstantBufferPrep != nullptr)
+            memcpy((uint8_t*) _mappedConstantBufferPrep + prepBufInfo.offset, &prepConst, sizeof(NLPrepInternalConstants));
+
+        UpdatePrepDescriptorSet(_descriptorSetsPrep[_currentSetIndex], prepBufInfo, InResourceInfo.ImageView,
+                                InDepthInfo->ImageView,
+                                hasNormals ? InGBufferNormals->ImageView : InResourceInfo.ImageView,
+                                _halfColorDepthView, _halfNormalView);
+
+        vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelinePrep);
+        vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelineLayoutPrep, 0, 1,
+                                &_descriptorSetsPrep[_currentSetIndex], 0, nullptr);
+        vkCmdDispatch(InCmdList, (_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
+
+        SetImageLayout(InCmdList, _halfColorDepthImage, VK_IMAGE_LAYOUT_GENERAL,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, giRange);
+        SetImageLayout(InCmdList, _halfNormalImage, VK_IMAGE_LAYOUT_GENERAL,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, giRange);
+    }
+
     _giWriteIdx = (_giWriteIdx + 1) & 1;
     const int prevIdx = _giWriteIdx ^ 1;
-    const VkImageSubresourceRange giRange { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
     if (!_giImageInitialized[prevIdx])
     {
@@ -402,6 +602,10 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         _ssrImageInitialized[prevIdx] = true;
     }
 
+    const VkImageView mvView =
+        (InMotionVectorsInfo.ImageView != VK_NULL_HANDLE) ? InMotionVectorsInfo.ImageView : InResourceInfo.ImageView;
+
+    // Pass 1: Checkerboard Temporal SSGI + SSR
     if (runGiPass)
     {
         const VkImageLayout prevGiLayout =
@@ -419,8 +623,6 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         giConst.OutputHeight = static_cast<int32_t>(OutResourceInfo.Height);
         giConst.GiWidth = static_cast<int32_t>(_giWidth);
         giConst.GiHeight = static_cast<int32_t>(_giHeight);
-        giConst.DepthWidth = static_cast<int32_t>(InDepthInfo->Width);
-        giConst.DepthHeight = static_cast<int32_t>(InDepthInfo->Height);
         giConst.MotionWidth = static_cast<int32_t>(InMotionVectorsInfo.Width);
         giConst.MotionHeight = static_cast<int32_t>(InMotionVectorsInfo.Height);
 
@@ -430,20 +632,16 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
             giConstIn.ResetHistory = true;
             _resetGiHistory = false;
         }
-        FillGiConstants(giConst, giConstIn, hasNormals, inEncodeMode, ssrEnabled);
+        FillGiConstants(giConst, giConstIn, ssrEnabled);
 
         const VkDescriptorBufferInfo giBufInfo { _constantBufferGi, _constantStrideGi * _currentSetIndex,
                                                  sizeof(NLGiInternalConstants) };
         if (_mappedConstantBufferGi != nullptr)
             memcpy((uint8_t*) _mappedConstantBufferGi + giBufInfo.offset, &giConst, sizeof(NLGiInternalConstants));
 
-        const VkImageView mvView =
-            (InMotionVectorsInfo.ImageView != VK_NULL_HANDLE) ? InMotionVectorsInfo.ImageView : InResourceInfo.ImageView;
-
-        UpdateGiDescriptorSet(_descriptorSetsGi[_currentSetIndex], giBufInfo, InResourceInfo.ImageView,
-                              InDepthInfo->ImageView, mvView, _giImageViews[prevIdx],
-                              hasNormals ? InGBufferNormals->ImageView : InResourceInfo.ImageView,
-                              _ssrImageViews[prevIdx], _giImageViews[_giWriteIdx], _ssrImageViews[_giWriteIdx]);
+        UpdateGiDescriptorSet(_descriptorSetsGi[_currentSetIndex], giBufInfo, _halfColorDepthView, _halfNormalView,
+                              mvView, _giImageViews[prevIdx], _ssrImageViews[prevIdx], _giImageViews[_giWriteIdx],
+                              _ssrImageViews[_giWriteIdx]);
 
         vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelineGi);
         vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelineLayoutGi, 0, 1,
@@ -472,7 +670,7 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         }
     }
 
-    // Composite pass
+    // Pass 2: Full-res Composite
     {
         NLCompositeInternalConstants compConst {};
         compConst.OutputWidth = static_cast<int32_t>(OutResourceInfo.Width);
@@ -488,12 +686,9 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
                                inEncodeMode, outEncodeMode);
 
         const VkDescriptorBufferInfo compBufInfo = WriteConstants(&compConst, sizeof(NLCompositeInternalConstants));
-        const VkImageView mvView =
-            (InMotionVectorsInfo.ImageView != VK_NULL_HANDLE) ? InMotionVectorsInfo.ImageView : InResourceInfo.ImageView;
 
         UpdateCompositeDescriptorSet(_descriptorSets[_currentSetIndex], compBufInfo, InResourceInfo.ImageView,
-                                     InDepthInfo->ImageView, mvView, _giImageViews[_giWriteIdx],
-                                     hasNormals ? InGBufferNormals->ImageView : InResourceInfo.ImageView,
+                                     _halfColorDepthView, mvView, _giImageViews[_giWriteIdx], _halfNormalView,
                                      hasAlbedo ? InGBufferAlbedo->ImageView : InResourceInfo.ImageView,
                                      hasRoughness ? InGBufferRoughness->ImageView : InResourceInfo.ImageView,
                                      _ssrImageViews[_giWriteIdx], OutResourceInfo.ImageView);
