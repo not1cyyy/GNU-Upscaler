@@ -276,17 +276,17 @@ float3 ApplyAgxFilmicContrast(float3 linearCol, float contrastStr)
     float l = max(Luma(inset), 1e-5f);
     float midGray = 0.18f;
     float logRatio = log2(max(l / midGray, 1e-4f));
-    float slope = 1.0f + contrastStr * 0.24f;
+    float slope = 1.0f + contrastStr * 0.16f;
     float contrasted = midGray * exp2(clamp(logRatio * slope, -10.0f, 6.0f));
 
     // Smooth highlight rolloff shoulder preserving HDR headroom
-    float shoulder = l / (1.0f + max(l - 0.90f, 0.0f) * contrastStr * 0.18f);
-    float targetL = lerp(contrasted, min(contrasted, shoulder), smoothstep(0.45f, 1.6f, l));
-    float3 graded = inset * clamp(targetL / l, 0.45f, 1.65f);
+    float shoulder = l / (1.0f + max(l - 1.05f, 0.0f) * contrastStr * 0.15f);
+    float targetL = lerp(contrasted, min(contrasted, shoulder), smoothstep(0.65f, 2.2f, l));
+    float3 graded = inset * clamp(targetL / l, 0.60f, 1.35f);
 
-    // Subtle AgX highlight purity rolloff above 1.2
-    float hiBlend = saturate((targetL - 1.1f) * 0.22f) * contrastStr;
-    graded = lerp(graded, targetL.xxx, hiBlend * 0.45f);
+    // Subtle AgX highlight purity rolloff above 1.4
+    float hiBlend = saturate((targetL - 1.4f) * 0.18f) * contrastStr;
+    graded = lerp(graded, targetL.xxx, hiBlend * 0.35f);
 
     return max(mul(agxOutset, graded), 0.0f);
 }
@@ -421,14 +421,14 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float3 g4 = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, 4.0f).rgb;
         float3 wide = g2 * 0.35f + g3 * 0.40f + g4 * 0.25f;
         float wL = Luma(wide);
-        float brightGate = max(wL - 0.55f, 0.0f) / max(wL, 1e-4f);
+        float brightGate = max(wL - 1.15f, 0.0f) / max(wL, 1e-4f);
         multiScaleGlow = wide * brightGate;
     }
 
     // Fast skybox early-out
     if (skyMask <= 1e-4f && DebugView == 0)
     {
-        float3 skyOut = centerColor + multiScaleGlow * (VolumetricGlow * 0.14f);
+        float3 skyOut = centerColor + multiScaleGlow * (VolumetricGlow * 0.10f);
         if (FusedRcasSharpness > 1e-4f)
         {
             float minL = min(min(lumaU, lumaL), min(lumaR, lumaD));
@@ -524,8 +524,9 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     }
 
     float solidMask = skyMask * (1.0f - flickerSoft);
+    float edgeMask = solidMask * (1.0f - haloRisk * 0.85f);
     float3 microNormal = normalize(
-        viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (0.50f * meshGuard * (1.0f - haloRisk) * solidMask));
+        viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (0.28f * meshGuard * edgeMask));
 
     // Fetch Trained Neural Material & Intrinsic Priors (override with render-res DLSS-RR G-buffers when present!)
     float4 mat0 = Material0Tex.SampleLevel(LinearClampMat0, uv, 0.0f);
@@ -588,15 +589,18 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     // Energy-Conserving GI + Direct-Light-Protected Multi-Bounce AO + Contact Shadows
     if (GiEnabled > 0)
     {
-        float indirectWeight = saturate(1.0f - directMask * 0.76f) * (1.0f - skinMask * 0.45f);
-        float effectiveAo = lerp(1.0f, contactAo, indirectWeight);
+        float indirectWeight = saturate(1.0f - directMask * 0.78f) * (1.0f - skinMask * 0.50f);
+        float flooredAo = max(contactAo, 0.30f);
+        float effectiveAo = lerp(1.0f, flooredAo, indirectWeight);
         float3 coloredAo = float3(MultiBounceAO(min16float(effectiveAo), min16float3(albedo)));
-        litColor = litColor * coloredAo * lerp(1.0f, contactShadow, 0.75f);
+        float csFactor = lerp(1.0f, max(contactShadow, 0.55f), 0.65f * edgeMask);
+        litColor = litColor * lerp(float3(1, 1, 1), coloredAo, edgeMask) * csFactor;
 
-        // Diffuse bounce weighted by (1 - metallic) so pure chrome isn't washed out by diffuse GI
-        float shadowFocus = rcp(1.0f + centerLuma * 0.90f);
-        litColor += giBounce * albedo * (1.0f - metallic * 0.75f) *
-                    (GiIntensity * (0.65f + 0.70f * shadowFocus)) * solidMask;
+        // Diffuse bounce weighted by (1 - metallic) so dark steel and chrome aren't washed out by diffuse GI
+        float shadowFocus = rcp(1.0f + centerLuma * 1.10f);
+        float3 bounceAlbedo = clamp(albedo, 0.01f, 0.85f);
+        litColor += giBounce * bounceAlbedo * (1.0f - metallic * 0.75f) *
+                    (GiIntensity * (0.45f + 0.45f * shadowFocus)) * edgeMask;
     }
 
     // Physically-Based Roughness-Cone SSR with Schlick Fresnel (no plastic glaze on rough/skin!)
@@ -608,7 +612,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float3 specF = f0 + (1.0f - f0) * fresnel;
         float glossGate = pow(smoothness, 1.35f) * (1.0f - skinMask * 0.65f);
         float reflWeight = saturate(max(specF.r, max(specF.g, specF.b)) * glossGate * SsrIntensity * 1.15f) *
-                           solidMask * (1.0f - haloRisk * 0.85f) * saturate(ssrSample.a);
+                           edgeMask * saturate(ssrSample.a);
         float3 reflTint = lerp(float3(1, 1, 1), albedo, metallic * 0.70f);
         litColor = lerp(litColor, ssrSample.rgb * reflTint, reflWeight);
     }
@@ -616,23 +620,23 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     // Scene-Coherent Directional Relighting + Charlie Cloth Sheen + Foliage Backlit Transmission
     if (RelightIntensity > 1e-4f)
     {
-        float deltaBump = (dot(microNormal, keyDirView) - dot(viewNormal, keyDirView)) * 0.60f;
-        float macroKey = (dot(viewNormal, keyDirView) - 0.15f) * 0.12f * keyStrength;
-        float hemiTerm = dot(viewNormal, worldUpInView) * 0.12f;
+        float deltaBump = (dot(microNormal, keyDirView) - dot(viewNormal, keyDirView)) * 0.18f;
+        float macroKey = (dot(viewNormal, keyDirView) - 0.15f) * 0.07f * keyStrength;
+        float hemiTerm = dot(viewNormal, worldUpInView) * 0.06f;
 
-        float sculpt = (deltaBump + macroKey + hemiTerm) * RelightIntensity * solidMask * (1.0f - haloRisk * 0.8f);
+        float sculpt = (deltaBump + macroKey + hemiTerm) * RelightIntensity * edgeMask;
         float3 sculptTint = (sculpt >= 0.0f) ? keyTint : float3(0.88f, 0.94f, 1.08f);
-        litColor *= max(1.0f + sculpt * sculptTint, 0.28f);
+        litColor *= max(1.0f + sculpt * sculptTint, 0.55f);
 
         // Rim scatter aligned with scene key & bounce
-        float rim = pow(1.0f - NdotV, 3.5f) * RelightIntensity * solidMask * 0.16f * (1.0f - roughness * 0.45f);
-        litColor += litColor * rim * keyTint * saturate(Luma(giBounce) * 1.4f + 0.35f);
+        float rim = pow(1.0f - NdotV, 3.5f) * RelightIntensity * edgeMask * 0.12f * (1.0f - roughness * 0.45f);
+        litColor += litColor * rim * keyTint * saturate(Luma(giBounce) * 1.2f + 0.30f);
 
-        // Charlie velvet/cloth sheen at grazing angles
+        // Charlie velvet/cloth sheen at grazing angles (zero black-floor lift)
         if (clothMask > 0.05f)
         {
-            float sheen = pow(1.0f - NdotV, 4.0f) * clothMask * RelightIntensity * solidMask * 0.14f;
-            litColor += (albedo * 0.6f + keyTint * 0.4f) * sheen * max(centerLuma, 0.05f);
+            float sheen = pow(1.0f - NdotV, 4.0f) * clothMask * RelightIntensity * edgeMask * 0.12f;
+            litColor += (albedo * 0.6f + keyTint * 0.4f) * sheen * centerLuma;
         }
 
         // Backlit foliage subsurface transmission
@@ -650,12 +654,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float microMag = length(microGrad) * meshGuard;
         float grazing = pow(1.0f - NdotV, 3.0f) * smoothness;
         float specSignal = 0.55f * grazing + 0.45f * saturate(microMag * 1.25f) * smoothness;
-        float specMod = SpecularRelief * solidMask * (1.0f - haloRisk) * specSignal * 0.28f * (1.0f - skinMask * 0.35f);
+        float specMod = SpecularRelief * edgeMask * specSignal * 0.18f * (1.0f - skinMask * 0.35f);
         litColor *= (1.0f + specMod);
     }
 
     if (VolumetricGlow > 1e-4f)
-        litColor += multiScaleGlow * (VolumetricGlow * 0.26f * (0.30f + 0.70f * (1.0f - flickerSoft)));
+        litColor += multiScaleGlow * (VolumetricGlow * 0.18f * (0.30f + 0.70f * (1.0f - flickerSoft)));
 
     // 3D Bilateral Grid Trilinear Slicing (Real Trained Neural Look Transform!)
     float3 finalColor = litColor;
@@ -676,17 +680,17 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float2 mv = MotionTex.Load(int3(mvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
         float motionDamp = rcp(1.0f + length(mv) * 0.04f);
 
-        float strength = saturate(NeuralDetail * 0.55f) * solidMask * (1.0f - haloRisk * 0.7f);
+        float strength = saturate(NeuralDetail * 0.50f) * edgeMask;
         float rcasDamp = lerp(1.0f, 0.35f, saturate(FusedRcasSharpness));
         float highPass = (pC - pAvg) / max(pAvg + 0.16f, 0.16f);
 
-        float3 gain = 1.0f + clamp(bg0.rgb, -0.30f, 0.35f) * strength;
-        float shadowLift = clamp(bg0.a, -0.15f, 0.25f) * strength * rcp(1.0f + centerLuma * 2.5f);
-        float detailBoost = clamp(bg1.a, -0.15f, 0.45f) * clamp(highPass, -0.35f, 0.35f) *
+        float3 gain = 1.0f + clamp(bg0.rgb, -0.18f, 0.20f) * strength;
+        float shadowLift = clamp(bg0.a, -0.08f, 0.08f) * strength * rcp(1.0f + centerLuma * 2.5f);
+        float detailBoost = clamp(bg1.a, -0.10f, 0.25f) * clamp(highPass, -0.25f, 0.25f) *
                             strength * motionDamp * meshGuard * rcasDamp * (1.0f - skinMask * 0.45f);
-        float chromaBoost = clamp(bg2.x, -0.20f, 0.35f) * strength;
+        float chromaBoost = clamp(bg2.x, -0.15f, 0.25f) * strength;
 
-        finalColor = litColor * (gain + detailBoost + shadowLift) + clamp(bg1.rgb, -0.05f, 0.05f) * strength;
+        finalColor = litColor * max(gain + detailBoost + shadowLift, 0.65f);
         float finalLuma = Luma(finalColor);
         finalColor = finalLuma + (finalColor - finalLuma) * (1.0f + chromaBoost);
 

@@ -325,11 +325,11 @@ def generate_pbr_batch(batch_size, rng, preset_style, H=16, W=16):
             sky_col = np.array([0.35, 0.38, 0.42])
             base_depth = rng.uniform(1.0, 8.0)
 
-        # Build 1-2 material regions across patch (skin, metal, stone/wood, cloth, foliage)
+        # Build 1-2 material regions across patch (skin, metal, stone/wood, cloth, foliage, dark industrial steel)
         split_ang = rng.uniform(0, math.pi)
         boundary = (xx * math.cos(split_ang) + yy * math.sin(split_ang)) > rng.uniform(-0.4, 0.4)
-        mat_a = rng.integers(0, 5)
-        mat_b = rng.integers(0, 5)
+        mat_a = rng.integers(0, 6)
+        mat_b = rng.integers(0, 6)
 
         albedo = np.zeros((H, W, 3), np.float32)
         rough = np.zeros((H, W), np.float32)
@@ -349,16 +349,16 @@ def generate_pbr_batch(batch_size, rng, preset_style, H=16, W=16):
                 skin[mask] = 1.0
                 foliage[mask] = 0.0
                 tex_var[mask] = rng.uniform(0.02, 0.10)
-            elif m_id == 1:  # Metal (chrome, gold, copper, gunmetal)
-                c = rng.uniform(0.35, 0.92, size=3)
+            elif m_id == 1:  # Metal (chrome, gold, copper, dark gunmetal)
+                c = rng.uniform(0.12, 0.92, size=3)
                 albedo[mask] = c
-                rough[mask] = rng.uniform(0.08, 0.38)
-                metal[mask] = rng.uniform(0.82, 1.0)
+                rough[mask] = rng.uniform(0.08, 0.42)
+                metal[mask] = rng.uniform(0.80, 1.0)
                 skin[mask] = 0.0
                 foliage[mask] = 0.0
                 tex_var[mask] = rng.uniform(0.03, 0.20)
             elif m_id == 2:  # Stone / concrete / wood (matte, higher variance)
-                c = np.array([rng.uniform(0.18, 0.62)] * 3) * rng.uniform(0.8, 1.15, size=3)
+                c = np.array([rng.uniform(0.14, 0.62)] * 3) * rng.uniform(0.8, 1.15, size=3)
                 albedo[mask] = np.clip(c, 0.05, 0.85)
                 rough[mask] = rng.uniform(0.68, 0.95)
                 metal[mask] = 0.0
@@ -366,14 +366,14 @@ def generate_pbr_batch(batch_size, rng, preset_style, H=16, W=16):
                 foliage[mask] = 0.0
                 tex_var[mask] = rng.uniform(0.12, 0.42)
             elif m_id == 3:  # Cloth / fabric (richer chroma, high roughness)
-                c = rng.uniform(0.08, 0.78, size=3)
+                c = rng.uniform(0.06, 0.78, size=3)
                 albedo[mask] = c
                 rough[mask] = rng.uniform(0.75, 0.96)
                 metal[mask] = 0.0
                 skin[mask] = 0.0
                 foliage[mask] = 0.0
                 tex_var[mask] = rng.uniform(0.08, 0.28)
-            else:  # Foliage / vegetation (green-olive dominant)
+            elif m_id == 4:  # Foliage / vegetation (green-olive dominant)
                 c = np.array([rng.uniform(0.08, 0.35), rng.uniform(0.28, 0.72), rng.uniform(0.06, 0.25)])
                 albedo[mask] = c
                 rough[mask] = rng.uniform(0.45, 0.72)
@@ -381,6 +381,15 @@ def generate_pbr_batch(batch_size, rng, preset_style, H=16, W=16):
                 skin[mask] = 0.0
                 foliage[mask] = 1.0
                 tex_var[mask] = rng.uniform(0.18, 0.45)
+            else:  # Dark painted steel / charcoal machinery / dark basalt
+                base_v = rng.uniform(0.03, 0.16)
+                c = np.array([base_v, base_v * rng.uniform(0.95, 1.08), base_v * rng.uniform(1.0, 1.18)])
+                albedo[mask] = np.clip(c, 0.03, 0.18)
+                rough[mask] = rng.uniform(0.25, 0.75)
+                metal[mask] = rng.uniform(0.0, 0.65)
+                skin[mask] = 0.0
+                foliage[mask] = 0.0
+                tex_var[mask] = rng.uniform(0.06, 0.24)
 
         # Normal field with smooth curvature
         nx = np.clip(xx * rng.uniform(-0.5, 0.5) + rng.uniform(-0.35, 0.35), -0.85, 0.85)
@@ -463,39 +472,39 @@ def generate_pbr_batch(batch_size, rng, preset_style, H=16, W=16):
                              1.0 + 0.04 * mid_zone - 0.04 * high_zone,
                              1.0 + 0.03 * mid_zone - 0.03 * high_zone])
             gain += np.array([0.04, 0.01, -0.02]) * mean_skin * mid_zone
-            shadow_lift = 0.08 * shadow_zone * (1.0 - 0.4 * mean_metal)
-            off = np.array([0.010, 0.004, 0.0]) * shadow_zone
-            detail = 0.20 * (0.4 + 0.6 * mean_var) * (1.0 - 0.45 * mean_skin)
-            chroma = 0.12 * mid_zone + 0.08 * mean_foliage
-            spec_boost = 0.16 * mean_metal + 0.06 * (1.0 - float(np.mean(rough)))
-            hl_roll = 0.18 * high_zone
+            shadow_lift = 0.03 * shadow_zone * (1.0 - 0.4 * mean_metal)
+            off = np.zeros(3, dtype=np.float32)
+            detail = 0.16 * (0.4 + 0.6 * mean_var) * (1.0 - 0.45 * mean_skin)
+            chroma = 0.10 * mid_zone + 0.06 * mean_foliage
+            spec_boost = 0.14 * mean_metal + 0.05 * (1.0 - float(np.mean(rough)))
+            hl_roll = 0.16 * high_zone
         elif preset_style == "path_traced_cinema":
-            gain = np.array([1.06 * mid_zone + 0.94 * (1.0 - mid_zone),
-                             1.02 * mid_zone + 0.95 * (1.0 - mid_zone),
-                             0.96 * mid_zone + 1.02 * (1.0 - mid_zone)])
-            gain += np.array([0.06, 0.02, -0.04]) * mean_skin
-            shadow_lift = 0.05 * shadow_zone - 0.05 * (1.0 - shadow_zone) * 0.2
-            off = np.array([0.008, 0.002, 0.012]) * shadow_zone
-            detail = 0.26 * (0.45 + 0.55 * mean_var) * (1.0 - 0.50 * mean_skin)
-            chroma = 0.22 * mid_zone + 0.10 * mean_foliage
-            spec_boost = 0.24 * mean_metal + 0.10 * (1.0 - float(np.mean(rough)))
-            hl_roll = 0.28 * high_zone
+            gain = np.array([1.05 * mid_zone + 0.95 * (1.0 - mid_zone),
+                             1.02 * mid_zone + 0.96 * (1.0 - mid_zone),
+                             0.97 * mid_zone + 1.02 * (1.0 - mid_zone)])
+            gain += np.array([0.05, 0.02, -0.03]) * mean_skin
+            shadow_lift = 0.02 * shadow_zone - 0.01 * (1.0 - shadow_zone)
+            off = np.zeros(3, dtype=np.float32)
+            detail = 0.20 * (0.45 + 0.55 * mean_var) * (1.0 - 0.50 * mean_skin)
+            chroma = 0.18 * mid_zone + 0.08 * mean_foliage
+            spec_boost = 0.20 * mean_metal + 0.08 * (1.0 - float(np.mean(rough)))
+            hl_roll = 0.24 * high_zone
         elif preset_style == "natural_daylight":
             gain = np.array([1.02, 1.03, 1.04]) - 0.05 * high_zone
-            shadow_lift = 0.14 * shadow_zone
-            off = np.array([0.006, 0.008, 0.012]) * shadow_zone
-            detail = 0.15 * (0.5 + 0.5 * mean_var) * (1.0 - 0.40 * mean_skin)
-            chroma = 0.09 * mid_zone + 0.08 * mean_foliage
-            spec_boost = 0.12 * mean_metal + 0.05 * (1.0 - float(np.mean(rough)))
+            shadow_lift = 0.04 * shadow_zone
+            off = np.zeros(3, dtype=np.float32)
+            detail = 0.13 * (0.5 + 0.5 * mean_var) * (1.0 - 0.40 * mean_skin)
+            chroma = 0.08 * mid_zone + 0.06 * mean_foliage
+            spec_boost = 0.10 * mean_metal + 0.04 * (1.0 - float(np.mean(rough)))
             hl_roll = 0.14 * high_zone
         else:  # filmic_noir
-            gain = np.array([0.96 + 0.12 * mid_zone, 0.95 + 0.10 * mid_zone, 0.98 + 0.08 * mid_zone])
-            shadow_lift = -0.06 * shadow_zone
-            off = np.array([-0.004, -0.003, 0.006]) * shadow_zone
-            detail = 0.30 * (0.4 + 0.6 * mean_var) * (1.0 - 0.35 * mean_skin)
-            chroma = -0.10 + 0.10 * mean_skin
-            spec_boost = 0.32 * mean_metal + 0.14 * (1.0 - float(np.mean(rough)))
-            hl_roll = 0.35 * high_zone
+            gain = np.array([0.96 + 0.10 * mid_zone, 0.95 + 0.08 * mid_zone, 0.98 + 0.07 * mid_zone])
+            shadow_lift = -0.04 * shadow_zone
+            off = np.zeros(3, dtype=np.float32)
+            detail = 0.22 * (0.4 + 0.6 * mean_var) * (1.0 - 0.35 * mean_skin)
+            chroma = -0.08 + 0.08 * mean_skin
+            spec_boost = 0.24 * mean_metal + 0.10 * (1.0 - float(np.mean(rough)))
+            hl_roll = 0.30 * high_zone
 
         y_bg[i, 0:3] = gain - 1.0
         y_bg[i, 3] = shadow_lift

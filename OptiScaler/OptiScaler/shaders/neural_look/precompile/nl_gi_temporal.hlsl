@@ -163,7 +163,7 @@ float3 EvalSceneSH(float3 dir)
     float3 shX = ResolvedSceneLightBuf[1].rgb;
     float3 shY = ResolvedSceneLightBuf[2].rgb;
     float3 shZ = ResolvedSceneLightBuf[3].rgb;
-    return max(sh0 + shX * dir.x + shY * dir.y + shZ * dir.z, 0.0f) * 0.45f;
+    return max(sh0 + shX * dir.x + shY * dir.y + shZ * dir.z, 0.0f) * 0.22f;
 }
 
 float3 QueryFallbackRadiance(float3 viewPos, float3 rayDirView, float rayDist)
@@ -224,27 +224,17 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     bool inBounds = (ResetHistory == 0 && FrameIndex > 3 && all(prevUv >= 0.002f) && all(prevUv <= 0.998f));
 
-    // Strict Depth + Normal Disocclusion Rejection
+    // Strict nearest-texel Depth + Normal Disocclusion Rejection (no bilinear silhouette smear, no checkerboard skip)
     bool validHistory = false;
     if (inBounds)
     {
-        float4 prevNormData = PrevHalfNormalTex.SampleLevel(LinearClampNorm, prevUv, 0.0f);
+        int2 prevGiCoord = ClampGiCoord(int2(prevUv * float2(GiWidth, GiHeight)));
+        float4 prevNormData = PrevHalfNormalTex.Load(int3(prevGiCoord, 0));
         float relDepthErr = abs(centerDepth - prevNormData.w) / max(min(centerDepth, prevNormData.w), 0.05f);
         float2 pnxy = clamp(prevNormData.xy, -1.0f, 1.0f);
         float3 prevNorm = float3(pnxy, -sqrt(max(0.0f, 1.0f - dot(pnxy, pnxy))));
-        if (relDepthErr < 0.045f && dot(viewNormal, prevNorm) > 0.70f)
+        if (relDepthErr < 0.045f && dot(viewNormal, prevNorm) > 0.72f)
             validHistory = true;
-    }
-
-    // Checkerboard tracing ONLY when history is valid and motion is low; disoccluded pixels ALWAYS trace
-    bool traceThisFrame = (((giCoord.x ^ giCoord.y) & 1) == (FrameIndex & 1)) || !validHistory || (mvMag > 5.0f);
-    if (!traceThisFrame)
-    {
-        OutGiTex[giCoord] = PrevGiTex.SampleLevel(LinearClampGi, prevUv, 0.0f);
-        OutSsrTex[giCoord] = (SsrEnabled > 0) ? PrevSsrTex.SampleLevel(LinearClampSsr, prevUv, 0.0f)
-                                              : float4(0.0f, 0.0f, 0.0f, 0.0f);
-        OutGiMetaTex[giCoord] = float4(1.0f, 0.05f, 0.0f, 4.0f);
-        return;
     }
 
     float3 centerPos = ReconstructViewPos(uv, centerDepth, TanHalfFov, TanHalfFovAspect);
@@ -260,9 +250,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     int slices = clamp(RayCount, 1, 4);
     int steps = clamp(StepCount, 3, 8);
-    float worldRange = max(centerDepth * 0.35f, 0.1f);
+    float worldRange = clamp(centerDepth * 0.18f, 0.50f, 5.0f);
     float invWorldRange = rcp(worldRange);
-    float thickness = max(centerDepth * 0.14f, 0.05f);
+    float thickness = clamp(centerDepth * 0.035f, 0.06f, 0.65f);
+    float maxForegroundGap = clamp(centerDepth * 0.06f, 0.15f, 1.4f);
 
     float3 accumGi = float3(0.0f, 0.0f, 0.0f);
     float accumAo = 0.0f;
@@ -302,21 +293,24 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
                 if (any(sampleUv < 0.002f) || any(sampleUv > 0.998f))
                 {
-                    // Screen-border exit: query World-Space Hash Cache / Scene SH
+                    // Screen-border exit: query World-Space Hash Cache / Scene SH gently
                     float3 exitDir = normalize(lerp(viewNormal, float3(marchDirPx.x, -marchDirPx.y, -0.3f), 0.55f));
-                    sliceGi += QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f) * 0.25f;
+                    sliceGi += QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f) * 0.08f;
                     break;
                 }
 
-                float mipLvl = clamp(log2(max(radiusPx * 0.22f, 1.0f)), 0.0f, 4.0f);
-                float4 samplePyr = ColorPyramidTex.SampleLevel(LinearClampPyr, sampleUv, mipLvl);
-                float sampleDepth = samplePyr.a;
-
-                if (sampleDepth >= 64000.0f)
+                // Sample crisp half-res depth to avoid Hi-Z minDepth silhouette bloat into 8x8/16x16 shadow blocks;
+                // keep prefiltered ColorPyramid only for soft indirect bounce radiance.
+                int2 sGiCoord = ClampGiCoord(int2(sampleUv * float2(GiWidth, GiHeight)));
+                float sampleDepth = HalfColorDepthTex.Load(int3(sGiCoord, 0)).a;
+                if (sampleDepth >= 64000.0f || sampleDepth >= SkyDepthThreshold ||
+                    (centerDepth - sampleDepth) > maxForegroundGap)
                 {
-                    // Sky visibility contributes gentle sky light along unobstructed sectors
                     continue;
                 }
+
+                float mipLvl = clamp(log2(max(radiusPx * 0.22f, 1.0f)), 0.0f, 4.0f);
+                float3 sampleColor = ColorPyramidTex.SampleLevel(LinearClampPyr, sampleUv, mipLvl).rgb;
 
                 float3 samplePos = ReconstructViewPos(sampleUv, sampleDepth, TanHalfFov, TanHalfFovAspect);
                 float3 deltaFront = samplePos - centerPos;
@@ -349,12 +343,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
                     if (visWeight > 0.0f)
                     {
-                        float rangeFade = 1.0f - saturate(dist * invWorldRange);
+                        float rangeFade = pow(1.0f - saturate(dist * invWorldRange), 1.5f);
                         float nDotL = saturate(dot(viewNormal, frontDir) - GiBias);
-                        float3 hitCol = max(samplePyr.rgb, 0.0f);
+                        float3 hitCol = max(sampleColor, 0.0f);
                         float hitLuma = Luma(hitCol);
-                        hitCol = max(lerp(hitLuma.xxx, hitCol, 1.25f), 0.0f);
-                        sliceGi += hitCol * nDotL * visWeight * rangeFade * 3.2f;
+                        hitCol = max(lerp(hitLuma.xxx, hitCol, 1.05f), 0.0f);
+                        sliceGi += hitCol * nDotL * visWeight * rangeFade * 1.10f;
                         hitCount += visWeight;
                     }
                 }
@@ -367,21 +361,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     }
 
     float3 currentGi = max(accumGi / float(slices), 0.0f);
-    float currentAo = saturate(accumAo / float(slices));
+    float distAoFade = rcp(1.0f + centerDepth * 0.03f);
+    float currentAo = lerp(1.0f, saturate(accumAo / float(slices)), distAoFade);
 
-    // Add gentle ambient/multi-bounce fill from World Hash or Scene SH weighted by unoccluded visibility
-    float3 worldN = (HasCameraBasis > 0) ? ViewToWorldDir(viewNormal, CameraRight, CameraUp, CameraFwd) : viewNormal;
-    float3 envBounce = EvalSceneSH(worldN);
-    if (WorldHashEnabled > 0 && HasCameraBasis > 0)
-    {
-        float3 worldPos = ViewToWorldPos(centerPos, CameraPos, CameraRight, CameraUp, CameraFwd);
-        float3 hashBounce;
-        if (LookupWorldHash(WorldHashBuf, worldPos + worldN * 0.35f, worldN, centerDepth, FrameIndex, hashBounce))
-            envBounce = lerp(envBounce, hashBounce, 0.55f);
-    }
-    currentGi += envBounce * currentAo * 0.22f;
-
-    // 2. Scene-Derived 6-Step Contact Shadows toward Dominant Key Light
+    // 2. Tight Screen-Space Contact Shadows toward Dominant Key Light
     float contactShadow = 1.0f;
     float4 keyDirData = ResolvedSceneLightBuf[4];
     float3 keyDirView = normalize(keyDirData.xyz);
@@ -390,7 +373,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (nDotKey > 0.02f && keyStrength > 0.05f)
     {
         int cSteps = clamp(int(ContactShadowSteps), 2, 8);
-        float maxShadowDist = clamp(centerDepth * 0.065f, 0.08f, 2.2f);
+        float maxShadowDist = clamp(centerDepth * 0.022f, 0.03f, 0.38f);
         float occ = 0.0f;
         float invTanV = rcp(max(TanHalfFov, 1e-4f));
         float invTanH = rcp(max(TanHalfFovAspect, 1e-4f));
@@ -409,13 +392,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
             float sampleD = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rUv * float2(GiWidth, GiHeight))), 0)).a;
             float diff = rayPos.z - sampleD;
-            float maxThick = max(centerDepth * 0.035f, 0.04f);
+            float maxThick = clamp(centerDepth * 0.012f, 0.015f, 0.16f);
             if (diff > centerDepth * 0.002f && diff < maxThick)
             {
                 occ = max(occ, 1.0f - fracS * 0.55f);
             }
         }
-        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f));
+        float csDistFade = rcp(1.0f + centerDepth * 0.09f);
+        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * 0.65f);
     }
 
     // 3. Hi-Z Roughness-Cone SSR (skip diffuse surfaces roughness > 0.85) + Virtual Hit Distance
@@ -473,11 +457,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     float2 rayUv = lerp(uv, clippedEndUv, kt2);
                     float rayZ = rcp(lerp(invZ0, invZ1, kt2));
 
-                    // Coarse Hi-Z mip on distant steps, mip 0 on near steps
-                    float hiZMip = (k > 3) ? 1.0f : 0.0f;
-                    float rayDepth = (hiZMip > 0.5f)
-                                         ? ColorPyramidTex.SampleLevel(LinearClampPyr, rayUv, 0.0f).a
-                                         : HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rayUv * float2(GiWidth, GiHeight))), 0)).a;
+                    // Sample crisp half-res depth to avoid 1/4-res min-depth silhouette bloat on reflections
+                    float rayDepth = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rayUv * float2(GiWidth, GiHeight))), 0)).a;
 
                     if (rayDepth < 64000.0f)
                     {
@@ -541,7 +522,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         {
             float3 envRefl = QueryFallbackRadiance(centerPos, reflDir, clamp(centerDepth * 1.2f, 1.5f, 24.0f));
             currentSsr.rgb = lerp(envRefl, currentSsr.rgb, currentSsr.a);
-            currentSsr.a = max(currentSsr.a, 0.45f * (1.0f - roughness));
+            currentSsr.a = max(currentSsr.a, 0.18f * (1.0f - roughness));
         }
     }
 

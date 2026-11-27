@@ -256,8 +256,8 @@ class NL_Common
 
         int32_t ResetHistory = 0;
         int32_t FrameIndex = 0;
-        int32_t RayCount = 3;
-        int32_t StepCount = 6;
+        int32_t RayCount = 2;
+        int32_t StepCount = 5;
 
         int32_t SsrEnabled = 1;
         int32_t SsrSteps = 12;
@@ -288,7 +288,7 @@ class NL_Common
     {
         int32_t GiWidth = 0;
         int32_t GiHeight = 0;
-        int32_t StepSize = 2;
+        int32_t StepSize = 1;
         int32_t SsrEnabled = 1;
 
         float SkyDepthThreshold = 500.0f;
@@ -516,8 +516,8 @@ class NL_Common
         c.ResetHistory = inConst.ResetHistory ? 1 : 0;
         c.FrameIndex = static_cast<int32_t>(_frameIndex);
 
-        c.RayCount = (_activeTier >= 2) ? 3 : 2;
-        c.StepCount = (_activeTier >= 2) ? 6 : 5;
+        c.RayCount = 2;
+        c.StepCount = (_activeTier >= 2) ? 5 : 4;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
         c.SsrSteps = (_activeTier >= 2) ? 12 : 8;
         c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
@@ -542,7 +542,7 @@ class NL_Common
         const float farP = std::max(inConst.CameraFar, std::max(inConst.CameraNear, 0.001f) + 1.0f);
         c.GiWidth = giW;
         c.GiHeight = giH;
-        c.StepSize = 2;
+        c.StepSize = 1;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
         c.SkyDepthThreshold = farP * 0.85f;
         c.PhiDepth = 0.045f;
