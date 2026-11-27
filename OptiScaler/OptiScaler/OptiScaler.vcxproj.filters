@@ -977,7 +977,13 @@
     <ClInclude Include="shaders\neural_look\NL_Common.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="shaders\neural_look\NL_DefaultModel.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="shaders\neural_look\NL_Dx12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\neural_look\NL_Model.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="shaders\neural_look\NL_Vk.h">
@@ -989,16 +995,34 @@
     <ClInclude Include="shaders\neural_look\precompile\nl_composite_Shader_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="shaders\neural_look\precompile\nl_denoise_Shader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\neural_look\precompile\nl_denoise_Shader_Vk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="shaders\neural_look\precompile\nl_gi_temporal_Shader.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="shaders\neural_look\precompile\nl_gi_temporal_Shader_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="shaders\neural_look\precompile\nl_neural_prior_Shader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\neural_look\precompile\nl_neural_prior_Shader_Vk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="shaders\neural_look\precompile\nl_prep_Shader.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="shaders\neural_look\precompile\nl_prep_Shader_Vk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\neural_look\precompile\nl_pyramid_Shader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shaders\neural_look\precompile\nl_pyramid_Shader_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="shaders\rcas\precompile\da_das_sharpen_Shader_Dx11.h">

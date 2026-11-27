@@ -104,6 +104,39 @@ NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter*
 {
     NeuralLookConstants nlConstants {};
 
+    nlConstants.RenderWidth = RenderWidth();
+    nlConstants.RenderHeight = RenderHeight();
+    uint32_t subW = 0;
+    uint32_t subH = 0;
+    if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &subW) ==
+            NVSDK_NGX_Result_Success &&
+        subW > 0)
+    {
+        nlConstants.RenderWidth = subW;
+    }
+    if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &subH) ==
+            NVSDK_NGX_Result_Success &&
+        subH > 0)
+    {
+        nlConstants.RenderHeight = subH;
+    }
+
+    InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &nlConstants.DepthSubrectBaseX);
+    InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &nlConstants.DepthSubrectBaseY);
+    InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, &nlConstants.MvSubrectBaseX);
+    InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, &nlConstants.MvSubrectBaseY);
+
+    InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &nlConstants.JitterOffsetX);
+    InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &nlConstants.JitterOffsetY);
+
+    float preExposure = 1.0f;
+    if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &preExposure) == NVSDK_NGX_Result_Success &&
+        preExposure > 1e-4f)
+    {
+        nlConstants.PreExposure = preExposure;
+    }
+
+    nlConstants.LowResMV = LowResMV();
     nlConstants.DepthIsLinear = DepthLinear();
     nlConstants.DepthIsReversed = DepthInverted();
     nlConstants.IsHdr =
@@ -147,6 +180,27 @@ NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter*
     if (InParameters->Get(NVSDK_NGX_Parameter_Reset, &resetFlag) == NVSDK_NGX_Result_Success && resetFlag != 0)
         nlConstants.ResetHistory = true;
 
+    if (InParameters->Get("DLSSG.CameraPosX", &nlConstants.CameraPos[0]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraPosY", &nlConstants.CameraPos[1]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraPosZ", &nlConstants.CameraPos[2]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraRightX", &nlConstants.CameraRight[0]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraRightY", &nlConstants.CameraRight[1]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraRightZ", &nlConstants.CameraRight[2]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraUpX", &nlConstants.CameraUp[0]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraUpY", &nlConstants.CameraUp[1]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraUpZ", &nlConstants.CameraUp[2]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraFwdX", &nlConstants.CameraFwd[0]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraFwdY", &nlConstants.CameraFwd[1]) == NVSDK_NGX_Result_Success &&
+        InParameters->Get("DLSSG.CameraFwdZ", &nlConstants.CameraFwd[2]) == NVSDK_NGX_Result_Success)
+    {
+        nlConstants.HasCameraBasis = true;
+    }
+    else if (auto* fg = State::Instance().CurrentFG(); fg != nullptr)
+    {
+        nlConstants.HasCameraBasis = fg->GetLatestCameraBasis(nlConstants.CameraPos, nlConstants.CameraUp,
+                                                              nlConstants.CameraRight, nlConstants.CameraFwd);
+    }
+
     return nlConstants;
 }
 
@@ -171,7 +225,9 @@ bool IFeature_Dx12::ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const
 
         if (!NeuralLook->Dispatch(cmdList, passes.nlInput, passes.paramMotion, passes.paramDepth, passes.nlConstants,
                                   passes.nlOutput, passes.paramGBufferNormals, passes.paramGBufferAlbedo,
-                                  passes.paramGBufferRoughness))
+                                  passes.paramGBufferRoughness, passes.paramGBufferMetallic,
+                                  passes.paramGBufferSubsurface, passes.paramReactiveMask,
+                                  passes.paramTransparencyMask, passes.paramExposure))
         {
             Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
             return false;
@@ -309,10 +365,18 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     ID3D12Resource* paramGBufferNormals = nullptr;
     ID3D12Resource* paramGBufferAlbedo = nullptr;
     ID3D12Resource* paramGBufferRoughness = nullptr;
+    ID3D12Resource* paramGBufferMetallic = nullptr;
+    ID3D12Resource* paramGBufferSubsurface = nullptr;
+    ID3D12Resource* paramReactiveMask = nullptr;
+    ID3D12Resource* paramTransparencyMask = nullptr;
+    ID3D12Resource* paramExposure = nullptr;
 
     InParameters->Get(NVSDK_NGX_Parameter_Output, &paramOutput);
     InParameters->Get(NVSDK_NGX_Parameter_MotionVectors, &paramMotion);
     InParameters->Get(NVSDK_NGX_Parameter_Depth, &paramDepth);
+    InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, &paramReactiveMask);
+    InParameters->Get(NVSDK_NGX_Parameter_TransparencyMask, &paramTransparencyMask);
+    InParameters->Get(NVSDK_NGX_Parameter_ExposureTexture, &paramExposure);
 
     if (Config::Instance()->NeuralLookUseGBuffers.value_or_default())
     {
@@ -320,6 +384,8 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
         if (InParameters->Get(NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo, &paramGBufferAlbedo) != NVSDK_NGX_Result_Success)
             InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Albedo, &paramGBufferAlbedo);
         InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Roughness, &paramGBufferRoughness);
+        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Metallic, &paramGBufferMetallic);
+        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Subsurface, &paramGBufferSubsurface);
     }
 
     const bool useNeuralLook = Config::Instance()->NeuralLookEnabled.value_or_default() && NeuralLook != nullptr &&
@@ -500,6 +566,11 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
                     pending.paramGBufferNormals = paramGBufferNormals;
                     pending.paramGBufferAlbedo = paramGBufferAlbedo;
                     pending.paramGBufferRoughness = paramGBufferRoughness;
+                    pending.paramGBufferMetallic = paramGBufferMetallic;
+                    pending.paramGBufferSubsurface = paramGBufferSubsurface;
+                    pending.paramReactiveMask = paramReactiveMask;
+                    pending.paramTransparencyMask = paramTransparencyMask;
+                    pending.paramExposure = paramExposure;
                     pending.nlConstants = BuildNeuralLookConstants(InParameters, fuseRcasIntoNeuralLook);
                     pending.active = true;
                 }
@@ -566,7 +637,8 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
 
                 if (!NeuralLook->Dispatch(InCommandList, pass.inputBuffer, paramMotion, paramDepth, nlConstants,
                                           pass.outputBuffer, paramGBufferNormals, paramGBufferAlbedo,
-                                          paramGBufferRoughness))
+                                          paramGBufferRoughness, paramGBufferMetallic, paramGBufferSubsurface,
+                                          paramReactiveMask, paramTransparencyMask, paramExposure))
                 {
                     Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
                     ok = false;

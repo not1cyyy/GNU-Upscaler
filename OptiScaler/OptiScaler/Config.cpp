@@ -625,13 +625,23 @@ bool Config::Reload(std::filesystem::path iniPath)
             if (auto setting = readFloat("NeuralLook", "ToneContrast"); setting.has_value())
                 NeuralLookToneContrast.set_from_config(std::clamp(setting.value(), 0.0f, 1.0f));
 
+            if (auto setting = readFloat("NeuralLook", "SssIntensity"); setting.has_value())
+                NeuralLookSssIntensity.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
+
+            if (auto setting = readFloat("NeuralLook", "ContactShadowIntensity"); setting.has_value())
+                NeuralLookContactShadowIntensity.set_from_config(std::clamp(setting.value(), 0.0f, 2.0f));
+
             if (auto setting = readFloat("NeuralLook", "MaxGpuMs"); setting.has_value())
                 NeuralLookMaxGpuMs.set_from_config(std::clamp(setting.value(), 0.25f, 5.0f));
 
             NeuralLookUseGBuffers.set_from_config(readBool("NeuralLook", "UseGBuffers"));
+            NeuralLookWorldHashEnabled.set_from_config(readBool("NeuralLook", "WorldHashEnabled"));
+
+            if (auto setting = readString("NeuralLook", "ModelPack"); setting.has_value())
+                NeuralLookModelPack.set_from_config(setting.value());
 
             if (auto setting = readInt("NeuralLook", "DebugView"); setting.has_value())
-                NeuralLookDebugView.set_from_config(std::clamp(setting.value(), 0, 5));
+                NeuralLookDebugView.set_from_config(std::clamp(setting.value(), 0, 8));
         }
 
         // Magnifier
@@ -1873,10 +1883,18 @@ bool Config::SaveIni()
                      GetFloatValue(Instance()->NeuralLookSpecularRelief.value_for_config()).c_str());
         ini.SetValue("NeuralLook", "ToneContrast",
                      GetFloatValue(Instance()->NeuralLookToneContrast.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "SssIntensity",
+                     GetFloatValue(Instance()->NeuralLookSssIntensity.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "ContactShadowIntensity",
+                     GetFloatValue(Instance()->NeuralLookContactShadowIntensity.value_for_config()).c_str());
         ini.SetValue("NeuralLook", "MaxGpuMs",
                      GetFloatValue(Instance()->NeuralLookMaxGpuMs.value_for_config()).c_str());
         ini.SetValue("NeuralLook", "UseGBuffers",
                      GetBoolValue(Instance()->NeuralLookUseGBuffers.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "WorldHashEnabled",
+                     GetBoolValue(Instance()->NeuralLookWorldHashEnabled.value_for_config()).c_str());
+        ini.SetValue("NeuralLook", "ModelPack",
+                     Instance()->NeuralLookModelPack.value_for_config_or("auto").c_str());
         ini.SetValue("NeuralLook", "DebugView",
                      GetIntValue(Instance()->NeuralLookDebugView.value_for_config()).c_str());
     }

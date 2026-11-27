@@ -30,6 +30,11 @@ class IFeature_Dx12 : public virtual IFeature
         ID3D12Resource* paramGBufferNormals = nullptr;
         ID3D12Resource* paramGBufferAlbedo = nullptr;
         ID3D12Resource* paramGBufferRoughness = nullptr;
+        ID3D12Resource* paramGBufferMetallic = nullptr;
+        ID3D12Resource* paramGBufferSubsurface = nullptr;
+        ID3D12Resource* paramReactiveMask = nullptr;
+        ID3D12Resource* paramTransparencyMask = nullptr;
+        ID3D12Resource* paramExposure = nullptr;
         NeuralLookConstants nlConstants {};
         bool runRcas = false;
         ID3D12Resource* rcasInput = nullptr;

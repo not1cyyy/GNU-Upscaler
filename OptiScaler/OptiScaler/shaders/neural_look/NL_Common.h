@@ -5,11 +5,22 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 struct NeuralLookConstants
 {
+    uint32_t RenderWidth = 0;
+    uint32_t RenderHeight = 0;
+    int32_t DepthSubrectBaseX = 0;
+    int32_t DepthSubrectBaseY = 0;
+    int32_t MvSubrectBaseX = 0;
+    int32_t MvSubrectBaseY = 0;
+
     float MvScaleX = 1.0f;
     float MvScaleY = 1.0f;
+    float JitterOffsetX = 0.0f;
+    float JitterOffsetY = 0.0f;
+    float PreExposure = 1.0f;
 
     float CameraNear = 0.1f;
     float CameraFar = 1000.0f;
@@ -21,6 +32,13 @@ struct NeuralLookConstants
     bool DepthIsReversed = false;
     bool IsHdr = false;
     bool ResetHistory = false;
+    bool LowResMV = true;
+
+    bool HasCameraBasis = false;
+    float CameraPos[3] = { 0.0f, 0.0f, 0.0f };
+    float CameraRight[3] = { 1.0f, 0.0f, 0.0f };
+    float CameraUp[3] = { 0.0f, 1.0f, 0.0f };
+    float CameraFwd[3] = { 0.0f, 0.0f, 1.0f };
 };
 
 class NL_Common
@@ -28,9 +46,9 @@ class NL_Common
   public:
     enum class BudgetTier : int
     {
-        Light = 0,  // Prep + Composite + Relight + Neural Detail only (skip SSGI/SSR)
-        Medium = 1, // Prep + 3-ray Checkerboard SSGI + 8-step SSR + Composite
-        Full = 2    // Prep + 4-ray Checkerboard SSGI + 12-step SSR + Composite
+        Light = 0,  // Prep + Pyramid + Neural Prior + Composite (SSS + Bilateral Grid + AgX + RCAS; skip SSGI/SSR/Denoise)
+        Medium = 1, // All 6 passes: 2-slice Visibility-Bitmask SSGI + 6-step Contact Shadows + 8-step Hi-Z SSR + Denoise
+        Full = 2    // All 6 passes: 3-slice Visibility-Bitmask SSGI + 6-step Contact Shadows + 12-step Hi-Z SSR + Denoise
     };
 
     void UpdateBudget(double gpuMs)
@@ -77,6 +95,11 @@ class NL_Common
     double LastGpuMs() const { return _lastGpuMs; }
 
   protected:
+    static constexpr uint32_t kWorldHashCapacity = 131072u; // 131072 * 2 uints = 1 MB
+    static constexpr uint32_t kSceneLightUints = 32u;
+    static constexpr uint32_t kResolvedSceneLightFloat4s = 8u;
+    static constexpr uint32_t kBilateralLumaBins = 8u;
+
     struct alignas(256) NLPrepInternalConstants
     {
         int32_t OutputWidth = 0;
@@ -84,10 +107,35 @@ class NL_Common
         int32_t HalfWidth = 0;
         int32_t HalfHeight = 0;
 
+        int32_t RenderWidth = 0;
+        int32_t RenderHeight = 0;
         int32_t DepthWidth = 0;
         int32_t DepthHeight = 0;
+
+        int32_t DepthSubrectBaseX = 0;
+        int32_t DepthSubrectBaseY = 0;
+        int32_t MvSubrectBaseX = 0;
+        int32_t MvSubrectBaseY = 0;
+
+        int32_t MotionWidth = 0;
+        int32_t MotionHeight = 0;
+        int32_t DisplaySizeMV = 0;
+        int32_t LowResMV = 1;
+
         int32_t DepthIsLinear = 0;
         int32_t DepthIsReversed = 0;
+        int32_t HasGBufferNormals = 0;
+        int32_t InColorEncodeMode = 0;
+
+        int32_t HasReactiveMask = 0;
+        int32_t HasTransparencyMask = 0;
+        int32_t HasExposureTex = 0;
+        int32_t HasCameraBasis = 0;
+
+        int32_t WorldHashEnabled = 1;
+        int32_t ResetHistory = 0;
+        int32_t FrameIndex = 0;
+        int32_t _pad0 = 0;
 
         float DepthLinearA = 100.0f;
         float DepthLinearB = 1000.0f;
@@ -96,18 +144,97 @@ class NL_Common
 
         float TanHalfFov = 0.57735027f;
         float TanHalfFovAspect = 1.02640048f;
-        int32_t HasGBufferNormals = 0;
-        int32_t InColorEncodeMode = 0;
+        float MvScaleX = 1.0f;
+        float MvScaleY = 1.0f;
+
+        float MotionTextureScale = 1.0f;
+        float JitterOffsetX = 0.0f;
+        float JitterOffsetY = 0.0f;
+        float PreExposure = 1.0f;
+
+        float CameraPos[3] = { 0.0f, 0.0f, 0.0f };
+        float _padCam0 = 0.0f;
+        float CameraRight[3] = { 1.0f, 0.0f, 0.0f };
+        float _padCam1 = 0.0f;
+        float CameraUp[3] = { 0.0f, 1.0f, 0.0f };
+        float _padCam2 = 0.0f;
+        float CameraFwd[3] = { 0.0f, 0.0f, 1.0f };
+        float _padCam3 = 0.0f;
+    };
+
+    struct alignas(256) NLPyramidInternalConstants
+    {
+        int32_t HalfWidth = 0;
+        int32_t HalfHeight = 0;
+        int32_t Mip0Width = 0;
+        int32_t Mip0Height = 0;
+
+        int32_t Mip1Width = 0;
+        int32_t Mip1Height = 0;
+        int32_t Mip2Width = 0;
+        int32_t Mip2Height = 0;
+
+        int32_t Mip3Width = 0;
+        int32_t Mip3Height = 0;
+        int32_t Mip4Width = 0;
+        int32_t Mip4Height = 0;
+
+        int32_t HasCameraBasis = 0;
+        int32_t FrameIndex = 0;
+        int32_t _pad0 = 0;
+        int32_t _pad1 = 0;
+
+        float SkyDepthThreshold = 500.0f;
+        float TanHalfFov = 0.57735027f;
+        float TanHalfFovAspect = 1.02640048f;
+        float _pad2 = 0.0f;
+
+        float CameraRight[3] = { 1.0f, 0.0f, 0.0f };
+        float _padCam0 = 0.0f;
+        float CameraUp[3] = { 0.0f, 1.0f, 0.0f };
+        float _padCam1 = 0.0f;
+        float CameraFwd[3] = { 0.0f, 0.0f, 1.0f };
+        float _padCam2 = 0.0f;
+    };
+
+    struct alignas(256) NLNeuralPriorInternalConstants
+    {
+        int32_t EighthWidth = 0;
+        int32_t EighthHeight = 0;
+        int32_t Mip3Width = 0;
+        int32_t Mip3Height = 0;
+
+        int32_t GridWidth = 0;
+        int32_t GridHeight = 0;
+        int32_t OutputWidth = 0;
+        int32_t OutputHeight = 0;
 
         int32_t MotionWidth = 0;
         int32_t MotionHeight = 0;
         int32_t DisplaySizeMV = 0;
+        int32_t LowResMV = 1;
+
+        int32_t RenderWidth = 0;
+        int32_t RenderHeight = 0;
+        int32_t MvSubrectBaseX = 0;
+        int32_t MvSubrectBaseY = 0;
+
         int32_t ResetHistory = 0;
+        int32_t FrameIndex = 0;
+        int32_t HasCameraBasis = 0;
+        int32_t TotalTiles = 1;
 
         float MvScaleX = 1.0f;
         float MvScaleY = 1.0f;
-        float MotionTextureScale = 1.0f;
-        int32_t FrameIndex = 0;
+        float SkyDepthThreshold = 500.0f;
+        float _pad0 = 0.0f;
+
+        float CameraRight[3] = { 1.0f, 0.0f, 0.0f };
+        float _padCam0 = 0.0f;
+        float CameraUp[3] = { 0.0f, 1.0f, 0.0f };
+        float _padCam1 = 0.0f;
+        float CameraFwd[3] = { 0.0f, 0.0f, 1.0f };
+        float _padCam2 = 0.0f;
     };
 
     struct alignas(256) NLGiInternalConstants
@@ -117,30 +244,57 @@ class NL_Common
         int32_t GiWidth = 0;
         int32_t GiHeight = 0;
 
+        int32_t RenderWidth = 0;
+        int32_t RenderHeight = 0;
         int32_t MotionWidth = 0;
         int32_t MotionHeight = 0;
+
+        int32_t MvSubrectBaseX = 0;
+        int32_t MvSubrectBaseY = 0;
         int32_t DisplaySizeMV = 0;
+        int32_t LowResMV = 1;
+
         int32_t ResetHistory = 0;
+        int32_t FrameIndex = 0;
+        int32_t RayCount = 3;
+        int32_t StepCount = 6;
+
+        int32_t SsrEnabled = 1;
+        int32_t SsrSteps = 12;
+        int32_t HasCameraBasis = 0;
+        int32_t WorldHashEnabled = 1;
 
         float SkyDepthThreshold = 500.0f;
         float MvScaleX = 1.0f;
         float MvScaleY = 1.0f;
-        float MotionTextureScale = 1.0f;
-
         float TanHalfFov = 0.57735027f;
+
         float TanHalfFovAspect = 1.02640048f;
         float GiRadius = 96.0f;
-        float GiBias = 0.05f;
+        float GiBias = 0.04f;
+        float ContactShadowSteps = 6.0f;
 
-        int32_t RayCount = 4;
-        int32_t StepCount = 5;
-        int32_t FrameIndex = 0;
+        float CameraPos[3] = { 0.0f, 0.0f, 0.0f };
+        float _padCam0 = 0.0f;
+        float CameraRight[3] = { 1.0f, 0.0f, 0.0f };
+        float _padCam1 = 0.0f;
+        float CameraUp[3] = { 0.0f, 1.0f, 0.0f };
+        float _padCam2 = 0.0f;
+        float CameraFwd[3] = { 0.0f, 0.0f, 1.0f };
+        float _padCam3 = 0.0f;
+    };
+
+    struct alignas(256) NLDenoiseInternalConstants
+    {
+        int32_t GiWidth = 0;
+        int32_t GiHeight = 0;
+        int32_t StepSize = 2;
         int32_t SsrEnabled = 1;
 
-        int32_t SsrSteps = 8;
-        int32_t _pad0 = 0;
-        int32_t _pad1 = 0;
-        int32_t _pad2 = 0;
+        float SkyDepthThreshold = 500.0f;
+        float PhiDepth = 0.045f;
+        float PhiNormal = 32.0f;
+        float PhiLuma = 1.25f;
     };
 
     struct alignas(256) NLCompositeInternalConstants
@@ -150,15 +304,40 @@ class NL_Common
         int32_t GiWidth = 0;
         int32_t GiHeight = 0;
 
+        int32_t RenderWidth = 0;
+        int32_t RenderHeight = 0;
         int32_t DepthWidth = 0;
         int32_t DepthHeight = 0;
+
+        int32_t DepthSubrectBaseX = 0;
+        int32_t DepthSubrectBaseY = 0;
+        int32_t MvSubrectBaseX = 0;
+        int32_t MvSubrectBaseY = 0;
+
         int32_t MotionWidth = 0;
         int32_t MotionHeight = 0;
+        int32_t DisplaySizeMV = 0;
+        int32_t LowResMV = 1;
 
         int32_t DepthIsLinear = 0;
         int32_t DepthIsReversed = 0;
-        int32_t DisplaySizeMV = 0;
-        int32_t ColorSpaceMode = 0;
+        int32_t InColorEncodeMode = 0;
+        int32_t OutColorEncodeMode = 0;
+
+        int32_t GiEnabled = 1;
+        int32_t SsrEnabled = 1;
+        int32_t HasGBufferNormals = 0;
+        int32_t HasGBufferAlbedo = 0;
+
+        int32_t HasGBufferRoughness = 0;
+        int32_t HasGBufferMetallic = 0;
+        int32_t HasGBufferSubsurface = 0;
+        int32_t HasCameraBasis = 0;
+
+        int32_t WorldHashEnabled = 1;
+        int32_t DebugView = 0;
+        int32_t FrameIndex = 0;
+        int32_t _pad0 = 0;
 
         float DepthLinearA = 100.0f;
         float DepthLinearB = 1000.0f;
@@ -167,40 +346,44 @@ class NL_Common
 
         float MvScaleX = 1.0f;
         float MvScaleY = 1.0f;
-        float MotionTextureScale = 1.0f;
-        float DepthTextureScale = 1.0f;
+        float JitterOffsetX = 0.0f;
+        float JitterOffsetY = 0.0f;
 
+        float TanHalfFov = 0.57735027f;
+        float TanHalfFovAspect = 1.02640048f;
         float GiIntensity = 1.00f;
         float AoIntensity = 0.85f;
-        float NeuralDetail = 0.80f;
-        float SpecularRelief = 0.70f;
 
-        float ToneContrast = 0.32f;
-        int32_t InColorEncodeMode = 0;
-
-        int32_t GiEnabled = 1;
-        int32_t HasGBufferNormals = 0;
-        int32_t HasGBufferAlbedo = 0;
-        int32_t HasGBufferRoughness = 0;
-
-        int32_t DebugView = 0;
-        int32_t OutColorEncodeMode = 0;
         float SsrIntensity = 0.85f;
         float RelightIntensity = 0.75f;
-
         float VolumetricGlow = 0.45f;
-        float SplitScreenPos = 0.0f;
-        int32_t SsrEnabled = 1;
-        float TanHalfFov = 0.57735027f;
+        float NeuralDetail = 0.55f;
 
-        float TanHalfFovAspect = 1.02640048f;
-        int32_t FrameIndex = 0;
+        float SpecularRelief = 0.50f;
+        float ToneContrast = 0.32f;
+        float SssIntensity = 0.75f;
+        float ContactShadowIntensity = 0.70f;
+
+        float SplitScreenPos = 0.0f;
         float FusedRcasSharpness = 0.0f;
-        int32_t _pad2 = 0;
+        float PreExposure = 1.0f;
+        float _pad1 = 0.0f;
+
+        float CameraPos[3] = { 0.0f, 0.0f, 0.0f };
+        float _padCam0 = 0.0f;
+        float CameraRight[3] = { 1.0f, 0.0f, 0.0f };
+        float _padCam1 = 0.0f;
+        float CameraUp[3] = { 0.0f, 1.0f, 0.0f };
+        float _padCam2 = 0.0f;
+        float CameraFwd[3] = { 0.0f, 0.0f, 1.0f };
+        float _padCam3 = 0.0f;
     };
 
     static_assert(sizeof(NLPrepInternalConstants) % 16 == 0);
+    static_assert(sizeof(NLPyramidInternalConstants) % 16 == 0);
+    static_assert(sizeof(NLNeuralPriorInternalConstants) % 16 == 0);
     static_assert(sizeof(NLGiInternalConstants) % 16 == 0);
+    static_assert(sizeof(NLDenoiseInternalConstants) % 16 == 0);
     static_assert(sizeof(NLCompositeInternalConstants) % 16 == 0);
 
     int _activeTier = 2;
@@ -220,108 +403,207 @@ class NL_Common
         outTanHalfFovAspect = outTanHalfFov * aspect;
     }
 
-    static void FillSharedDepthMotion(int32_t outW, int32_t outH, int32_t depthW, int32_t depthH, int32_t motionW,
-                                      int32_t motionH, const NeuralLookConstants& inConst, int32_t& outDepthLinear,
-                                      int32_t& outDepthReversed, int32_t& outDisplaySizeMV, float& outLinearA,
-                                      float& outLinearB, float& outLinearC, float& outSkyThreshold, float& outMvScaleX,
-                                      float& outMvScaleY, float& outMotionTexScale, float& outDepthTexScale)
+    static void CopyCameraBasis(const NeuralLookConstants& inConst, float outPos[3], float outRight[3], float outUp[3],
+                                float outFwd[3])
+    {
+        if (outPos)
+            std::memcpy(outPos, inConst.CameraPos, 3 * sizeof(float));
+        std::memcpy(outRight, inConst.CameraRight, 3 * sizeof(float));
+        std::memcpy(outUp, inConst.CameraUp, 3 * sizeof(float));
+        std::memcpy(outFwd, inConst.CameraFwd, 3 * sizeof(float));
+    }
+
+    static void ResolveRenderDims(int32_t outW, int32_t outH, int32_t depthW, int32_t depthH,
+                                  const NeuralLookConstants& inConst, int32_t& outRenderW, int32_t& outRenderH)
+    {
+        outRenderW = (inConst.RenderWidth > 0) ? static_cast<int32_t>(inConst.RenderWidth)
+                                               : ((depthW > 0) ? depthW : outW);
+        outRenderH = (inConst.RenderHeight > 0) ? static_cast<int32_t>(inConst.RenderHeight)
+                                                : ((depthH > 0) ? depthH : outH);
+    }
+
+    static void FillDepthLinearParams(const NeuralLookConstants& inConst, int32_t& outDepthLinear,
+                                      int32_t& outDepthReversed, float& outLinearA, float& outLinearB,
+                                      float& outLinearC, float& outSkyThreshold)
     {
         const float nearP = std::max(inConst.CameraNear, 0.001f);
         const float farP = std::max(inConst.CameraFar, nearP + 1.0f);
-
         outDepthLinear = inConst.DepthIsLinear ? 1 : 0;
         outDepthReversed = inConst.DepthIsReversed ? 1 : 0;
-        outDisplaySizeMV = (motionW == outW) ? 1 : 0;
-
         outLinearA = nearP * farP;
         outLinearB = farP;
         outLinearC = farP - nearP;
         outSkyThreshold = farP * 0.85f;
-
-        outMvScaleX = inConst.MvScaleX;
-        outMvScaleY = inConst.MvScaleY;
-        outMotionTexScale = outDisplaySizeMV ? 1.0f : ((float) motionW / (float) std::max(outW, 1));
-        outDepthTexScale = (float) depthW / (float) std::max(outW, 1);
     }
 
     void FillPrepConstants(NLPrepInternalConstants& c, const NeuralLookConstants& inConst, bool hasNormals,
+                           bool hasReactive, bool hasTransparency, bool hasExposure, bool worldHashEnabled,
                            int32_t inEncodeMode) const
     {
-        const float nearP = std::max(inConst.CameraNear, 0.001f);
-        const float farP = std::max(inConst.CameraFar, nearP + 1.0f);
+        ResolveRenderDims(c.OutputWidth, c.OutputHeight, c.DepthWidth, c.DepthHeight, inConst, c.RenderWidth,
+                          c.RenderHeight);
+        FillDepthLinearParams(inConst, c.DepthIsLinear, c.DepthIsReversed, c.DepthLinearA, c.DepthLinearB,
+                              c.DepthLinearC, c.SkyDepthThreshold);
 
-        c.DepthIsLinear = inConst.DepthIsLinear ? 1 : 0;
-        c.DepthIsReversed = inConst.DepthIsReversed ? 1 : 0;
-        c.DepthLinearA = nearP * farP;
-        c.DepthLinearB = farP;
-        c.DepthLinearC = farP - nearP;
-        c.SkyDepthThreshold = farP * 0.85f;
+        c.DepthSubrectBaseX = inConst.DepthSubrectBaseX;
+        c.DepthSubrectBaseY = inConst.DepthSubrectBaseY;
+        c.MvSubrectBaseX = inConst.MvSubrectBaseX;
+        c.MvSubrectBaseY = inConst.MvSubrectBaseY;
 
-        ComputeTanFov(c.OutputWidth, c.OutputHeight, inConst, c.TanHalfFov, c.TanHalfFovAspect);
+        c.LowResMV = inConst.LowResMV ? 1 : 0;
+        c.DisplaySizeMV = (!inConst.LowResMV) ? 1 : 0;
         c.HasGBufferNormals = hasNormals ? 1 : 0;
         c.InColorEncodeMode = inEncodeMode;
 
-        c.DisplaySizeMV = (c.MotionWidth == c.OutputWidth) ? 1 : 0;
+        c.HasReactiveMask = hasReactive ? 1 : 0;
+        c.HasTransparencyMask = hasTransparency ? 1 : 0;
+        c.HasExposureTex = hasExposure ? 1 : 0;
+        c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
+
+        c.WorldHashEnabled = (worldHashEnabled && inConst.HasCameraBasis) ? 1 : 0;
         c.ResetHistory = inConst.ResetHistory ? 1 : 0;
+        c.FrameIndex = static_cast<int32_t>(_frameIndex);
+
+        ComputeTanFov(c.OutputWidth, c.OutputHeight, inConst, c.TanHalfFov, c.TanHalfFovAspect);
         c.MvScaleX = inConst.MvScaleX;
         c.MvScaleY = inConst.MvScaleY;
         c.MotionTextureScale = c.DisplaySizeMV ? 1.0f : ((float) c.MotionWidth / (float) std::max(c.OutputWidth, 1));
-        c.FrameIndex = static_cast<int32_t>(_frameIndex);
+        c.JitterOffsetX = inConst.JitterOffsetX;
+        c.JitterOffsetY = inConst.JitterOffsetY;
+        c.PreExposure = std::max(inConst.PreExposure, 1e-4f);
+
+        CopyCameraBasis(inConst, c.CameraPos, c.CameraRight, c.CameraUp, c.CameraFwd);
     }
 
-    void FillGiConstants(NLGiInternalConstants& c, const NeuralLookConstants& inConst, bool ssrEnabled) const
+    void FillPyramidConstants(NLPyramidInternalConstants& c, const NeuralLookConstants& inConst, int32_t outW,
+                              int32_t outH) const
     {
         const float farP = std::max(inConst.CameraFar, std::max(inConst.CameraNear, 0.001f) + 1.0f);
-        c.DisplaySizeMV = (c.MotionWidth == c.OutputWidth) ? 1 : 0;
+        c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
+        c.FrameIndex = static_cast<int32_t>(_frameIndex);
+        c.SkyDepthThreshold = farP * 0.85f;
+        ComputeTanFov(outW, outH, inConst, c.TanHalfFov, c.TanHalfFovAspect);
+        CopyCameraBasis(inConst, nullptr, c.CameraRight, c.CameraUp, c.CameraFwd);
+    }
+
+    void FillNeuralPriorConstants(NLNeuralPriorInternalConstants& c, const NeuralLookConstants& inConst) const
+    {
+        const float farP = std::max(inConst.CameraFar, std::max(inConst.CameraNear, 0.001f) + 1.0f);
+        ResolveRenderDims(c.OutputWidth, c.OutputHeight, 0, 0, inConst, c.RenderWidth, c.RenderHeight);
+        c.MvSubrectBaseX = inConst.MvSubrectBaseX;
+        c.MvSubrectBaseY = inConst.MvSubrectBaseY;
+        c.LowResMV = inConst.LowResMV ? 1 : 0;
+        c.DisplaySizeMV = (!inConst.LowResMV) ? 1 : 0;
         c.ResetHistory = inConst.ResetHistory ? 1 : 0;
+        c.FrameIndex = static_cast<int32_t>(_frameIndex);
+        c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
+        c.TotalTiles = std::max(1, c.GridWidth * c.GridHeight);
+        c.MvScaleX = inConst.MvScaleX;
+        c.MvScaleY = inConst.MvScaleY;
+        c.SkyDepthThreshold = farP * 0.85f;
+        CopyCameraBasis(inConst, nullptr, c.CameraRight, c.CameraUp, c.CameraFwd);
+    }
+
+    void FillGiConstants(NLGiInternalConstants& c, const NeuralLookConstants& inConst, bool ssrEnabled,
+                         bool worldHashEnabled) const
+    {
+        const float farP = std::max(inConst.CameraFar, std::max(inConst.CameraNear, 0.001f) + 1.0f);
+        ResolveRenderDims(c.OutputWidth, c.OutputHeight, 0, 0, inConst, c.RenderWidth, c.RenderHeight);
+        c.MvSubrectBaseX = inConst.MvSubrectBaseX;
+        c.MvSubrectBaseY = inConst.MvSubrectBaseY;
+        c.LowResMV = inConst.LowResMV ? 1 : 0;
+        c.DisplaySizeMV = (!inConst.LowResMV) ? 1 : 0;
+        c.ResetHistory = inConst.ResetHistory ? 1 : 0;
+        c.FrameIndex = static_cast<int32_t>(_frameIndex);
+
+        c.RayCount = (_activeTier >= 2) ? 3 : 2;
+        c.StepCount = (_activeTier >= 2) ? 6 : 5;
+        c.SsrEnabled = ssrEnabled ? 1 : 0;
+        c.SsrSteps = (_activeTier >= 2) ? 12 : 8;
+        c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
+        c.WorldHashEnabled = (worldHashEnabled && inConst.HasCameraBasis) ? 1 : 0;
+
         c.SkyDepthThreshold = farP * 0.85f;
         c.MvScaleX = inConst.MvScaleX;
         c.MvScaleY = inConst.MvScaleY;
-        c.MotionTextureScale = c.DisplaySizeMV ? 1.0f : ((float) c.MotionWidth / (float) std::max(c.OutputWidth, 1));
-
         ComputeTanFov(c.OutputWidth, c.OutputHeight, inConst, c.TanHalfFov, c.TanHalfFovAspect);
 
         const float minDim = (float) std::min(c.OutputWidth, c.OutputHeight);
         c.GiRadius = std::clamp(minDim * 0.11f, 40.0f, 144.0f);
-        c.GiBias = 0.05f;
+        c.GiBias = 0.04f;
+        c.ContactShadowSteps = (_activeTier >= 2) ? 6.0f : 4.0f;
 
-        c.RayCount = (_activeTier >= 2) ? 4 : 3;
-        c.StepCount = (_activeTier >= 2) ? 5 : 4;
-        c.FrameIndex = static_cast<int32_t>(_frameIndex);
+        CopyCameraBasis(inConst, c.CameraPos, c.CameraRight, c.CameraUp, c.CameraFwd);
+    }
+
+    void FillDenoiseConstants(NLDenoiseInternalConstants& c, const NeuralLookConstants& inConst, int32_t giW,
+                              int32_t giH, bool ssrEnabled) const
+    {
+        const float farP = std::max(inConst.CameraFar, std::max(inConst.CameraNear, 0.001f) + 1.0f);
+        c.GiWidth = giW;
+        c.GiHeight = giH;
+        c.StepSize = 2;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
-        c.SsrSteps = (_activeTier >= 2) ? 12 : 8;
+        c.SkyDepthThreshold = farP * 0.85f;
+        c.PhiDepth = 0.045f;
+        c.PhiNormal = 32.0f;
+        c.PhiLuma = 1.25f;
     }
 
     void FillCompositeConstants(NLCompositeInternalConstants& c, const NeuralLookConstants& inConst, bool giEnabled,
-                                bool ssrEnabled, bool hasNormals, bool hasAlbedo, bool hasRoughness,
-                                int32_t inEncodeMode, int32_t outEncodeMode) const
+                                bool ssrEnabled, bool hasNormals, bool hasAlbedo, bool hasRoughness, bool hasMetallic,
+                                bool hasSubsurface, bool worldHashEnabled, int32_t inEncodeMode,
+                                int32_t outEncodeMode) const
     {
-        FillSharedDepthMotion(c.OutputWidth, c.OutputHeight, c.DepthWidth, c.DepthHeight, c.MotionWidth, c.MotionHeight,
-                              inConst, c.DepthIsLinear, c.DepthIsReversed, c.DisplaySizeMV, c.DepthLinearA,
-                              c.DepthLinearB, c.DepthLinearC, c.SkyDepthThreshold, c.MvScaleX, c.MvScaleY,
-                              c.MotionTextureScale, c.DepthTextureScale);
+        ResolveRenderDims(c.OutputWidth, c.OutputHeight, c.DepthWidth, c.DepthHeight, inConst, c.RenderWidth,
+                          c.RenderHeight);
+        FillDepthLinearParams(inConst, c.DepthIsLinear, c.DepthIsReversed, c.DepthLinearA, c.DepthLinearB,
+                              c.DepthLinearC, c.SkyDepthThreshold);
 
-        auto* cfg = Config::Instance();
-        c.GiIntensity = std::clamp(cfg->NeuralLookGiIntensity.value_or_default(), 0.0f, 2.0f);
-        c.AoIntensity = std::clamp(cfg->NeuralLookAoIntensity.value_or_default(), 0.0f, 2.0f);
-        c.NeuralDetail = std::clamp(cfg->NeuralLookDetail.value_or_default(), 0.0f, 2.0f);
-        c.SpecularRelief = std::clamp(cfg->NeuralLookSpecularRelief.value_or_default(), 0.0f, 2.0f);
-        c.ToneContrast = std::clamp(cfg->NeuralLookToneContrast.value_or_default(), 0.0f, 1.0f);
-        c.SsrIntensity = std::clamp(cfg->NeuralLookSsrIntensity.value_or_default(), 0.0f, 2.0f);
-        c.RelightIntensity = std::clamp(cfg->NeuralLookRelightIntensity.value_or_default(), 0.0f, 2.0f);
-        c.VolumetricGlow = std::clamp(cfg->NeuralLookVolumetricGlow.value_or_default(), 0.0f, 2.0f);
-        c.SplitScreenPos = std::clamp(cfg->NeuralLookSplitScreen.value_or_default(), 0.0f, 1.0f);
+        c.DepthSubrectBaseX = inConst.DepthSubrectBaseX;
+        c.DepthSubrectBaseY = inConst.DepthSubrectBaseY;
+        c.MvSubrectBaseX = inConst.MvSubrectBaseX;
+        c.MvSubrectBaseY = inConst.MvSubrectBaseY;
+
+        c.LowResMV = inConst.LowResMV ? 1 : 0;
+        c.DisplaySizeMV = (!inConst.LowResMV) ? 1 : 0;
+        c.InColorEncodeMode = inEncodeMode;
+        c.OutColorEncodeMode = outEncodeMode;
 
         c.GiEnabled = giEnabled ? 1 : 0;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
-        ComputeTanFov(c.OutputWidth, c.OutputHeight, inConst, c.TanHalfFov, c.TanHalfFovAspect);
-        c.FrameIndex = static_cast<int32_t>(_frameIndex);
-        c.FusedRcasSharpness = std::clamp(inConst.FusedRcasSharpness, 0.0f, 1.0f);
         c.HasGBufferNormals = hasNormals ? 1 : 0;
         c.HasGBufferAlbedo = hasAlbedo ? 1 : 0;
         c.HasGBufferRoughness = hasRoughness ? 1 : 0;
+        c.HasGBufferMetallic = hasMetallic ? 1 : 0;
+        c.HasGBufferSubsurface = hasSubsurface ? 1 : 0;
+        c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
+        c.WorldHashEnabled = (worldHashEnabled && inConst.HasCameraBasis) ? 1 : 0;
+
+        auto* cfg = Config::Instance();
         c.DebugView = cfg->NeuralLookDebugView.value_or_default();
-        c.InColorEncodeMode = inEncodeMode;
-        c.OutColorEncodeMode = outEncodeMode;
+        c.FrameIndex = static_cast<int32_t>(_frameIndex);
+
+        c.MvScaleX = inConst.MvScaleX;
+        c.MvScaleY = inConst.MvScaleY;
+        c.JitterOffsetX = inConst.JitterOffsetX;
+        c.JitterOffsetY = inConst.JitterOffsetY;
+        ComputeTanFov(c.OutputWidth, c.OutputHeight, inConst, c.TanHalfFov, c.TanHalfFovAspect);
+
+        c.GiIntensity = std::clamp(cfg->NeuralLookGiIntensity.value_or_default(), 0.0f, 2.0f);
+        c.AoIntensity = std::clamp(cfg->NeuralLookAoIntensity.value_or_default(), 0.0f, 2.0f);
+        c.SsrIntensity = std::clamp(cfg->NeuralLookSsrIntensity.value_or_default(), 0.0f, 2.0f);
+        c.RelightIntensity = std::clamp(cfg->NeuralLookRelightIntensity.value_or_default(), 0.0f, 2.0f);
+        c.VolumetricGlow = std::clamp(cfg->NeuralLookVolumetricGlow.value_or_default(), 0.0f, 2.0f);
+        c.NeuralDetail = std::clamp(cfg->NeuralLookDetail.value_or_default(), 0.0f, 2.0f);
+        c.SpecularRelief = std::clamp(cfg->NeuralLookSpecularRelief.value_or_default(), 0.0f, 2.0f);
+        c.ToneContrast = std::clamp(cfg->NeuralLookToneContrast.value_or_default(), 0.0f, 1.0f);
+        c.SssIntensity = std::clamp(cfg->NeuralLookSssIntensity.value_or_default(), 0.0f, 2.0f);
+        c.ContactShadowIntensity = std::clamp(cfg->NeuralLookContactShadowIntensity.value_or_default(), 0.0f, 2.0f);
+        c.SplitScreenPos = std::clamp(cfg->NeuralLookSplitScreen.value_or_default(), 0.0f, 1.0f);
+        c.FusedRcasSharpness = std::clamp(inConst.FusedRcasSharpness, 0.0f, 1.0f);
+        c.PreExposure = std::max(inConst.PreExposure, 1e-4f);
+
+        CopyCameraBasis(inConst, c.CameraPos, c.CameraRight, c.CameraUp, c.CameraFwd);
     }
 };

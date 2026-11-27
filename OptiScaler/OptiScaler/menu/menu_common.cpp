@@ -24,6 +24,7 @@
 
 #include <framegen/nvngx/Nvngx_FG.h>
 #include <framegen/reprojection/Reprojection_Dx12.h>
+#include <shaders/neural_look/NL_Model.h>
 
 #include <nvapi/fakenvapi.h>
 #include <hooks/Reflex_Hooks.h>
@@ -8220,19 +8221,20 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
     bool nlEnabled = config->NeuralLookEnabled.value_or_default();
     if (GnuUi::Checkbox("Enable 3D Neural Look", &nlEnabled))
         config->NeuralLookEnabled = nlEnabled;
-    ShowTooltip("Real-time 3D-guided relighting & neural detail pipeline (DX12 & Vulkan, pre-HUD):\n"
-                "- Half-res temporal multi-bounce SSGI & tight contact shadows\n"
-                "- Half-res temporal Screen-Space Reflections (SSR)\n"
-                "- 3D normal/micro-bump directional relighting & volumetric light wrap\n"
-                "- Tiled FP16 residual neural detail synthesis & HDR filmic contrast");
+    ShowTooltip("Real-time 3D-Guided Neural Rendering pipeline (DX12 & Vulkan, pre-HUD):\n"
+                "- 5-Mip Hi-Z Depth + Color Pyramid & Scene L1 SH Light Field\n"
+                "- Trained 1/8-res ConvNeXt-Micro Material Priors + 3D Bilateral Grid\n"
+                "- Visibility-Bitmask SSGI, Contact Shadows & Hi-Z Roughness-Cone SSR\n"
+                "- World-Space Spatial Hash Radiance Cache (off-screen & multi-bounce GI)\n"
+                "- Skin Subsurface Scattering (SSSSS), AgX Filmic Roll-Off & Fused RCAS");
 
     if (currentFeature != nullptr)
     {
         const int tier = currentFeature->NeuralLookActiveTier();
         const auto gpuMs = currentFeature->LastNeuralLookTime();
-        const char* tierName = (tier == 2) ? "Full (4-ray SSGI + 12-step SSR + Neural)"
-                               : (tier == 1) ? "Medium (3-ray SSGI + 8-step SSR + Neural)"
-                               : (tier == 0) ? "Light (Relight + Neural only)"
+        const char* tierName = (tier == 2) ? "Full (3-slice VisBitmask SSGI + 12-step Hi-Z SSR + Neural Grid)"
+                               : (tier == 1) ? "Medium (2-slice VisBitmask SSGI + 8-step Hi-Z SSR + Neural Grid)"
+                               : (tier == 0) ? "Light (Neural Grid + SSS + Relight + AgX only)"
                                              : "Inactive / DX11 unsupported";
         if (nlEnabled && gpuMs.has_value())
             ImGui::TextDisabled("Active Tier: %s | GPU Pass: %.2f ms", tierName, gpuMs.value());
@@ -8257,6 +8259,8 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
             config->NeuralLookDetail = 0.35f;
             config->NeuralLookSpecularRelief = 0.30f;
             config->NeuralLookToneContrast = 0.15f;
+            config->NeuralLookSssIntensity = 0.45f;
+            config->NeuralLookContactShadowIntensity = 0.40f;
         }
         else if (preset == 1) // Balanced
         {
@@ -8268,6 +8272,8 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
             config->NeuralLookDetail = 0.55f;
             config->NeuralLookSpecularRelief = 0.50f;
             config->NeuralLookToneContrast = 0.32f;
+            config->NeuralLookSssIntensity = 0.75f;
+            config->NeuralLookContactShadowIntensity = 0.70f;
         }
         else if (preset == 2) // Dramatic (DLSS 5)
         {
@@ -8279,6 +8285,8 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
             config->NeuralLookDetail = 0.65f;
             config->NeuralLookSpecularRelief = 0.60f;
             config->NeuralLookToneContrast = 0.50f;
+            config->NeuralLookSssIntensity = 1.05f;
+            config->NeuralLookContactShadowIntensity = 1.00f;
         }
         else // Ultra Cinematic
         {
@@ -8290,7 +8298,38 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
             config->NeuralLookDetail = 0.75f;
             config->NeuralLookSpecularRelief = 0.70f;
             config->NeuralLookToneContrast = 0.68f;
+            config->NeuralLookSssIntensity = 1.30f;
+            config->NeuralLookContactShadowIntensity = 1.25f;
         }
+    }
+
+    // Hot-swappable .nlmodel Look Pack selector
+    {
+        static std::vector<std::pair<std::string, std::filesystem::path>> cachedPacks;
+        static bool packsLoaded = false;
+        if (!packsLoaded)
+        {
+            cachedPacks = NLModel::DiscoverModelPacks(Util::DllPath().parent_path());
+            packsLoaded = true;
+        }
+
+        const std::string curPack = config->NeuralLookModelPack.value_or_default();
+        if (ImGui::BeginCombo("Neural Model Pack", curPack.c_str()))
+        {
+            for (const auto& [packName, _] : cachedPacks)
+            {
+                const bool selected = (packName == curPack);
+                if (ImGui::Selectable(packName.c_str(), selected))
+                    config->NeuralLookModelPack = packName;
+                if (selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Refresh##NLModel"))
+            cachedPacks = NLModel::DiscoverModelPacks(Util::DllPath().parent_path());
+        ShowTooltip("Select hot-swappable .nlmodel weights from neural_look/ or 'default' built-in PBR weights.");
     }
 
     ImGui::Spacing();
@@ -8301,15 +8340,19 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
         config->NeuralLookGiIntensity = giIntensity;
 
     float aoIntensity = config->NeuralLookAoIntensity.value_or_default();
-    if (ImGui::SliderFloat("Contact Shadows (AO)", &aoIntensity, 0.0f, 2.0f, "%.2f"))
+    if (ImGui::SliderFloat("Ambient Occlusion (AO)", &aoIntensity, 0.0f, 2.0f, "%.2f"))
         config->NeuralLookAoIntensity = aoIntensity;
 
+    float contactShadowIntensity = config->NeuralLookContactShadowIntensity.value_or_default();
+    if (ImGui::SliderFloat("Contact Shadows", &contactShadowIntensity, 0.0f, 2.0f, "%.2f"))
+        config->NeuralLookContactShadowIntensity = contactShadowIntensity;
+
     float ssrIntensity = config->NeuralLookSsrIntensity.value_or_default();
-    if (ImGui::SliderFloat("Screen-Space Reflections (SSR)", &ssrIntensity, 0.0f, 2.0f, "%.2f"))
+    if (ImGui::SliderFloat("Roughness-Cone SSR", &ssrIntensity, 0.0f, 2.0f, "%.2f"))
         config->NeuralLookSsrIntensity = ssrIntensity;
 
     float relightIntensity = config->NeuralLookRelightIntensity.value_or_default();
-    if (ImGui::SliderFloat("3D Directional Relighting", &relightIntensity, 0.0f, 2.0f, "%.2f"))
+    if (ImGui::SliderFloat("Scene-Coherent Relighting", &relightIntensity, 0.0f, 2.0f, "%.2f"))
         config->NeuralLookRelightIntensity = relightIntensity;
 
     float volGlow = config->NeuralLookVolumetricGlow.value_or_default();
@@ -8317,10 +8360,14 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
         config->NeuralLookVolumetricGlow = volGlow;
 
     ImGui::Spacing();
-    GnuUi::SectionHeader("Detail & Tone");
+    GnuUi::SectionHeader("Materials, Detail & Tone");
+
+    float sssIntensity = config->NeuralLookSssIntensity.value_or_default();
+    if (ImGui::SliderFloat("Skin & Foliage SSS", &sssIntensity, 0.0f, 2.0f, "%.2f"))
+        config->NeuralLookSssIntensity = sssIntensity;
 
     float nlDetail = config->NeuralLookDetail.value_or_default();
-    if (ImGui::SliderFloat("Neural Detail", &nlDetail, 0.0f, 2.0f, "%.2f"))
+    if (ImGui::SliderFloat("Neural Bilateral Grid", &nlDetail, 0.0f, 2.0f, "%.2f"))
         config->NeuralLookDetail = nlDetail;
 
     float specRelief = config->NeuralLookSpecularRelief.value_or_default();
@@ -8328,7 +8375,7 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
         config->NeuralLookSpecularRelief = specRelief;
 
     float toneContrast = config->NeuralLookToneContrast.value_or_default();
-    if (ImGui::SliderFloat("Filmic Contrast", &toneContrast, 0.0f, 1.0f, "%.2f"))
+    if (ImGui::SliderFloat("AgX Filmic Contrast", &toneContrast, 0.0f, 1.0f, "%.2f"))
         config->NeuralLookToneContrast = toneContrast;
 
     ImGui::Spacing();
@@ -8350,10 +8397,25 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
     bool useGBuffers = config->NeuralLookUseGBuffers.value_or_default();
     if (GnuUi::Checkbox("Use Ray Reconstruction G-Buffers", &useGBuffers))
         config->NeuralLookUseGBuffers = useGBuffers;
-    ShowTooltip("Uses GBuffer.Normals, DiffuseAlbedo, and Roughness when provided by the game.");
+    ShowTooltip("Overrides neural predictions with GBuffer.Normals, Albedo, Roughness, Metallic, and Subsurface when supplied.");
+
+    bool worldHash = config->NeuralLookWorldHashEnabled.value_or_default();
+    if (GnuUi::Checkbox("World-Space Radiance Cache (Multi-Bounce / Off-Screen)", &worldHash))
+        config->NeuralLookWorldHashEnabled = worldHash;
+    ShowTooltip("Caches surface radiance in a 3D world hash grid when camera pose is available (via FG/Streamline).");
 
     int debugView = config->NeuralLookDebugView.value_or_default();
-    const char* debugViews[] = { "Off", "GI Bounce", "Contact AO", "Normals", "Neural Residual", "SSR Reflections" };
+    const char* debugViews[] = {
+        "Off",
+        "GI Bounce",
+        "Contact AO",
+        "Normals",
+        "Bilateral Neural Grid",
+        "SSR Reflections",
+        "Material Priors (Rough/Metal/Skin)",
+        "Skin SSS & Contact Shadows",
+        "World Radiance Cache"
+    };
     if (ImGui::Combo("Debug View##NL", &debugView, debugViews, IM_ARRAYSIZE(debugViews)))
         config->NeuralLookDebugView = debugView;
 

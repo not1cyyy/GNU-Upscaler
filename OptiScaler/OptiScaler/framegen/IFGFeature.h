@@ -164,6 +164,22 @@ class IFGFeature
                          int index = -1);
     void SetCameraData(float cameraPosition[3], float cameraUp[3], float cameraRight[3], float cameraForward[3],
                        int index = -1);
+    bool GetLatestCameraBasis(float outPos[3], float outUp[3], float outRight[3], float outForward[3]) const
+    {
+        if (_frameCount == 0)
+            return false;
+
+        const int idx = static_cast<int>(_frameCount % BUFFER_COUNT);
+        const auto lenSq = [](const float v[3]) { return v[0] * v[0] + v[1] * v[1] + v[2] * v[2]; };
+        if (lenSq(_cameraUp[idx]) < 0.01f || lenSq(_cameraRight[idx]) < 0.01f || lenSq(_cameraForward[idx]) < 0.01f)
+            return false;
+
+        std::memcpy(outPos, _cameraPosition[idx], 3 * sizeof(float));
+        std::memcpy(outUp, _cameraUp[idx], 3 * sizeof(float));
+        std::memcpy(outRight, _cameraRight[idx], 3 * sizeof(float));
+        std::memcpy(outForward, _cameraForward[idx], 3 * sizeof(float));
+        return true;
+    }
     void SetFrameTimeDelta(double delta, int index = -1);
     void SetReset(UINT reset, int index = -1);
     void SetInterpolationRect(UINT64 width, UINT height, int index = -1);

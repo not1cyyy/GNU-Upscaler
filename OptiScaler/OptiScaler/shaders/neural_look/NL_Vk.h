@@ -1,78 +1,105 @@
 #pragma once
 
 #include "NL_Common.h"
+#include "NL_Model.h"
 #include "SysUtils.h"
 #include <shaders/Shader_Vk.h>
+#include <string>
+#include <vector>
 
 class NL_Vk : public Shader_Vk, public NL_Common
 {
   private:
-    VkBuffer _constantBufferPrep = VK_NULL_HANDLE;
-    VkDeviceMemory _constantBufferMemoryPrep = VK_NULL_HANDLE;
-    void* _mappedConstantBufferPrep = nullptr;
-    VkDeviceSize _constantStridePrep = 0;
+    struct VkPassObjects
+    {
+        VkBuffer constantBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory constantMemory = VK_NULL_HANDLE;
+        void* mappedConstants = nullptr;
+        VkDeviceSize constantStride = 0;
+        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+        std::vector<VkDescriptorSet> descriptorSets;
+        VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+        VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
 
-    VkDescriptorPool _descriptorPoolPrep = VK_NULL_HANDLE;
-    std::vector<VkDescriptorSet> _descriptorSetsPrep;
-    VkDescriptorSetLayout _descriptorSetLayoutPrep = VK_NULL_HANDLE;
-    VkPipelineLayout _pipelineLayoutPrep = VK_NULL_HANDLE;
-    VkPipeline _pipelinePrep = VK_NULL_HANDLE;
+    VkPassObjects _passPrep {};
+    VkPassObjects _passPyramid {};
+    VkPassObjects _passPrior {};
+    VkPassObjects _passGi {};
+    VkPassObjects _passDenoise {};
 
-    VkBuffer _constantBufferGi = VK_NULL_HANDLE;
-    VkDeviceMemory _constantBufferMemoryGi = VK_NULL_HANDLE;
-    void* _mappedConstantBufferGi = nullptr;
-    VkDeviceSize _constantStrideGi = 0;
+    struct Image2DRes
+    {
+        VkImage image = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        bool initialized = false;
+    };
 
-    VkDescriptorPool _descriptorPoolGi = VK_NULL_HANDLE;
-    std::vector<VkDescriptorSet> _descriptorSetsGi;
-    VkDescriptorSetLayout _descriptorSetLayoutGi = VK_NULL_HANDLE;
-    VkPipelineLayout _pipelineLayoutGi = VK_NULL_HANDLE;
-    VkPipeline _pipelineGi = VK_NULL_HANDLE;
+    struct BufferRes
+    {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+        VkDeviceSize size = 0;
+    };
 
-    VkImage _halfColorDepthImage = VK_NULL_HANDLE;
-    VkImageView _halfColorDepthView = VK_NULL_HANDLE;
-    VkDeviceMemory _halfColorDepthMemory = VK_NULL_HANDLE;
-    bool _halfColorDepthInit = false;
+    Image2DRes _halfColorDepth {};
+    Image2DRes _halfNormal[2] {};
+    Image2DRes _gi[2] {};
+    Image2DRes _ssr[2] {};
+    Image2DRes _giMeta[2] {};
+    Image2DRes _denoisedGi {};
+    Image2DRes _denoisedSsr {};
+    Image2DRes _denoisedMeta {};
 
-    VkImage _halfNormalImages[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkImageView _halfNormalImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDeviceMemory _halfNormalMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    bool _halfNormalImageInitialized[2] = { false, false };
+    VkImage _colorPyramidImage = VK_NULL_HANDLE;
+    VkImageView _colorPyramidView = VK_NULL_HANDLE;
+    VkImageView _colorPyramidMipViews[5] = {};
+    VkDeviceMemory _colorPyramidMemory = VK_NULL_HANDLE;
+    bool _colorPyramidInit = false;
 
-    VkImage _giImages[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkImageView _giImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDeviceMemory _giMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    bool _giImageInitialized[2] = { false, false };
+    Image2DRes _eighthNormal {};
+    Image2DRes _material0[2] {};
+    Image2DRes _material1[2] {};
+    Image2DRes _bilateralGrid[3] {};
 
-    VkImage _ssrImages[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkImageView _ssrImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDeviceMemory _ssrMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    bool _ssrImageInitialized[2] = { false, false };
+    BufferRes _sceneLightBuf {};
+    BufferRes _resolvedSceneLightBuf {};
+    BufferRes _worldHashBuf {};
+    BufferRes _modelWeightsBuf {};
+    std::string _loadedModelPack;
 
     uint32_t _giWidth = 0;
     uint32_t _giHeight = 0;
+    uint32_t _mipDims[5][2] = {};
+    uint32_t _eighthWidth = 0;
+    uint32_t _eighthHeight = 0;
+    uint32_t _gridWidth = 0;
+    uint32_t _gridHeight = 0;
     int _giWriteIdx = 0;
     bool _resetGiHistory = true;
 
-    bool CreateHalfResImage(uint32_t width, uint32_t height, VkFormat format, VkImage& outImg, VkImageView& outView,
-                            VkDeviceMemory& outMem);
+    bool CreateImage2D(uint32_t width, uint32_t height, VkFormat format, Image2DRes& outRes);
+    bool CreateImage3D(uint32_t width, uint32_t height, uint32_t depth, VkFormat format, Image2DRes& outRes);
+    void ReleaseImageRes(Image2DRes& res);
+    bool CreatePyramidImage(uint32_t mip0W, uint32_t mip0H);
+    void ReleasePyramidImage();
+
     bool CreateGiImages(uint32_t width, uint32_t height);
     void ReleaseGiImages();
 
-    void UpdatePrepDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo, VkImageView colorView,
-                                 VkImageView depthView, VkImageView normalsView, VkImageView motionView,
-                                 VkImageView prevHalfNormalView, VkImageView outColorDepthView,
-                                 VkImageView outNormalView);
+    bool CreateStaticBuffers();
+    void ReleaseStaticBuffers();
+    void UpdateModelWeightsIfNeeded();
 
-    void UpdateGiDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
-                               VkImageView halfColorDepthView, VkImageView halfNormalView, VkImageView motionView,
-                               VkImageView prevGiView, VkImageView prevSsrView, VkImageView outGiView,
-                               VkImageView outSsrView);
+    bool CreatePassPipeline(VkPassObjects& pass, const std::vector<VkDescriptorSetLayoutBinding>& bindings,
+                            const std::vector<VkDescriptorPoolSize>& poolSizes, VkDeviceSize constantSize,
+                            const unsigned char* spvData, size_t spvSize);
+    void DestroyPassPipeline(VkPassObjects& pass);
 
-    void UpdateCompositeDescriptorSet(VkDescriptorSet descriptorSet, VkDescriptorBufferInfo bufferInfo,
-                                      VkImageView colorView, VkImageView halfColorDepthView, VkImageView motionView,
-                                      VkImageView giView, VkImageView halfNormalView, VkImageView albedoView,
-                                      VkImageView roughnessView, VkImageView ssrView, VkImageView outColorView);
+    void BatchImageBarriers(VkCommandBuffer cmdBuffer, const std::vector<VkImageMemoryBarrier>& barriers);
 
   public:
     NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalDevice);
@@ -82,7 +109,9 @@ class NL_Vk : public Shader_Vk, public NL_Common
                   const VkImageInfo& InResourceInfo, const VkImageInfo& InMotionVectorsInfo,
                   const VkImageInfo& OutResourceInfo, VkImageInfo* InDepthInfo,
                   VkImageInfo* InGBufferNormals = nullptr, VkImageInfo* InGBufferAlbedo = nullptr,
-                  VkImageInfo* InGBufferRoughness = nullptr);
+                  VkImageInfo* InGBufferRoughness = nullptr, VkImageInfo* InGBufferMetallic = nullptr,
+                  VkImageInfo* InGBufferSubsurface = nullptr, VkImageInfo* InReactiveMask = nullptr,
+                  VkImageInfo* InTransparencyMask = nullptr, VkImageInfo* InExposure = nullptr);
 
     bool CreateImageResource(VkDevice device, VkPhysicalDevice physicalDevice, uint32_t width, uint32_t height,
                              VkFormat format, VkImageUsageFlags usage)

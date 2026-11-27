@@ -391,9 +391,13 @@ class Config
     CustomOptional<float> NeuralLookDetail { 0.55f };
     CustomOptional<float> NeuralLookSpecularRelief { 0.50f };
     CustomOptional<float> NeuralLookToneContrast { 0.32f };
+    CustomOptional<float> NeuralLookSssIntensity { 0.75f };
+    CustomOptional<float> NeuralLookContactShadowIntensity { 0.70f };
     CustomOptional<float> NeuralLookMaxGpuMs { 1.80f };
     CustomOptional<float> NeuralLookSplitScreen { 0.0f };
     CustomOptional<bool> NeuralLookUseGBuffers { true };
+    CustomOptional<bool> NeuralLookWorldHashEnabled { true };
+    CustomOptional<std::string> NeuralLookModelPack { "default" };
     CustomOptional<int> NeuralLookDebugView { 0 };
 
     // Magnifier
