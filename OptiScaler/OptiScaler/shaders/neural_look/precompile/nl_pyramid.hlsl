@@ -165,10 +165,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         bool isSky = (m0.a >= 64000.0f || m0.a >= SkyDepthThreshold);
 
         float3 dirView;
+        float3 keyCandView;
         float sampleW = 1.0f;
         if (isSky)
         {
             dirView = viewRay;
+            keyCandView = viewRay;
             sampleW = 1.4f;
             sh0.w = 1.0f;
         }
@@ -176,9 +178,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         {
             float2 nxy = clamp(nAvg, -1.0f, 1.0f);
             dirView = normalize(float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy)))));
+            // Avoid front-facing surface normals turning dominant key light into a (0,0,-1) camera flash
+            keyCandView = normalize(float3(nxy.x * 0.85f + viewRay.x * 0.35f, max(nxy.y * 0.75f + 0.30f, 0.15f), -0.25f));
         }
 
         float3 dir = (HasCameraBasis > 0) ? ViewToWorldDir(dirView, CameraRight, CameraUp, CameraFwd) : dirView;
+        float3 keyCandDir = (HasCameraBasis > 0) ? ViewToWorldDir(keyCandView, CameraRight, CameraUp, CameraFwd) : keyCandView;
 
         sh0.rgb = col * sampleW;
         shX = float4(col * (dir.x * sampleW), 1.0f);
@@ -188,7 +193,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         // Dominant key light weighted toward bright directional highlights & bright sky regions
         float brightW = max(lum - 0.12f, 0.0f) * (isSky ? 1.8f : 1.0f);
         brightW = min(brightW * brightW, 12.0f);
-        kdW = float4(dir * brightW, brightW);
+        kdW = float4(keyCandDir * brightW, brightW);
         kcW = float4(col * brightW, lum);
     }
 

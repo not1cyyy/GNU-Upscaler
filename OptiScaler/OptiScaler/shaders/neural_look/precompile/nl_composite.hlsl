@@ -264,58 +264,6 @@ float ComputeSpecularOcclusion(float NdotV, float ao, float roughness)
     return saturate(pow(max(NdotV + ao, 1e-4f), exp2(-16.0f * roughness - 1.0f)) - 1.0f + ao);
 }
 
-// Full-resolution view normal reconstructed directly from LDS 18x18 depth tile
-float3 ReconstructFullResNormalLDS(float2 uv, float2 invOut, float dC, float dL, float dR, float dU, float dD,
-                                   float tanHalfFov, float tanHalfFovAspect)
-{
-    float3 pC = ReconstructViewPos(uv, dC, tanHalfFov, tanHalfFovAspect);
-    float3 pL = ReconstructViewPos(uv + float2(-invOut.x, 0.0f), dL, tanHalfFov, tanHalfFovAspect);
-    float3 pR = ReconstructViewPos(uv + float2(invOut.x, 0.0f), dR, tanHalfFov, tanHalfFovAspect);
-    float3 pU = ReconstructViewPos(uv + float2(0.0f, -invOut.y), dU, tanHalfFov, tanHalfFovAspect);
-    float3 pD = ReconstructViewPos(uv + float2(0.0f, invOut.y), dD, tanHalfFov, tanHalfFovAspect);
-
-    float3 dx = (abs(dR - dC) < abs(dC - dL)) ? (pR - pC) : (pC - pL);
-    float3 dy = (abs(dD - dC) < abs(dC - dU)) ? (pC - pD) : (pU - pC);
-
-    float3 n = cross(dx, dy);
-    float lenSq = dot(n, n);
-    if (lenSq < 1e-12f)
-        return float3(0.0f, 0.0f, -1.0f);
-
-    n *= rsqrt(lenSq);
-    if (n.z > 0.0f)
-        n = -n;
-    return n;
-}
-
-// Physically-based Trowbridge-Reitz GGX microfacet specular lobe
-float3 EvalGGXSpecular(float3 N, float3 V, float3 L, float roughness, float3 f0)
-{
-    float NdotL = saturate(dot(N, L));
-    float NdotV = max(saturate(dot(N, V)), 1e-3f);
-    if (NdotL <= 1e-4f)
-        return float3(0.0f, 0.0f, 0.0f);
-
-    float3 H = normalize(V + L);
-    float NdotH = saturate(dot(N, H));
-    float VdotH = saturate(dot(V, H));
-
-    float a = max(roughness * roughness, 0.045f);
-    float a2 = a * a;
-    float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    float D = a2 / (kPi * max(denom * denom, 1e-5f));
-
-    float k = (a + 1.0f);
-    k = (k * k) * 0.125f;
-    float gV = NdotV / (NdotV * (1.0f - k) + k);
-    float gL = NdotL / (NdotL * (1.0f - k) + k);
-    float G = gV * gL;
-
-    float3 F = f0 + (1.0f - f0) * pow(1.0f - VdotH, 5.0f);
-    float3 spec = (D * G * F) / max(4.0f * NdotV * NdotL, 1e-3f);
-    return min(spec * NdotL, float3(3.5f, 3.5f, 3.5f));
-}
-
 // AgX-inspired highlight-desaturating filmic curve (preserves hue on bright lights instead of neon clipping)
 float3 ApplyAgxFilmicContrast(float3 linearCol, float contrastStr)
 {
@@ -349,9 +297,10 @@ float3 ApplyAgxFilmicContrast(float3 linearCol, float contrastStr)
     return max(mul(agxOutset, graded), 0.0f);
 }
 
-// Joint-bilateral upsample of half-res DenoisedGI, DenoisedSSR, DenoisedMeta, and flicker dilation
+// Joint-bilateral upsample of half-res DenoisedGI, DenoisedSSR, DenoisedMeta, HalfNormal, and flicker dilation
 void BilateralUpsampleHalfRes(int2 halfCoord, float centerDepth, float centerFlicker, bool sampleSsr,
-                              out float4 outGi, out float4 outSsr, out float outContactShadow, out float outFlicker)
+                              out float4 outGi, out float4 outSsr, out float outContactShadow,
+                              out float outFlicker, out float3 outViewNormal)
 {
     float invSigmaLog2 = 1.442695f / max(centerDepth * 0.045f, 0.02f);
 
@@ -360,6 +309,7 @@ void BilateralUpsampleHalfRes(int2 halfCoord, float centerDepth, float centerFli
 
     float4 giAccum = float4(0, 0, 0, 0);
     float4 ssrAccum = float4(0, 0, 0, 0);
+    float3 normAccum = float3(0, 0, 0);
     float csAccum = 0.0f;
     float wSum = 0.0f;
     float maxNFlick = 0.0f;
@@ -371,11 +321,11 @@ void BilateralUpsampleHalfRes(int2 halfCoord, float centerDepth, float centerFli
         int2 tapGi = ClampGiCoord(halfCoord + offsets[i]);
         float4 giTap = DenoisedGiTex.Load(int3(tapGi, 0));
         float csTap = DenoisedMetaTex.Load(int3(tapGi, 0)).r;
+        float4 hNormTap = HalfNormalTex.Load(int3(tapGi, 0));
 
         float w = weights[i];
         if (i > 0)
         {
-            float4 hNormTap = HalfNormalTex.Load(int3(tapGi, 0));
             w *= exp2(-abs(centerDepth - hNormTap.w) * invSigmaLog2);
             float tf = saturate(hNormTap.z);
             maxNFlick = max(maxNFlick, tf);
@@ -383,7 +333,11 @@ void BilateralUpsampleHalfRes(int2 halfCoord, float centerDepth, float centerFli
         }
         w += 1e-5f;
 
+        float2 tn = clamp(hNormTap.xy, -1.0f, 1.0f);
+        float3 tNorm = float3(tn, -sqrt(max(0.0f, 1.0f - dot(tn, tn))));
+
         giAccum += giTap * w;
+        normAccum += tNorm * w;
         csAccum += csTap * w;
         if (sampleSsr)
             ssrAccum += DenoisedSsrTex.Load(int3(tapGi, 0)) * w;
@@ -395,6 +349,7 @@ void BilateralUpsampleHalfRes(int2 halfCoord, float centerDepth, float centerFli
     outSsr = sampleSsr ? (ssrAccum * invW) : float4(0, 0, 0, 0);
     outContactShadow = saturate(csAccum * invW);
     outFlicker = saturate(max(centerFlicker, maxNFlick * 0.65f + (sumNFlick * 0.25f) * 0.35f));
+    outViewNormal = (dot(normAccum, normAccum) > 1e-6f) ? normalize(normAccum) : float3(0.0f, 0.0f, -1.0f);
 }
 
 [numthreads(16, 16, 1)]
@@ -476,7 +431,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float dD = s_depth[ldsCoord.y + 1][ldsCoord.x];
 
     float maxDepthGrad = max(abs(dR - dL), abs(dD - dU));
-    float haloRisk = smoothstep(0.015f, 0.08f, maxDepthGrad / max(centerDepth, 0.05f));
+    float haloRisk = smoothstep(0.06f, 0.18f, maxDepthGrad / max(centerDepth, 0.05f));
 
     // 3D Depth-Occluded Volumetric Light Scattering (foreground characters & beams occlude background light glow)
     float3 volumetricScatter = float3(0, 0, 0);
@@ -498,12 +453,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             float4 pyr = ColorPyramidTex.SampleLevel(LinearClampPyr, tapUv, vMips[vi]);
             float3 tapCol = max(pyr.rgb, 0.0f);
             float wL = Luma(tapCol);
-            float brightGate = max(wL - 0.65f, 0.0f) / max(wL, 1e-4f);
+            float brightGate = max(wL - 0.95f, 0.0f) / max(wL, 1e-4f);
             float3 tapBright = tapCol * brightGate;
 
             float tapDepth = pyr.a;
-            float frontOcc = smoothstep(0.50f, 1.05f, centerDepth / max(tapDepth, 0.05f));
-            float edgeWrap = haloRisk * 0.22f;
+            float frontOcc = smoothstep(0.55f, 1.05f, centerDepth / max(tapDepth, 0.05f));
+            float edgeWrap = haloRisk * 0.12f;
             float airWeight = max(frontOcc, edgeWrap);
 
             volumetricScatter += tapBright * airWeight * vWeights[vi];
@@ -513,7 +468,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     // Fast skybox early-out
     if (skyMask <= 1e-4f && DebugView == 0)
     {
-        float3 skyOut = centerColor + volumetricScatter * (VolumetricGlow * 0.22f);
+        float3 skyOut = centerColor + volumetricScatter * (VolumetricGlow * 0.14f);
         if (FusedRcasSharpness > 1e-4f)
         {
             float minL = min(min(lumaU, lumaL), min(lumaR, lumaD));
@@ -538,19 +493,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     int2 halfCoord = ClampGiCoord(int2((float2(outCoord) + 0.5f) * outToGi));
     float4 hNorm = HalfNormalTex.Load(int3(halfCoord, 0));
     float2 nxy = clamp(hNorm.xy, -1.0f, 1.0f);
-    float3 halfViewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
+    float3 viewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
     float centerFlicker = saturate(hNorm.z);
-
-    float3 fullViewNormal =
-        ReconstructFullResNormalLDS(uv, invOut, centerDepth, dL, dR, dU, dD, TanHalfFov, TanHalfFovAspect);
-    float3 viewNormal = (HasGBufferNormals > 0)
-                            ? normalize(lerp(fullViewNormal, halfViewNormal, 0.75f))
-                            : normalize(lerp(fullViewNormal, halfViewNormal, 0.30f * (1.0f - haloRisk)));
 
     float3 viewPos = ReconstructViewPos(uv, centerDepth, TanHalfFov, TanHalfFovAspect);
     float3 viewDir = normalize(viewPos);
     float3 toEye = -viewDir;
-    float NdotV = saturate(dot(toEye, viewNormal));
 
     float lumaUL = Luma(cUL);
     float lumaUR = Luma(cUR);
@@ -575,7 +523,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float meshGuard = rcp(1.0f + meshEnergy * meshEnergy * 32.0f);
     float2 microGrad = clamp(float2(pR - pL, pD - pU) / max(pC + 0.18f, 0.18f), -0.85f, 0.85f);
 
-    // Upsample GI, Contact Shadow, SSR
+    // Depth-bilateral upsample of GI, Contact Shadow, SSR, and ViewNormal (zero screen-door aliasing)
     float3 giBounce = float3(0, 0, 0);
     float contactAo = 1.0f;
     float contactShadow = 1.0f;
@@ -587,7 +535,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float4 giSample;
         bool needSsr = (SsrEnabled > 0 && SsrIntensity > 1e-4f) || (DebugView == 5);
         BilateralUpsampleHalfRes(halfCoord, centerDepth, centerFlicker, needSsr,
-                                 giSample, ssrSample, contactShadow, flickerSoft);
+                                 giSample, ssrSample, contactShadow, flickerSoft, viewNormal);
         giBounce = max(giSample.rgb, 0.0f);
         contactAo = lerp(1.0f, saturate(giSample.a), saturate(AoIntensity) * skyMask * (1.0f - flickerSoft));
         contactShadow = lerp(1.0f, contactShadow, saturate(ContactShadowIntensity) * skyMask * (1.0f - flickerSoft));
@@ -595,22 +543,28 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     else
     {
         static const int2 dOffsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+        float invSigmaLog2 = 1.442695f / max(centerDepth * 0.045f, 0.02f);
+        float3 normAccum = viewNormal * 0.36f;
         float maxNF = 0.0f;
         float sumNF = 0.0f;
         [unroll]
         for (int i = 0; i < 4; ++i)
         {
-            float tf = saturate(HalfNormalTex.Load(int3(ClampGiCoord(halfCoord + dOffsets[i]), 0)).z);
+            float4 hTap = HalfNormalTex.Load(int3(ClampGiCoord(halfCoord + dOffsets[i]), 0));
+            float tf = saturate(hTap.z);
             maxNF = max(maxNF, tf);
             sumNF += tf;
+            float wn = 0.16f * exp2(-abs(centerDepth - hTap.w) * invSigmaLog2);
+            float2 tn = clamp(hTap.xy, -1.0f, 1.0f);
+            normAccum += float3(tn, -sqrt(max(0.0f, 1.0f - dot(tn, tn)))) * wn;
         }
+        viewNormal = (dot(normAccum, normAccum) > 1e-6f) ? normalize(normAccum) : viewNormal;
         flickerSoft = saturate(max(centerFlicker, maxNF * 0.65f + (sumNF * 0.25f) * 0.35f));
     }
 
+    float NdotV = saturate(dot(toEye, viewNormal));
     float solidMask = skyMask * (1.0f - flickerSoft);
-    float edgeMask = solidMask * (1.0f - haloRisk * 0.85f);
-    float3 microNormal = normalize(
-        viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (0.34f * meshGuard * edgeMask));
+    float detailGuard = solidMask * (1.0f - haloRisk * 0.85f);
 
     // Fetch Trained Neural Material & Intrinsic Priors (override with render-res DLSS-RR G-buffers when present!)
     float4 mat0 = Material0Tex.SampleLevel(LinearClampMat0, uv, 0.0f);
@@ -714,78 +668,67 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float localLuma = max(Luma(localLightCol), 1e-4f);
     float3 localLightTint = clamp(localLightCol / localLuma, 0.50f, 1.80f);
 
-    // Energy-Conserving GI + Multi-Bounce AO + Frostbite Specular Occlusion + Radiant Colored Diffuse & Indirect Specular
+    // Energy-Conserving GI + Multi-Bounce AO + Frostbite Specular Occlusion + Calibrated Chromatic GI
     float specOcc = 1.0f;
     if (GiEnabled > 0)
     {
         float indirectWeight = saturate(1.0f - directMask * 0.72f) * (1.0f - skinMask * 0.50f);
-        float flooredAo = max(contactAo, 0.22f);
+        float flooredAo = max(contactAo, 0.26f);
         float effectiveAo = lerp(1.0f, flooredAo, indirectWeight);
         float3 coloredAo = float3(MultiBounceAO(min16float(effectiveAo), min16float3(albedo)));
         specOcc = ComputeSpecularOcclusion(NdotV, effectiveAo, roughness);
-        float csFactor = lerp(1.0f, max(contactShadow, 0.40f), 0.78f * edgeMask);
-        litColor = litColor * lerp(float3(1, 1, 1), coloredAo, edgeMask) * csFactor;
+        float csFactor = lerp(1.0f, max(contactShadow, 0.48f), 0.72f * solidMask);
+        litColor = litColor * lerp(float3(1, 1, 1), coloredAo, solidMask) * csFactor;
 
         float shadowFocus = rcp(1.0f + centerLuma * 0.85f);
         float3 bounceAlbedo = clamp(albedo, 0.03f, 0.90f);
-        // Diffuse colored bounce from glowing lights & walls
-        litColor += giBounce * bounceAlbedo * (1.0f - metallic * 0.60f) *
-                    (GiIntensity * (0.75f + 0.85f * shadowFocus)) * edgeMask;
+        // Diffuse colored bounce from glowing lights & walls (direct-light-protected so lit walls never turn white)
+        litColor += giBounce * bounceAlbedo * (1.0f - metallic * 0.65f) * (1.0f - directMask * 0.50f) *
+                    (GiIntensity * (0.45f + 0.65f * shadowFocus)) * solidMask;
 
-        // Indirect specular colored sheen so dark painted steel, armor, and pipes pick up colored environment light
+        // Subtle indirect colored specular sheen on smooth/metallic surfaces
         float3 indSpecF0 = lerp(float3(0.04f, 0.04f, 0.04f), bounceAlbedo, metallic);
         float indFresnel = 0.25f + 0.75f * pow(1.0f - NdotV, 4.0f);
-        litColor += giBounce * indSpecF0 * indFresnel * pow(smoothness, 1.25f) * specOcc *
-                    (1.0f - skinMask * 0.80f) * (GiIntensity * 0.55f) * edgeMask;
+        litColor += giBounce * indSpecF0 * indFresnel * pow(smoothness, 2.0f) * specOcc *
+                    (1.0f - skinMask * 0.85f) * (GiIntensity * 0.22f) * solidMask;
     }
 
     // Physically-Based Roughness-Cone SSR with Schlick Fresnel + Frostbite Specular Occlusion
-    if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && roughness < 0.85f)
+    if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && roughness < 0.80f)
     {
         float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
         f0 = lerp(f0, float3(0.028f, 0.028f, 0.028f), skinMask);
         float fresnel = pow(1.0f - NdotV, 5.0f);
         float3 specF = f0 + (1.0f - f0) * fresnel;
-        float glossGate = pow(smoothness, 1.15f) * (1.0f - skinMask * 0.78f);
-        float reflWeight = saturate((max(specF.r, max(specF.g, specF.b)) * 1.45f + metallic * 0.22f) * glossGate *
-                                    SsrIntensity * 1.35f) *
-                           edgeMask * specOcc * saturate(ssrSample.a);
+        float glossGate = pow(smoothness, 2.2f) * (1.0f - skinMask * 0.85f);
+        float reflWeight = saturate((max(specF.r, max(specF.g, specF.b)) + metallic * 0.14f) * glossGate *
+                                    SsrIntensity * 1.15f) *
+                           solidMask * (1.0f - haloRisk * 0.70f) * specOcc * saturate(ssrSample.a);
         float3 reflTint = lerp(float3(1, 1, 1), albedo, metallic * 0.70f);
         litColor = lerp(litColor, ssrSample.rgb * reflTint, reflWeight);
     }
 
-    // Physically-Based GGX Microfacet Specular + Local 3D Light Rim + Macro Volume Sculpting
-    if (RelightIntensity > 1e-4f || SpecularRelief > 1e-4f)
-    {
-        float3 f0Spec = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
-        float specScale = (RelightIntensity * 0.35f + SpecularRelief * 0.45f) * specOcc * contactShadow *
-                          (1.0f - skinMask * 0.65f) * edgeMask;
-        float3 keySpec = EvalGGXSpecular(microNormal, toEye, keyDirView, roughness, f0Spec) * keyTint * keyStrength * 0.85f;
-        float3 localSpec = EvalGGXSpecular(microNormal, toEye, localLightDir, roughness, f0Spec) * localLightCol *
-                           localLightWeight * 1.15f;
-        litColor += (keySpec + localSpec) * specScale;
-    }
-
+    // Natural 3D Volume Sculpting & Grazing Rim (zero camera headlamp flash!)
     if (RelightIntensity > 1e-4f)
     {
-        float macroKey = (dot(viewNormal, keyDirView) - 0.12f) * 0.13f * keyStrength;
+        float macroKey = (dot(viewNormal, keyDirView) - 0.10f) * 0.08f * keyStrength;
         float hemiTerm = dot(viewNormal, worldUpInView) * 0.09f;
 
-        float sculpt = (macroKey + hemiTerm) * RelightIntensity * edgeMask;
+        float sculpt = (macroKey + hemiTerm) * RelightIntensity * solidMask;
         float3 sculptTint = (sculpt >= 0.0f) ? keyTint : float3(0.88f, 0.94f, 1.08f);
-        litColor *= max(1.0f + sculpt * sculptTint, 0.50f);
+        litColor *= max(1.0f + sculpt * sculptTint, 0.58f);
 
         // Local-light grazing rim scatter with subtle foreground character/geometry separation
-        float fgBoost = 1.0f + 0.45f * (1.0f - smoothstep(2.0f, 10.0f, centerDepth));
-        float rim = pow(1.0f - NdotV, 3.0f) * RelightIntensity * edgeMask * specOcc * 0.16f *
-                    (1.0f - roughness * 0.40f) * fgBoost;
+        float fgBoost = 1.0f + 0.35f * (1.0f - smoothstep(2.0f, 10.0f, centerDepth));
+        float rim = pow(1.0f - NdotV, 3.0f) * RelightIntensity * solidMask * specOcc * 0.10f *
+                    (1.0f - roughness * 0.45f) * fgBoost;
         float3 rimTint = lerp(keyTint, localLightTint, localLightWeight);
         litColor += litColor * rim * rimTint * saturate(Luma(giBounce) * 1.3f + localLightWeight * 0.55f + 0.25f);
 
         // Charlie velvet/cloth sheen at grazing angles (zero black-floor lift)
         if (clothMask > 0.05f)
         {
-            float sheen = pow(1.0f - NdotV, 4.0f) * clothMask * RelightIntensity * edgeMask * 0.12f;
+            float sheen = pow(1.0f - NdotV, 4.0f) * clothMask * RelightIntensity * solidMask * 0.12f;
             litColor += (albedo * 0.6f + keyTint * 0.4f) * sheen * centerLuma;
         }
 
@@ -798,14 +741,24 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         }
     }
 
+    // Specular Micro-Relief
+    if (SpecularRelief > 1e-4f)
+    {
+        float microMag = length(microGrad) * meshGuard;
+        float grazing = pow(1.0f - NdotV, 3.5f) * smoothness;
+        float specSignal = 0.50f * grazing + 0.50f * saturate(microMag * 1.15f) * smoothness;
+        float specMod = SpecularRelief * detailGuard * specOcc * specSignal * 0.14f * (1.0f - skinMask * 0.45f);
+        litColor *= (1.0f + specMod);
+    }
+
     if (VolumetricGlow > 1e-4f)
     {
-        litColor += volumetricScatter * (VolumetricGlow * 0.42f * (0.35f + 0.65f * (1.0f - flickerSoft)));
+        litColor += volumetricScatter * (VolumetricGlow * 0.24f * (0.35f + 0.65f * (1.0f - flickerSoft)));
 
-        // Subtle Beer-Lambert distant atmospheric depth separation (only past 12m, preserves foreground blacks)
-        float farDist = max(centerDepth - 12.0f, 0.0f);
-        float aerialFactor = saturate(1.0f - exp(-farDist * 0.0085f)) * min(VolumetricGlow * 0.14f, 0.16f) * skyMask;
-        float3 sceneAmbient = max(ResolvedSceneLightBuf[0].rgb * 0.45f + volumetricScatter * 0.35f, 0.0f);
+        // Subtle Beer-Lambert distant atmospheric depth separation (only past 18m, preserves foreground blacks)
+        float farDist = max(centerDepth - 18.0f, 0.0f);
+        float aerialFactor = saturate(1.0f - exp(-farDist * 0.005f)) * min(VolumetricGlow * 0.06f, 0.07f) * skyMask;
+        float3 sceneAmbient = max(ResolvedSceneLightBuf[0].rgb * 0.25f + volumetricScatter * 0.20f, 0.0f);
         litColor = lerp(litColor, max(litColor, sceneAmbient), aerialFactor);
     }
 
@@ -828,7 +781,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float2 mv = MotionTex.Load(int3(mvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
         float motionDamp = rcp(1.0f + length(mv) * 0.04f);
 
-        float strength = saturate(NeuralDetail * 0.50f) * edgeMask;
+        float strength = saturate(NeuralDetail * 0.50f) * detailGuard;
         float rcasDamp = lerp(1.0f, 0.35f, saturate(FusedRcasSharpness));
         float highPass = (pC - pAvg) / max(pAvg + 0.16f, 0.16f);
 

@@ -250,15 +250,15 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     int slices = clamp(RayCount, 1, 4);
     int steps = clamp(StepCount, 3, 8);
-    float aoWorldRange = clamp(centerDepth * 0.16f, 0.45f, 3.8f);
-    float aoThickness = clamp(centerDepth * 0.032f, 0.06f, 0.48f);
-    float maxFgGap = clamp(centerDepth * 0.07f, 0.18f, 1.35f);
-    float giWorldRange = clamp(centerDepth * 0.48f, 2.5f, 14.0f);
+    float aoWorldRange = clamp(centerDepth * 0.12f, 0.35f, 2.2f);
+    float aoThickness = clamp(centerDepth * 0.025f, 0.04f, 0.30f);
+    float maxFgGap = clamp(centerDepth * 0.05f, 0.12f, 0.75f);
+    float giWorldRange = clamp(centerDepth * 0.38f, 2.0f, 10.0f);
 
     float3 accumGi = float3(0.0f, 0.0f, 0.0f);
     float accumAo = 0.0f;
 
-    // 1. Dual-Band Visibility-Bitmask SSGI: Crisp Close AO + Wide Radiant Colored Light Bleed
+    // 1. Dual-Band Visibility-Bitmask SSGI: Smooth Distance-Faded AO + Calibrated Chromatic Light Bleed
     [loop]
     for (int r = 0; r < slices; ++r)
     {
@@ -276,6 +276,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float nAngle = (projNLen > 1e-4f) ? atan2(sinN, cosN) : 0.0f;
 
         uint bitmask = 0u;
+        float sliceOcc = 0.0f;
         float3 sliceGi = float3(0.0f, 0.0f, 0.0f);
 
         [loop]
@@ -293,7 +294,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 if (any(sampleUv < 0.002f) || any(sampleUv > 0.998f))
                 {
                     float3 exitDir = normalize(lerp(viewNormal, float3(marchDirPx.x, -marchDirPx.y, -0.3f), 0.55f));
-                    sliceGi += QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f) * 0.12f;
+                    sliceGi += QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f) * 0.08f;
                     break;
                 }
 
@@ -312,7 +313,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 float dist = sqrt(distSq);
                 float3 frontDir = deltaFront / dist;
 
-                // Band 1: Geometric Visibility-Bitmask AO (foreground-gap guarded)
+                // Band 1: Smooth Distance-Faded Visibility-Bitmask AO (zero halos on pipes/arches)
                 if ((centerDepth - sampleDepth) <= maxFgGap && dist < aoWorldRange)
                 {
                     float3 backDir = normalize(deltaFront - toEye * aoThickness);
@@ -341,11 +342,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     {
                         uint sectorMask = (bitCount >= 32u) ? (0xFFFFFFFFu << startBit)
                                                             : (((1u << bitCount) - 1u) << startBit);
+                        uint newlyOccluded = sectorMask & ~bitmask;
                         bitmask |= sectorMask;
+                        float aoFade = pow(1.0f - saturate(dist / aoWorldRange), 1.5f);
+                        sliceOcc += (float(countbits(newlyOccluded)) / 32.0f) * aoFade;
                     }
                 }
 
-                // Band 2: Wide Radiant Colored Bounce (up to 14m, luminous emitter boost)
+                // Band 2: Calibrated Wide Colored Bounce (up to 10m, luminous emitter boost)
                 float fgAtten = 1.0f - smoothstep(giWorldRange * 0.35f, giWorldRange * 0.70f, max(centerDepth - sampleDepth, 0.0f));
                 if (fgAtten > 0.01f)
                 {
@@ -353,31 +357,31 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     if (nDotL > 0.0f)
                     {
                         float mipLvl = clamp(log2(max(radiusPx * 0.22f, 1.0f)), 0.0f, 4.0f);
-                        float3 sampleColor = max(ColorPyramidTex.SampleLevel(LinearClampPyr, sampleUv, mipLvl).rgb, 0.0f);
+                        float3 sampleColor = clamp(ColorPyramidTex.SampleLevel(LinearClampPyr, sampleUv, mipLvl).rgb, 0.0f, 4.0f);
                         float hitLuma = Luma(sampleColor);
 
                         float2 sNxy = clamp(HalfNormalTex.Load(int3(sGiCoord, 0)).xy, -1.0f, 1.0f);
                         float3 sNorm = float3(sNxy, -sqrt(max(0.0f, 1.0f - dot(sNxy, sNxy))));
                         float emitterFace = saturate(dot(sNorm, -frontDir) * 0.65f + 0.35f);
-                        float emitterBoost = 1.0f + smoothstep(0.40f, 1.60f, hitLuma) * 1.50f;
-                        float3 hitCol = max(lerp(hitLuma.xxx, sampleColor, 1.20f), 0.0f);
+                        float emitterBoost = 1.0f + smoothstep(0.65f, 2.20f, hitLuma) * 0.85f;
+                        float3 hitCol = max(lerp(hitLuma.xxx, sampleColor, 1.15f), 0.0f);
 
                         float normD = dist / max(giWorldRange * 0.38f, 0.5f);
                         float giAtten = rcp(1.0f + normD * normD) * pow(1.0f - saturate(dist / giWorldRange), 1.25f) * fgAtten;
 
-                        sliceGi += hitCol * nDotL * emitterFace * emitterBoost * giAtten * (1.75f / float(steps));
+                        sliceGi += hitCol * nDotL * emitterFace * emitterBoost * giAtten * (0.95f / float(steps));
                     }
                 }
             }
         }
 
-        float sliceAo = 1.0f - float(countbits(bitmask)) / 32.0f;
-        accumAo += saturate(sliceAo);
+        float sliceAo = saturate(1.0f - sliceOcc);
+        accumAo += sliceAo;
         accumGi += sliceGi;
     }
 
     float3 currentGi = max(accumGi / float(slices), 0.0f);
-    float distAoFade = rcp(1.0f + centerDepth * 0.012f);
+    float distAoFade = rcp(1.0f + centerDepth * 0.018f);
     float currentAo = lerp(1.0f, saturate(accumAo / float(slices)), distAoFade);
 
     // 2. Grounding Screen-Space Contact Shadows toward Dominant Key Light (in canonical meters)
@@ -389,7 +393,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (nDotKey > 0.02f && keyStrength > 0.05f)
     {
         int cSteps = clamp(int(ContactShadowSteps), 2, 8);
-        float maxShadowDist = clamp(centerDepth * 0.045f, 0.08f, 1.10f);
+        float maxShadowDist = clamp(centerDepth * 0.035f, 0.05f, 0.75f);
         float occ = 0.0f;
         float invTanV = rcp(max(TanHalfFov, 1e-4f));
         float invTanH = rcp(max(TanHalfFovAspect, 1e-4f));
@@ -408,14 +412,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
             float sampleD = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rUv * float2(GiWidth, GiHeight))), 0)).a;
             float diff = rayPos.z - sampleD;
-            float maxThick = clamp(centerDepth * 0.022f, 0.03f, 0.32f);
+            float maxThick = clamp(centerDepth * 0.018f, 0.02f, 0.22f);
             if (diff > centerDepth * 0.002f && diff < maxThick)
             {
                 occ = max(occ, 1.0f - fracS * 0.55f);
             }
         }
-        float csDistFade = rcp(1.0f + centerDepth * 0.025f);
-        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * 0.85f);
+        float csDistFade = rcp(1.0f + centerDepth * 0.035f);
+        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * 0.72f);
     }
 
     // 3. Hi-Z Roughness-Cone SSR (skip diffuse surfaces roughness > 0.85) + Virtual Hit Distance
