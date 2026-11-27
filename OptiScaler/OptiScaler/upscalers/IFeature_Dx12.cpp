@@ -5,6 +5,8 @@
 
 #include "IFeature_Dx12.h"
 #include "State.h"
+#include <OptiTypes.h>
+#include <algorithm>
 #include <misc/DeferredRelease.h>
 
 void IFeature_Dx12::ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
@@ -157,6 +159,14 @@ NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter*
         nlConstants.CameraNear = nearPlane;
         nlConstants.CameraFar = farPlane;
     }
+    else if (InParameters->Get(OptiKeys::FSR_NearPlane, &nearPlane) == NVSDK_NGX_Result_Success &&
+             InParameters->Get(OptiKeys::FSR_FarPlane, &farPlane) == NVSDK_NGX_Result_Success)
+    {
+        if (DepthInverted() && nearPlane > farPlane && farPlane > 0.0f)
+            std::swap(nearPlane, farPlane);
+        nlConstants.CameraNear = nearPlane;
+        nlConstants.CameraFar = farPlane;
+    }
     else
     {
         nlConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
@@ -166,6 +176,10 @@ NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter*
     float vFov = 0.0f;
     if (InParameters->Get("DLSSG.CameraVFov", &vFov) == NVSDK_NGX_Result_Success && vFov > 0.05f)
         nlConstants.CameraVFov = vFov;
+    else if (InParameters->Get(OptiKeys::FSR_CameraFovVertical, &vFov) == NVSDK_NGX_Result_Success && vFov > 0.05f)
+        nlConstants.CameraVFov = vFov;
+    else if (Config::Instance()->FsrVerticalFov.has_value() && Config::Instance()->FsrVerticalFov.value() > 1.0f)
+        nlConstants.CameraVFov = Config::Instance()->FsrVerticalFov.value() * 0.0174532925f;
 
     float aspectRatio = 0.0f;
     if (InParameters->Get("DLSSG.CameraAspectRatio", &aspectRatio) == NVSDK_NGX_Result_Success && aspectRatio > 0.1f)

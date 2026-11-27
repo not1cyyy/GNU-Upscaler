@@ -170,13 +170,23 @@ int2 ClampDepthCoord(int2 p)
     return clamp(p, minC, max(minC, maxC));
 }
 
+int2 GetMotionActiveSize()
+{
+    if (DisplaySizeMV > 0)
+    {
+        return (PreUpscale == 0)
+                   ? int2(max(OutputWidth, 1), max(OutputHeight, 1))
+                   : int2(max(MotionWidth - MvSubrectBaseX, 1), max(MotionHeight - MvSubrectBaseY, 1));
+    }
+    return int2(max(RenderWidth, 1), max(RenderHeight, 1));
+}
+
 int2 ClampMotionCoord(int2 p)
 {
-    int activeW = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputWidth : RenderWidth;
-    int activeH = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputHeight : RenderHeight;
+    int2 activeMv = GetMotionActiveSize();
     int2 minC = int2(MvSubrectBaseX, MvSubrectBaseY);
-    int2 maxC = int2(min(MvSubrectBaseX + activeW - 1, MotionWidth - 1),
-                     min(MvSubrectBaseY + activeH - 1, MotionHeight - 1));
+    int2 maxC = int2(min(MvSubrectBaseX + activeMv.x - 1, MotionWidth - 1),
+                     min(MvSubrectBaseY + activeMv.y - 1, MotionHeight - 1));
     return clamp(p, minC, max(minC, maxC));
 }
 
@@ -189,11 +199,26 @@ int2 UvToDepthCoord(float2 uv)
     return ClampDepthCoord(c);
 }
 
+int2 HalfCoordToDepthCoord(int2 hc)
+{
+    if (PreUpscale > 0 && abs(RenderWidth - HalfWidth * 2) <= 1 && abs(RenderHeight - HalfHeight * 2) <= 1)
+    {
+        return ClampDepthCoord(int2(DepthSubrectBaseX, DepthSubrectBaseY) + hc * 2);
+    }
+    float2 invHalf = 1.0f / float2(max(HalfWidth, 1), max(HalfHeight, 1));
+    return UvToDepthCoord((float2(hc) + 0.5f) * invHalf);
+}
+
+float2 DepthCoordToUv(int2 dCoord)
+{
+    float2 rel = float2(dCoord - int2(DepthSubrectBaseX, DepthSubrectBaseY)) + 0.5f;
+    return rel / float2(max(RenderWidth, 1), max(RenderHeight, 1));
+}
+
 int2 UvToMotionCoord(float2 uv)
 {
-    int activeW = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputWidth : RenderWidth;
-    int activeH = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputHeight : RenderHeight;
-    int2 c = int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeW, activeH));
+    int2 activeMv = GetMotionActiveSize();
+    int2 c = int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeMv));
     return ClampMotionCoord(c);
 }
 
@@ -204,27 +229,119 @@ float LoadLinearDepth(int2 coord)
                                DepthLinearA, DepthLinearB, DepthLinearC, SkyDepthThreshold);
 }
 
-float3 ReconstructViewNormalFromHalfDepths(float2 uv, float dC, float dL, float dR, float dU, float dD)
+float3 ReconstructViewNormalFromHalfDepths(int2 halfCoord, float dC, float dL, float dR, float dU, float dD,
+                                           float dUL, float dUR, float dDL, float dDR)
 {
-    float2 invHalf = 1.0f / float2(max(HalfWidth, 1), max(HalfHeight, 1));
+    int2 cC  = ClampHalfCoord(halfCoord);
+    int2 cL  = ClampHalfCoord(halfCoord + int2(-1, 0));
+    int2 cR  = ClampHalfCoord(halfCoord + int2(1, 0));
+    int2 cU  = ClampHalfCoord(halfCoord + int2(0, -1));
+    int2 cD  = ClampHalfCoord(halfCoord + int2(0, 1));
+    int2 cUL = ClampHalfCoord(halfCoord + int2(-1, -1));
+    int2 cUR = ClampHalfCoord(halfCoord + int2(1, -1));
+    int2 cDL = ClampHalfCoord(halfCoord + int2(-1, 1));
+    int2 cDR = ClampHalfCoord(halfCoord + int2(1, 1));
 
-    float3 pC = ReconstructViewPos(uv, dC, TanHalfFov, TanHalfFovAspect);
-    float3 pL = ReconstructViewPos(uv + float2(-invHalf.x, 0.0f), dL, TanHalfFov, TanHalfFovAspect);
-    float3 pR = ReconstructViewPos(uv + float2(invHalf.x, 0.0f), dR, TanHalfFov, TanHalfFovAspect);
-    float3 pU = ReconstructViewPos(uv + float2(0.0f, -invHalf.y), dU, TanHalfFov, TanHalfFovAspect);
-    float3 pD = ReconstructViewPos(uv + float2(0.0f, invHalf.y), dD, TanHalfFov, TanHalfFovAspect);
+    float2 uvC  = DepthCoordToUv(HalfCoordToDepthCoord(cC));
+    float2 uvL  = DepthCoordToUv(HalfCoordToDepthCoord(cL));
+    float2 uvR  = DepthCoordToUv(HalfCoordToDepthCoord(cR));
+    float2 uvU  = DepthCoordToUv(HalfCoordToDepthCoord(cU));
+    float2 uvD  = DepthCoordToUv(HalfCoordToDepthCoord(cD));
+    float2 uvUL = DepthCoordToUv(HalfCoordToDepthCoord(cUL));
+    float2 uvUR = DepthCoordToUv(HalfCoordToDepthCoord(cUR));
+    float2 uvDL = DepthCoordToUv(HalfCoordToDepthCoord(cDL));
+    float2 uvDR = DepthCoordToUv(HalfCoordToDepthCoord(cDR));
 
-    float3 dx = (abs(dR - dC) < abs(dC - dL)) ? (pR - pC) : (pC - pL);
-    float3 dy = (abs(dD - dC) < abs(dC - dU)) ? (pC - pD) : (pU - pC);
+    float invDC = rcp(max(dC, 1e-4f));
+    float3 qC  = ReconstructViewPos(uvC,  1.0f,        TanHalfFov, TanHalfFovAspect);
+    float3 qL  = ReconstructViewPos(uvL,  dL  * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qR  = ReconstructViewPos(uvR,  dR  * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qU  = ReconstructViewPos(uvU,  dU  * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qD  = ReconstructViewPos(uvD,  dD  * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qUL = ReconstructViewPos(uvUL, dUL * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qUR = ReconstructViewPos(uvUR, dUR * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qDL = ReconstructViewPos(uvDL, dDL * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qDR = ReconstructViewPos(uvDR, dDR * invDC, TanHalfFov, TanHalfFovAspect);
+
+    float iC = invDC;
+    float iL = rcp(max(dL, 1e-4f));
+    float iR = rcp(max(dR, 1e-4f));
+    float iU = rcp(max(dU, 1e-4f));
+    float iD = rcp(max(dD, 1e-4f));
+
+    bool hasL = halfCoord.x > 0;
+    bool hasR = halfCoord.x < (HalfWidth - 1);
+    bool hasU = halfCoord.y > 0;
+    bool hasD = halfCoord.y < (HalfHeight - 1);
+
+    float diL = iC - iL;
+    float diR = iR - iC;
+    float diffX = abs(diR - diL);
+    float tolX = max(abs(diL) + abs(diR), iC * 0.008f) * 0.45f + iC * 0.004f;
+    bool coplanarX = (hasL && hasR && dL < 64000.0f && dR < 64000.0f && diffX < tolX);
+
+    float3 dx;
+    if (coplanarX)
+        dx = 0.5f * (qR - qL);
+    else if (hasL && hasR)
+        dx = (abs(diR) < abs(diL)) ? (qR - qC) : (qC - qL);
+    else if (hasR)
+        dx = qR - qC;
+    else if (hasL)
+        dx = qC - qL;
+    else
+        dx = float3(2.0f * TanHalfFovAspect / float(max(HalfWidth, 1)), 0.0f, 0.0f);
+
+    float diU = iC - iU;
+    float diD = iD - iC;
+    float diffY = abs(diD - diU);
+    float tolY = max(abs(diU) + abs(diD), iC * 0.008f) * 0.45f + iC * 0.004f;
+    bool coplanarY = (hasU && hasD && dU < 64000.0f && dD < 64000.0f && diffY < tolY);
+
+    float3 dy;
+    if (coplanarY)
+        dy = 0.5f * (qU - qD);
+    else if (hasU && hasD)
+        dy = (abs(diD) < abs(diU)) ? (qC - qD) : (qU - qC);
+    else if (hasU)
+        dy = qU - qC;
+    else if (hasD)
+        dy = qC - qD;
+    else
+        dy = float3(0.0f, 2.0f * TanHalfFov / float(max(HalfHeight, 1)), 0.0f);
 
     float3 n = cross(dx, dy);
+
+    if (coplanarX && coplanarY && dUL < 64000.0f && dUR < 64000.0f && dDL < 64000.0f && dDR < 64000.0f)
+    {
+        float gX = 0.5f * (iR - iL);
+        float gY = 0.5f * (iD - iU);
+        float diagTol = max(tolX, tolY) * 1.5f;
+        float eUL = abs(rcp(max(dUL, 1e-4f)) - (iC - gX - gY));
+        float eUR = abs(rcp(max(dUR, 1e-4f)) - (iC + gX - gY));
+        float eDL = abs(rcp(max(dDL, 1e-4f)) - (iC - gX + gY));
+        float eDR = abs(rcp(max(dDR, 1e-4f)) - (iC + gX + gY));
+        if (max(max(eUL, eUR), max(eDL, eDR)) < diagTol)
+        {
+            float3 nDiag = cross(0.5f * (qUR - qDL), 0.5f * (qUL - qDR));
+            if (dot(nDiag, n) < 0.0f)
+                nDiag = -nDiag;
+            n += nDiag * 0.5f;
+        }
+    }
+
     float lenSq = dot(n, n);
     if (lenSq < 1e-12f)
         return float3(0.0f, 0.0f, -1.0f);
 
     n *= rsqrt(lenSq);
-    if (n.z > 0.0f)
+    if (dot(n, qC) > 0.0f)
         n = -n;
+    if (n.z > -0.005f)
+    {
+        n.z = -0.005f;
+        n = normalize(n);
+    }
     return n;
 }
 
@@ -257,8 +374,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             int ly = int(idx / 10u);
             int lx = int(idx % 10u);
             int2 hc = ClampHalfCoord(tileOrigin + int2(lx, ly));
-            float2 hUv = (float2(hc) + 0.5f) * invHalf;
-            s_depth[ly][lx] = LoadLinearDepth(UvToDepthCoord(hUv));
+            s_depth[ly][lx] = LoadLinearDepth(HalfCoordToDepthCoord(hc));
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -282,7 +398,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float2 uv = (float2(halfCoord) + 0.5f) * invHalf;
     float exposureNorm = rcp(max(PreExposure, 1e-4f));
 
-    int2 dCoord = UvToDepthCoord(uv);
+    int2 dCoord = HalfCoordToDepthCoord(halfCoord);
     float dC  = s_depth[ly][lx];
     float dL  = s_depth[ly][lx - 1];
     float dR  = s_depth[ly][lx + 1];
@@ -345,9 +461,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     int2 mvCoord = UvToMotionCoord(uv);
     float2 mv = MotionTex.Load(int3(mvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
-    float2 mvRefSize = (DisplaySizeMV > 0 && PreUpscale == 0)
-                           ? float2(OutputWidth, OutputHeight)
-                           : float2(max(RenderWidth, 1), max(RenderHeight, 1));
+    float2 mvRefSize = float2(GetMotionActiveSize());
     float2 mvUv = mv / mvRefSize;
     float mvMagPx = length(mvUv * float2(OutputWidth, OutputHeight));
     float2 prevUv = uv + mvUv;
@@ -391,7 +505,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         return;
     }
 
-    float3 viewNormal = ReconstructViewNormalFromHalfDepths(uv, dC, dL, dR, dU, dD);
+    float3 viewNormal = ReconstructViewNormalFromHalfDepths(halfCoord, dC, dL, dR, dU, dD, dUL, dUR, dDL, dDR);
     if (HasGBufferNormals > 0)
     {
         float3 gN = GBufferNormalsTex.Load(int3(dCoord, 0)).xyz;

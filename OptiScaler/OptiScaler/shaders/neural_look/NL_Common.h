@@ -426,18 +426,41 @@ class NL_Common
         outTanHalfFovAspect = outTanHalfFov * aspect;
     }
 
-    static float ComputeDepthUnitScale(const NeuralLookConstants& inConst)
+    static void ResolveNearFarMeters(const NeuralLookConstants& inConst, float& outNearP, float& outFarP,
+                                     float& outUnitScale)
     {
+        float rawNear = inConst.CameraNear;
+        float rawFar = inConst.CameraFar;
+
+        if (!std::isfinite(rawNear) || rawNear <= 0.0f)
+            rawNear = 0.1f;
+
+        const bool hasFinitePositiveFar = std::isfinite(rawFar) && rawFar > 0.0f;
+        if (hasFinitePositiveFar && rawNear > rawFar)
+            std::swap(rawNear, rawFar);
+
         // Engines like Unreal Engine pass CameraNear in centimeters (e.g. 10.0 cm).
         // Normalize to canonical meters so world-space GI/AO/Contact Shadow/Volumetric ranges are engine-invariant.
-        return (inConst.CameraNear >= 2.0f) ? 0.01f : 1.0f;
+        outUnitScale = (rawNear >= 2.0f) ? 0.01f : 1.0f;
+        outNearP = std::max(rawNear * outUnitScale, 0.001f);
+
+        if (!hasFinitePositiveFar || rawFar * outUnitScale <= outNearP + 0.5f)
+            outFarP = 10000.0f;
+        else
+            outFarP = std::clamp(rawFar * outUnitScale, outNearP + 1.0f, 100000.0f);
+    }
+
+    static float ComputeDepthUnitScale(const NeuralLookConstants& inConst)
+    {
+        float nearP = 0.1f, farP = 10000.0f, unitScale = 1.0f;
+        ResolveNearFarMeters(inConst, nearP, farP, unitScale);
+        return unitScale;
     }
 
     static float ComputeScaledSkyThreshold(const NeuralLookConstants& inConst)
     {
-        const float unitScale = ComputeDepthUnitScale(inConst);
-        const float nearP = std::max(inConst.CameraNear * unitScale, 0.001f);
-        const float farP = std::max(inConst.CameraFar * unitScale, nearP + 1.0f);
+        float nearP = 0.1f, farP = 10000.0f, unitScale = 1.0f;
+        ResolveNearFarMeters(inConst, nearP, farP, unitScale);
         // Cap below FP16 max (65504) so HalfColorDepthTex / ColorPyramidTex never overflow to +INF.
         return std::min(farP * 0.85f, 32000.0f);
     }
@@ -470,9 +493,8 @@ class NL_Common
                                       int32_t& outDepthReversed, float& outLinearA, float& outLinearB,
                                       float& outLinearC, float& outSkyThreshold)
     {
-        const float unitScale = ComputeDepthUnitScale(inConst);
-        const float nearP = std::max(inConst.CameraNear * unitScale, 0.001f);
-        const float farP = std::max(inConst.CameraFar * unitScale, nearP + 1.0f);
+        float nearP = 0.1f, farP = 10000.0f, unitScale = 1.0f;
+        ResolveNearFarMeters(inConst, nearP, farP, unitScale);
         outDepthLinear = inConst.DepthIsLinear ? 1 : 0;
         outDepthReversed = inConst.DepthIsReversed ? 1 : 0;
         outLinearA = nearP * farP;

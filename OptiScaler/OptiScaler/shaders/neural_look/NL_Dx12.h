@@ -91,6 +91,18 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
     int _giWriteIdx = 0;
     bool _resetGiHistory = true;
 
+    bool _loggedDiagConfig = false;
+    DXGI_FORMAT _lastDiagInFmt = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT _lastDiagDepthFmt = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT _lastDiagMvFmt = DXGI_FORMAT_UNKNOWN;
+    uint32_t _lastDiagActiveW = 0;
+    uint32_t _lastDiagActiveH = 0;
+    uint32_t _lastDiagDepthW = 0;
+    uint32_t _lastDiagDepthH = 0;
+    bool _lastDiagDepthRev = false;
+    bool _lastDiagDepthLin = false;
+    bool _lastDiagHasBasis = false;
+
     ID3D12RootSignature* _rootSignaturePrep = nullptr;
     ID3D12PipelineState* _pipelineStatePrep = nullptr;
     ID3D12RootSignature* _rootSignaturePyramid = nullptr;

@@ -91,6 +91,17 @@ struct BarrierBatch
         curState = targetState;
     }
 
+    void Uav(ID3D12Resource* res)
+    {
+        if (res == nullptr)
+            return;
+
+        D3D12_RESOURCE_BARRIER b {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = res;
+        list.push_back(b);
+    }
+
     void Flush(ID3D12GraphicsCommandList* cmdList)
     {
         if (!list.empty())
@@ -404,9 +415,6 @@ bool NL_Dx12::CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InSou
         _bufferState = InState;
     }
 
-    if (result)
-        CreateGiBuffers(InDevice, static_cast<uint32_t>(inDesc.Width), inDesc.Height);
-
     return result;
 }
 
@@ -476,6 +484,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         return false;
     }
 
+    const auto inDesc = InResource->GetDesc();
     const auto outDesc = OutResource->GetDesc();
     const auto mvsDesc = InMotionVectors->GetDesc();
     const auto depthDesc = InDepth->GetDesc();
@@ -500,8 +509,10 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     _frameIndex++;
 
     const bool hdrPQ = Shader_Dx12::IsHdrPQActive();
-    const auto srcSpace = Shader_Dx12::GetSrvColorSpace(InResource->GetDesc().Format, hdrPQ);
-    const auto dstSpace = Shader_Dx12::GetTargetStorageColorSpace(outDesc.Format, hdrPQ);
+    const DXGI_FORMAT srcFmt = Shader_Dx12::TranslateTypelessFormats(inDesc.Format);
+    const DXGI_FORMAT dstFmt = Shader_Dx12::TranslateTypelessFormats(outDesc.Format);
+    const auto srcSpace = Shader_Dx12::GetSrvColorSpace(srcFmt, hdrPQ);
+    const auto dstSpace = Shader_Dx12::GetTargetStorageColorSpace(dstFmt, hdrPQ);
     const int32_t inEncodeMode = static_cast<int32_t>(GetColorEncodeMode(srcSpace, ShaderColorSpace::Linear));
     const int32_t outEncodeMode = static_cast<int32_t>(GetColorEncodeMode(ShaderColorSpace::Linear, dstSpace));
 
@@ -514,6 +525,36 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     const bool hasReactive = IsValidSrvTex(InReactiveMask);
     const bool hasTransparency = IsValidSrvTex(InTransparencyMask);
     const bool hasExposure = IsValidSrvTex(InExposure);
+
+    const uint32_t depthW = static_cast<uint32_t>(depthDesc.Width);
+    if (!_loggedDiagConfig || _lastDiagInFmt != inDesc.Format || _lastDiagDepthFmt != depthDesc.Format ||
+        _lastDiagMvFmt != mvsDesc.Format || _lastDiagActiveW != activeW || _lastDiagActiveH != activeH ||
+        _lastDiagDepthW != depthW || _lastDiagDepthH != depthDesc.Height ||
+        _lastDiagDepthRev != InConstants.DepthIsReversed || _lastDiagDepthLin != InConstants.DepthIsLinear ||
+        _lastDiagHasBasis != InConstants.HasCameraBasis)
+    {
+        _loggedDiagConfig = true;
+        _lastDiagInFmt = inDesc.Format;
+        _lastDiagDepthFmt = depthDesc.Format;
+        _lastDiagMvFmt = mvsDesc.Format;
+        _lastDiagActiveW = activeW;
+        _lastDiagActiveH = activeH;
+        _lastDiagDepthW = depthW;
+        _lastDiagDepthH = depthDesc.Height;
+        _lastDiagDepthRev = InConstants.DepthIsReversed;
+        _lastDiagDepthLin = InConstants.DepthIsLinear;
+        _lastDiagHasBasis = InConstants.HasCameraBasis;
+
+        LOG_INFO(
+            "[{0}] Config active={1}x{2} in={3}x{4}(fmt={5}) depth={6}x{7}(fmt={8},flags={9:#x},sub={10},{11},rev={12},lin={13}) mv={14}x{15}(fmt={16},lowRes={17},scale={18},{19}) cam(near={20},far={21},fov={22},basis={23}) preExp={24} gbuf(N={25},R={26},T={27})",
+            _name, activeW, activeH, static_cast<uint32_t>(inDesc.Width), inDesc.Height,
+            static_cast<int>(inDesc.Format), depthW, depthDesc.Height, static_cast<int>(depthDesc.Format),
+            static_cast<uint32_t>(depthDesc.Flags), InConstants.DepthSubrectBaseX, InConstants.DepthSubrectBaseY,
+            InConstants.DepthIsReversed, InConstants.DepthIsLinear, static_cast<uint32_t>(mvsDesc.Width),
+            mvsDesc.Height, static_cast<int>(mvsDesc.Format), InConstants.LowResMV, InConstants.MvScaleX,
+            InConstants.MvScaleY, InConstants.CameraNear, InConstants.CameraFar, InConstants.CameraVFov,
+            InConstants.HasCameraBasis, InConstants.PreExposure, hasNormals, hasReactive, hasTransparency);
+    }
 
     const auto* cfg = Config::Instance();
     const float giIntensity = cfg->NeuralLookGiIntensity.value_or_default();
@@ -609,6 +650,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         barriers.Transition(_colorPyramidBuffer, _colorPyramidState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Transition(_eighthNormalBuffer, _eighthNormalState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Transition(_eighthFeaturesBuffer, _eighthFeaturesState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barriers.Uav(_sceneLightBuffer);
         barriers.Flush(InCmdList);
 
         FrameDescriptorHeap& pyrHeap = _frameHeapsPyramid[_counter];

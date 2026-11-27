@@ -158,14 +158,29 @@ int2 ClampGiCoord(int2 p)
     return int2(clamp(p.x, 0, GiWidth - 1), clamp(p.y, 0, GiHeight - 1));
 }
 
+int2 GetMotionActiveSize()
+{
+    return (DisplaySizeMV > 0)
+               ? int2(max(MotionWidth - MvSubrectBaseX, 1), max(MotionHeight - MvSubrectBaseY, 1))
+               : int2(max(RenderWidth, 1), max(RenderHeight, 1));
+}
+
 int2 ClampMotionCoord(int2 p)
 {
-    int activeW = (DisplaySizeMV > 0) ? OutputWidth : RenderWidth;
-    int activeH = (DisplaySizeMV > 0) ? OutputHeight : RenderHeight;
+    int2 activeMv = GetMotionActiveSize();
     int2 minC = int2(MvSubrectBaseX, MvSubrectBaseY);
-    int2 maxC = int2(min(MvSubrectBaseX + activeW - 1, MotionWidth - 1),
-                     min(MvSubrectBaseY + activeH - 1, MotionHeight - 1));
+    int2 maxC = int2(min(MvSubrectBaseX + activeMv.x - 1, MotionWidth - 1),
+                     min(MvSubrectBaseY + activeMv.y - 1, MotionHeight - 1));
     return clamp(p, minC, max(minC, maxC));
+}
+
+float WrapPi(float a)
+{
+    if (a > kPi)
+        a -= 2.0f * kPi;
+    else if (a < -kPi)
+        a += 2.0f * kPi;
+    return a;
 }
 
 float InterleavedGradientNoise(float2 p)
@@ -240,12 +255,11 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float soilProb = saturate(mat2.z);
     float grassProb = saturate(mat2.w);
 
-    // Motion vector lookup aligned 1:1 with active image space (pre-upscale = RenderWidth/Height)
-    int activeW = (DisplaySizeMV > 0) ? OutputWidth : RenderWidth;
-    int activeH = (DisplaySizeMV > 0) ? OutputHeight : RenderHeight;
-    int2 mvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeW, activeH)));
+    // Motion vector lookup aligned 1:1 with active MV buffer resolution
+    int2 activeMv = GetMotionActiveSize();
+    int2 mvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeMv)));
     float2 mv = MotionTex.Load(int3(mvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
-    float2 mvUv = mv / float2(max(activeW, 1), max(activeH, 1));
+    float2 mvUv = mv / float2(activeMv);
     float mvMag = length(mvUv * float2(OutputWidth, OutputHeight));
     float2 prevUv = uv + mvUv;
 
@@ -379,7 +393,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 if (sampleDepth >= 64000.0f || sampleDepth >= SkyDepthThreshold)
                     continue;
 
-                float3 samplePos = ReconstructViewPos(sampleUv, sampleDepth, TanHalfFov, TanHalfFovAspect);
+                float2 snappedSampleUv = (float2(sGiCoord) + 0.5f) / float2(GiWidth, GiHeight);
+                float3 samplePos = ReconstructViewPos(snappedSampleUv, sampleDepth, TanHalfFov, TanHalfFovAspect);
                 float3 deltaFront = samplePos - centerPos;
                 float distSq = dot(deltaFront, deltaFront);
                 if (distSq < 1e-5f || distSq > giWorldRange * giWorldRange)
@@ -390,7 +405,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
                 // Dual-Scale Visibility-Bitmask AO + Directional Occlusion for Bent Normals
                 float fgGap = centerDepth - sampleDepth;
-                if (fgGap <= maxBroadGap && dist < broadRange)
+                float minAoDist = max(centerDepth * 0.015f, 0.025f);
+                if (fgGap <= maxBroadGap && dist > minAoDist && dist < broadRange)
                 {
                     float3 backDir = normalize(deltaFront - toEye * aoThickness);
                     float fhX = dot(frontDir, toEye);
@@ -400,43 +416,45 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     float bhY = dot(backDir, orthoTangent);
                     float hBack = (abs(bhX) + abs(bhY) > 1e-5f) ? atan2(bhY, bhX) : hFront;
 
-                    float hF = hFront - nAngle;
-                    if (hF > kPi) hF -= 2.0f * kPi;
-                    else if (hF < -kPi) hF += 2.0f * kPi;
+                    float hF = WrapPi(hFront - nAngle);
+                    float dH = WrapPi(hBack - hFront);
+                    float hB = hF + dH;
 
-                    float hB = hBack - nAngle;
-                    if (hB > kPi) hB -= 2.0f * kPi;
-                    else if (hB < -kPi) hB += 2.0f * kPi;
-
-                    float a0 = clamp((min(hF, hB) + kPi * 0.5f) / kPi, 0.0f, 1.0f);
-                    float a1 = clamp((max(hF, hB) + kPi * 0.5f) / kPi, 0.0f, 1.0f);
-
-                    uint startBit = min(uint(floor(a0 * 32.0f)), 31u);
-                    uint endBit = min(uint(ceil(a1 * 32.0f)), 32u);
-                    uint bitCount = (endBit > startBit) ? (endBit - startBit) : 0u;
-                    if (bitCount > 0u)
+                    const float biasRad = 0.08f;
+                    float lo = max(min(hF, hB), -kPi * 0.5f + biasRad);
+                    float hi = min(max(hF, hB),  kPi * 0.5f - biasRad);
+                    if (hi > lo + 1e-4f)
                     {
-                        uint sectorMask = (bitCount >= 32u) ? (0xFFFFFFFFu << startBit)
-                                                            : (((1u << bitCount) - 1u) << startBit);
+                        float a0 = saturate((lo + kPi * 0.5f) / kPi);
+                        float a1 = saturate((hi + kPi * 0.5f) / kPi);
 
-                        if (fgGap <= maxFgGap && dist < tightRange)
+                        uint startBit = min(uint(floor(a0 * 32.0f)), 31u);
+                        uint endBit = min(uint(ceil(a1 * 32.0f)), 32u);
+                        uint bitCount = (endBit > startBit) ? (endBit - startBit) : 0u;
+                        if (bitCount > 0u)
                         {
-                            uint newlyTight = sectorMask & ~bitmaskTight;
-                            bitmaskTight |= sectorMask;
-                            float tightFade = pow(1.0f - saturate(dist / tightRange), 1.35f);
-                            float tOcc = (float(countbits(newlyTight)) / 32.0f) * tightFade;
-                            sliceTightOcc += tOcc;
-                            if (dirSign < 0) occNeg += tOcc * 0.65f;
-                            else occPos += tOcc * 0.65f;
-                        }
+                            uint sectorMask = (bitCount >= 32u) ? (0xFFFFFFFFu << startBit)
+                                                                : (((1u << bitCount) - 1u) << startBit);
 
-                        uint newlyBroad = sectorMask & ~bitmaskBroad;
-                        bitmaskBroad |= sectorMask;
-                        float broadFade = pow(1.0f - saturate(dist / broadRange), 2.1f);
-                        float bOcc = (float(countbits(newlyBroad)) / 32.0f) * broadFade;
-                        sliceBroadOcc += bOcc;
-                        if (dirSign < 0) occNeg += bOcc * 0.55f;
-                        else occPos += bOcc * 0.55f;
+                            if (fgGap <= maxFgGap && dist < tightRange)
+                            {
+                                uint newlyTight = sectorMask & ~bitmaskTight;
+                                bitmaskTight |= sectorMask;
+                                float tightFade = pow(1.0f - saturate(dist / tightRange), 1.35f);
+                                float tOcc = (float(countbits(newlyTight)) / 32.0f) * tightFade;
+                                sliceTightOcc += tOcc;
+                                if (dirSign < 0) occNeg += tOcc * 0.65f;
+                                else occPos += tOcc * 0.65f;
+                            }
+
+                            uint newlyBroad = sectorMask & ~bitmaskBroad;
+                            bitmaskBroad |= sectorMask;
+                            float broadFade = pow(1.0f - saturate(dist / broadRange), 2.1f);
+                            float bOcc = (float(countbits(newlyBroad)) / 32.0f) * broadFade;
+                            sliceBroadOcc += bOcc;
+                            if (dirSign < 0) occNeg += bOcc * 0.55f;
+                            else occPos += bOcc * 0.55f;
+                        }
                     }
                 }
 
@@ -741,9 +759,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             if (currentSsr.a > 0.25f)
             {
                 float2 hitApproxUv = saturate(ssrHitUv);
-                int2 hitMvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(hitApproxUv * float2(activeW, activeH)));
+                int2 hitMvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(hitApproxUv * float2(activeMv)));
                 float2 hitMv = MotionTex.Load(int3(hitMvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
-                float2 hitPrevUv = uv + hitMv / float2(max(activeW, 1), max(activeH, 1));
+                float2 hitPrevUv = uv + hitMv / float2(activeMv);
                 float virtBlend = saturate(ssrHitDist / max(centerDepth * 1.5f, 0.5f)) * (1.0f - effRoughness) * 0.55f;
                 ssrPrevUv = lerp(prevUv, hitPrevUv, virtBlend);
             }

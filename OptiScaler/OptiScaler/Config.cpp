@@ -641,7 +641,7 @@ bool Config::Reload(std::filesystem::path iniPath)
                 NeuralLookModelPack.set_from_config(setting.value());
 
             if (auto setting = readInt("NeuralLook", "DebugView"); setting.has_value())
-                NeuralLookDebugView.set_from_config(std::clamp(setting.value(), 0, 8));
+                NeuralLookDebugView.set_from_config(std::clamp(setting.value(), 0, 9));
         }
 
         // Magnifier

@@ -265,13 +265,19 @@ int2 Clamp8(int2 p)
     return clamp(p, int2(0, 0), int2(EighthWidth - 1, EighthHeight - 1));
 }
 
+int2 GetMotionActiveSize()
+{
+    return (DisplaySizeMV > 0)
+               ? int2(max(MotionWidth - MvSubrectBaseX, 1), max(MotionHeight - MvSubrectBaseY, 1))
+               : int2(max(RenderWidth, 1), max(RenderHeight, 1));
+}
+
 int2 ClampMotionCoord(int2 p)
 {
-    int activeW = (DisplaySizeMV > 0) ? OutputWidth : RenderWidth;
-    int activeH = (DisplaySizeMV > 0) ? OutputHeight : RenderHeight;
+    int2 activeMv = GetMotionActiveSize();
     int2 minC = int2(MvSubrectBaseX, MvSubrectBaseY);
-    int2 maxC = int2(min(MvSubrectBaseX + activeW - 1, MotionWidth - 1),
-                     min(MvSubrectBaseY + activeH - 1, MotionHeight - 1));
+    int2 maxC = int2(min(MvSubrectBaseX + activeMv.x - 1, MotionWidth - 1),
+                     min(MvSubrectBaseY + activeMv.y - 1, MotionHeight - 1));
     return clamp(p, minC, max(minC, maxC));
 }
 
@@ -565,11 +571,10 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float4 mat2 = float4(e1 * invSum, e2 * invSum, e3 * invSum, e4 * invSum);
 
         float2 uv = (float2(coord8) + 0.5f) / float2(max(EighthWidth, 1), max(EighthHeight, 1));
-        int activeW = (DisplaySizeMV > 0) ? OutputWidth : RenderWidth;
-        int activeH = (DisplaySizeMV > 0) ? OutputHeight : RenderHeight;
-        int2 mvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeW, activeH)));
+        int2 activeMv = GetMotionActiveSize();
+        int2 mvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeMv)));
         float2 mv = MotionTex.Load(int3(mvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
-        float2 prevUv = uv + mv / float2(max(activeW, 1), max(activeH, 1));
+        float2 prevUv = uv + mv / float2(activeMv);
 
         if (ResetHistory == 0 && FrameIndex > 3 && all(prevUv >= 0.002f) && all(prevUv <= 0.998f))
         {

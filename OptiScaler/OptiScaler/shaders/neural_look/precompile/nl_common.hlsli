@@ -95,7 +95,7 @@ float LinearizeDepthValue(float rawDepth, int depthIsLinear, int depthIsReversed
     }
     else if (depthIsReversed > 0)
     {
-        float revOffset = depthLinearB - depthLinearC;
+        float revOffset = depthLinearA / max(depthLinearB, 1e-4f);
         linDepth = depthLinearA / max(revOffset + rawDepth * depthLinearC, 1e-5f);
     }
     else

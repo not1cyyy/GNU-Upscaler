@@ -260,8 +260,12 @@ int2 ClampDepthCoord(int2 p)
 
 int2 ClampMotionCoord(int2 p)
 {
-    int activeW = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputWidth : RenderWidth;
-    int activeH = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputHeight : RenderHeight;
+    int activeW = (DisplaySizeMV > 0)
+                      ? ((PreUpscale == 0) ? OutputWidth : max(MotionWidth - MvSubrectBaseX, 1))
+                      : RenderWidth;
+    int activeH = (DisplaySizeMV > 0)
+                      ? ((PreUpscale == 0) ? OutputHeight : max(MotionHeight - MvSubrectBaseY, 1))
+                      : RenderHeight;
     int2 minC = int2(MvSubrectBaseX, MvSubrectBaseY);
     int2 maxC = int2(min(MvSubrectBaseX + activeW - 1, MotionWidth - 1),
                      min(MvSubrectBaseY + activeH - 1, MotionHeight - 1));
@@ -725,7 +729,16 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     // Lean Depth-Guarded Skin Subsurface Scattering (LDS 4-tap + 1 mip tap, capped luma)
     float3 litColor = centerColor;
-    if (skinProb > 0.08f && SssIntensity > 1e-4f && solidMask > 0.05f)
+    float skinChromaGate = 1.0f;
+    if (HasGBufferSubsurface == 0)
+    {
+        float invL = rcp(max(centerLuma + 0.05f, 0.05f));
+        float rg = (centerColor.r - centerColor.g) * invL;
+        float rb = (centerColor.r - centerColor.b) * invL;
+        skinChromaGate = smoothstep(0.02f, 0.14f, rb) * smoothstep(-0.02f, 0.08f, rg);
+    }
+    float effSkinSss = saturate(skinProb * SssIntensity * 0.85f) * skinChromaGate;
+    if (effSkinSss > 0.03f && SssIntensity > 1e-4f && solidMask > 0.05f)
     {
         float sssInvSigma = rcp(max(centerDepth * 0.024f, 0.015f));
         float3 sumCol = centerColor * 0.36f;
@@ -759,7 +772,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         if (diffLuma > centerLuma * 1.12f + 0.01f)
             diffusedSkin *= (centerLuma * 1.12f + 0.01f) / max(diffLuma, 1e-4f);
 
-        float3 rgbFalloff = float3(0.75f, 0.38f, 0.16f) * saturate(skinProb * SssIntensity * 0.85f) *
+        float3 rgbFalloff = float3(0.75f, 0.38f, 0.16f) * effSkinSss *
                             solidMask * (1.0f - silEdge * 0.85f);
         litColor = lerp(litColor, max(diffusedSkin, 0.0f), rgbFalloff);
     }
@@ -966,8 +979,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
                      hardProb   * float3(0.22f, 0.52f, 0.92f);
     }
 
-    if (DebugView == 0)
-        finalColor *= preExp;
+    finalColor *= preExp;
 
     finalColor = max(finalColor, 0.0f);
     DestColor[destCoord] = float4(EncodeColor(finalColor, OutColorEncodeMode), origAlpha);
