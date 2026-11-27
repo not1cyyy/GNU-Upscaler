@@ -125,36 +125,27 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float centerLuma = Luma(centerGi.rgb);
     float centerSsrLuma = Luma(centerSsr.rgb);
 
-    // 3x3 local variance pre-estimation + disocclusion kernel boost
-    float varAcc = centerMeta.g * 0.40f;
-    static const int2 vOff[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
-    [unroll]
-    for (int vi = 0; vi < 4; ++vi)
-        varAcc += InGiMetaTex.Load(int3(ClampGi(p + vOff[vi]), 0)).g * 0.15f;
-
     float histLen = max(centerMeta.a, 1.0f);
-    float disoccBoost = lerp(2.2f, 1.0f, saturate((histLen - 1.0f) / 3.0f));
+    float disoccBoost = lerp(2.0f, 1.0f, saturate((histLen - 1.0f) / 3.0f));
     float invSigmaZ = rcp(max(centerDepth * PhiDepth, 0.015f));
-    float invSigmaL = rcp(max((varAcc * PhiLuma * disoccBoost) + 0.06f, 0.06f));
+    float invSigmaL = rcp(max((centerMeta.g * PhiLuma * disoccBoost) + 0.06f, 0.06f));
     float invSigmaSsr = rcp(max(centerSsrLuma * 0.65f + 0.12f, 0.12f));
 
     // Roughness + Hit-Distance guided SSR blur gate (mirror/contact stays crisp, rough glossy smooths)
     float ssrHitDist = max(centerMeta.b, 0.05f);
-    float ssrBlur = saturate(effRoughness * 1.45f * saturate(ssrHitDist / max(centerDepth * 0.25f, 0.20f)));
-    if (PassIndex > 0)
-        ssrBlur *= saturate(effRoughness * 1.25f);
+    float ssrBlur = saturate(effRoughness * 1.40f * saturate(ssrHitDist / max(centerDepth * 0.25f, 0.20f)));
+    bool doSsrBlur = (SsrEnabled > 0 && ssrBlur > 0.03f);
 
-    static const int2 kOffsets[13] = {
+    // Single-pass 9-tap À-Trous filter covering a 5x5 half-res footprint
+    static const int2 kOffsets[9] = {
         int2(0, 0),
         int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1),
-        int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1),
-        int2(-3, 0), int2(3, 0), int2(0, -3), int2(0, 3)
+        int2(-2, -2), int2(2, -2), int2(-2, 2), int2(2, 2)
     };
-    static const float kKernel[13] = {
-        0.22f,
-        0.10f, 0.10f, 0.10f, 0.10f,
-        0.06f, 0.06f, 0.06f, 0.06f,
-        0.035f, 0.035f, 0.035f, 0.035f
+    static const float kKernel[9] = {
+        0.24f,
+        0.11f, 0.11f, 0.11f, 0.11f,
+        0.08f, 0.08f, 0.08f, 0.08f
     };
 
     float4 giSum = centerGi * kKernel[0];
@@ -168,7 +159,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float maxDepthCliff = max(centerDepth * 0.08f, 0.04f);
 
     [unroll]
-    for (int i = 1; i < 13; ++i)
+    for (int i = 1; i < 9; ++i)
     {
         int2 q = ClampGi(p + kOffsets[i] * step);
         float tapDepth = HalfColorDepthTex.Load(int3(q, 0)).a;
@@ -188,7 +179,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         csSum += InGiMetaTex.Load(int3(q, 0)).r * wGi;
         wGiSum += wGi;
 
-        if (SsrEnabled > 0 && ssrBlur > 0.02f)
+        if (doSsrBlur)
         {
             float4 tapSsr = InSsrTex.Load(int3(q, 0));
             float wLs = exp(-abs(centerSsrLuma - Luma(tapSsr.rgb)) * invSigmaSsr);
@@ -204,7 +195,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         outDir.xy = normalize(outDir.xy);
 
     OutDenoisedGiTex[p] = giSum * invWGi;
-    OutDenoisedSsrTex[p] = (SsrEnabled > 0) ? (ssrSum * rcp(max(wSsrSum, 1e-5f))) : float4(0, 0, 0, 0);
+    OutDenoisedSsrTex[p] = (SsrEnabled > 0) ? (doSsrBlur ? (ssrSum * rcp(max(wSsrSum, 1e-5f))) : centerSsr)
+                                            : float4(0, 0, 0, 0);
     OutDenoisedMetaTex[p] = float4(csSum * invWGi, centerMeta.g, centerMeta.b, centerMeta.a);
     OutDenoisedGiDirTex[p] = outDir;
 }

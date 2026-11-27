@@ -243,10 +243,6 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
     };
 
     if (!createTex2D(targetW, targetH, 1, _halfColorDepthBuffer, _halfColorDepthState, L"NL_HalfColorDepth") ||
-        !createTex2D(targetW, targetH, 1, _denoisedGiScratch, _denoisedGiScratchState, L"NL_DenoisedGI_Scratch") ||
-        !createTex2D(targetW, targetH, 1, _denoisedSsrScratch, _denoisedSsrScratchState, L"NL_DenoisedSSR_Scratch") ||
-        !createTex2D(targetW, targetH, 1, _denoisedMetaScratch, _denoisedMetaScratchState, L"NL_DenoisedMeta_Scratch") ||
-        !createTex2D(targetW, targetH, 1, _denoisedGiDirScratch, _denoisedGiDirScratchState, L"NL_DenoisedGIDir_Scratch") ||
         !createTex2D(targetW, targetH, 1, _denoisedGiBuffer, _denoisedGiState, L"NL_DenoisedGI") ||
         !createTex2D(targetW, targetH, 1, _denoisedSsrBuffer, _denoisedSsrState, L"NL_DenoisedSSR") ||
         !createTex2D(targetW, targetH, 1, _denoisedMetaBuffer, _denoisedMetaState, L"NL_DenoisedMeta") ||
@@ -355,10 +351,6 @@ void NL_Dx12::ReleaseGiBuffers()
     };
 
     rel(_halfColorDepthBuffer, _halfColorDepthState);
-    rel(_denoisedGiScratch, _denoisedGiScratchState);
-    rel(_denoisedSsrScratch, _denoisedSsrScratchState);
-    rel(_denoisedMetaScratch, _denoisedMetaScratchState);
-    rel(_denoisedGiDirScratch, _denoisedGiDirScratchState);
     rel(_denoisedGiBuffer, _denoisedGiState);
     rel(_denoisedSsrBuffer, _denoisedSsrState);
     rel(_denoisedMetaBuffer, _denoisedMetaState);
@@ -395,11 +387,16 @@ bool NL_Dx12::CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InSou
         return false;
 
     const auto inDesc = InSource->GetDesc();
-    const auto packedFormat = Shader_Dx12::SelectPackedIntermediateFormat(InDevice, inDesc.Format);
+    const DXGI_FORMAT targetFormat =
+        (Shader_Dx12::IsSrgbFormat(inDesc.Format) || Shader_Dx12::IsTypelessFormat(inDesc.Format) ||
+         inDesc.Format == DXGI_FORMAT_B8G8R8X8_UNORM)
+            ? Shader_Dx12::SelectPackedIntermediateFormat(InDevice, inDesc.Format)
+            : inDesc.Format;
 
     auto oldBuffer = _buffer;
-    auto result = Shader_Dx12::CreateBufferResource(InDevice, InSource, InState, &_buffer,
-                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, 0, 0, packedFormat);
+    auto result = Shader_Dx12::CreateBufferResource(
+        InDevice, InSource, InState, &_buffer,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, 0, 0, targetFormat);
 
     if (result && _buffer != oldBuffer)
     {
@@ -483,7 +480,14 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
     const auto mvsDesc = InMotionVectors->GetDesc();
     const auto depthDesc = InDepth->GetDesc();
 
-    if (!CreateGiBuffers(_device, static_cast<uint32_t>(outDesc.Width), outDesc.Height))
+    const uint32_t activeW = (InConstants.PreUpscale && InConstants.RenderWidth > 0)
+                                 ? InConstants.RenderWidth
+                                 : static_cast<uint32_t>(outDesc.Width);
+    const uint32_t activeH = (InConstants.PreUpscale && InConstants.RenderHeight > 0)
+                                 ? InConstants.RenderHeight
+                                 : static_cast<uint32_t>(outDesc.Height);
+
+    if (!CreateGiBuffers(_device, activeW, activeH))
         return false;
 
     UpdateModelWeightsIfNeeded(_device);
@@ -574,8 +578,8 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         CreateBufferUAV(_device, _worldHashBuffer, kWorldHashCapacity * 2u, sizeof(uint32_t), prepHeap.GetUavCPU(3));
 
         NLPrepInternalConstants prepConst {};
-        prepConst.OutputWidth = static_cast<int32_t>(outDesc.Width);
-        prepConst.OutputHeight = static_cast<int32_t>(outDesc.Height);
+        prepConst.OutputWidth = static_cast<int32_t>(activeW);
+        prepConst.OutputHeight = static_cast<int32_t>(activeH);
         prepConst.HalfWidth = static_cast<int32_t>(_giWidth);
         prepConst.HalfHeight = static_cast<int32_t>(_giHeight);
         prepConst.DepthWidth = static_cast<int32_t>(depthDesc.Width);
@@ -629,8 +633,8 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         pyrConst.Mip3Height = static_cast<int32_t>(_mipDims[3][1]);
         pyrConst.Mip4Width = static_cast<int32_t>(_mipDims[4][0]);
         pyrConst.Mip4Height = static_cast<int32_t>(_mipDims[4][1]);
-        FillPyramidConstants(pyrConst, temporalConstIn, static_cast<int32_t>(outDesc.Width),
-                             static_cast<int32_t>(outDesc.Height));
+        FillPyramidConstants(pyrConst, temporalConstIn, static_cast<int32_t>(activeW),
+                             static_cast<int32_t>(activeH));
 
         if (!CreateConstantsBuffer(_device, pyrHeap, pyrConst, pyrHeap.GetCbvCPU(0)))
             return false;
@@ -702,8 +706,8 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         priorConst.Mip3Height = static_cast<int32_t>(_mipDims[3][1]);
         priorConst.GridWidth = static_cast<int32_t>(_gridWidth);
         priorConst.GridHeight = static_cast<int32_t>(_gridHeight);
-        priorConst.OutputWidth = static_cast<int32_t>(outDesc.Width);
-        priorConst.OutputHeight = static_cast<int32_t>(outDesc.Height);
+        priorConst.OutputWidth = static_cast<int32_t>(activeW);
+        priorConst.OutputHeight = static_cast<int32_t>(activeH);
         priorConst.MotionWidth = static_cast<int32_t>(mvsDesc.Width);
         priorConst.MotionHeight = static_cast<int32_t>(mvsDesc.Height);
         FillNeuralPriorConstants(priorConst, temporalConstIn);
@@ -719,7 +723,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         InCmdList->Dispatch(_gridWidth, _gridHeight, 1);
     }
 
-    // --- Pass 3 & Pass 4 (2-Pass Decoupled À-Trous Denoiser) ---
+    // --- Pass 3 & Pass 4 (1-Pass Decoupled À-Trous Denoiser) ---
     if (runGiPass)
     {
         barriers.Transition(_material1Buffers[_giWriteIdx], _material1States[_giWriteIdx],
@@ -767,8 +771,8 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         CreateUnorderedAccessView(_device, _giDirBuffers[_giWriteIdx], giHeap.GetUavCPU(3), 0);
 
         NLGiInternalConstants giConst {};
-        giConst.OutputWidth = static_cast<int32_t>(outDesc.Width);
-        giConst.OutputHeight = static_cast<int32_t>(outDesc.Height);
+        giConst.OutputWidth = static_cast<int32_t>(activeW);
+        giConst.OutputHeight = static_cast<int32_t>(activeH);
         giConst.GiWidth = static_cast<int32_t>(_giWidth);
         giConst.GiHeight = static_cast<int32_t>(_giHeight);
         giConst.MotionWidth = static_cast<int32_t>(mvsDesc.Width);
@@ -785,9 +789,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         InCmdList->SetComputeRootDescriptorTable(0, giHeap.GetTableGPUStart());
         InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
 
-        const bool twoPassDenoise = (_activeTier >= 1);
-
-        // Pass 4a: À-Trous Variance-Guided Denoiser (step = 1)
+        // Pass 4: Single-pass 9-tap À-Trous Variance-Guided Denoiser
         barriers.Transition(_giBuffers[_giWriteIdx], _giBufferStates[_giWriteIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_ssrBuffers[_giWriteIdx], _ssrBufferStates[_giWriteIdx],
@@ -797,25 +799,10 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         barriers.Transition(_giDirBuffers[_giWriteIdx], _giDirStates[_giWriteIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-        ID3D12Resource* dn1OutGi = twoPassDenoise ? _denoisedGiScratch : _denoisedGiBuffer;
-        ID3D12Resource* dn1OutSsr = twoPassDenoise ? _denoisedSsrScratch : _denoisedSsrBuffer;
-        ID3D12Resource* dn1OutMeta = twoPassDenoise ? _denoisedMetaScratch : _denoisedMetaBuffer;
-        ID3D12Resource* dn1OutDir = twoPassDenoise ? _denoisedGiDirScratch : _denoisedGiDirBuffer;
-
-        if (twoPassDenoise)
-        {
-            barriers.Transition(_denoisedGiScratch, _denoisedGiScratchState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Transition(_denoisedSsrScratch, _denoisedSsrScratchState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Transition(_denoisedMetaScratch, _denoisedMetaScratchState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Transition(_denoisedGiDirScratch, _denoisedGiDirScratchState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        }
-        else
-        {
-            barriers.Transition(_denoisedGiBuffer, _denoisedGiState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Transition(_denoisedSsrBuffer, _denoisedSsrState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Transition(_denoisedMetaBuffer, _denoisedMetaState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Transition(_denoisedGiDirBuffer, _denoisedGiDirState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        }
+        barriers.Transition(_denoisedGiBuffer, _denoisedGiState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barriers.Transition(_denoisedSsrBuffer, _denoisedSsrState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barriers.Transition(_denoisedMetaBuffer, _denoisedMetaState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barriers.Transition(_denoisedGiDirBuffer, _denoisedGiDirState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Flush(InCmdList);
 
         {
@@ -827,10 +814,10 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
             CreateShaderResourceView(_device, _giMetaBuffers[_giWriteIdx], dnHeap.GetSrvCPU(4));
             CreateShaderResourceView(_device, _giDirBuffers[_giWriteIdx], dnHeap.GetSrvCPU(5));
             CreateShaderResourceView(_device, _material1Buffers[_giWriteIdx], dnHeap.GetSrvCPU(6));
-            CreateUnorderedAccessView(_device, dn1OutGi, dnHeap.GetUavCPU(0), 0);
-            CreateUnorderedAccessView(_device, dn1OutSsr, dnHeap.GetUavCPU(1), 0);
-            CreateUnorderedAccessView(_device, dn1OutMeta, dnHeap.GetUavCPU(2), 0);
-            CreateUnorderedAccessView(_device, dn1OutDir, dnHeap.GetUavCPU(3), 0);
+            CreateUnorderedAccessView(_device, _denoisedGiBuffer, dnHeap.GetUavCPU(0), 0);
+            CreateUnorderedAccessView(_device, _denoisedSsrBuffer, dnHeap.GetUavCPU(1), 0);
+            CreateUnorderedAccessView(_device, _denoisedMetaBuffer, dnHeap.GetUavCPU(2), 0);
+            CreateUnorderedAccessView(_device, _denoisedGiDirBuffer, dnHeap.GetUavCPU(3), 0);
 
             NLDenoiseInternalConstants dnConst {};
             FillDenoiseConstants(dnConst, temporalConstIn, static_cast<int32_t>(_giWidth),
@@ -843,50 +830,6 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
             InCmdList->SetComputeRootSignature(_rootSignatureDenoise);
             InCmdList->SetPipelineState(_pipelineStateDenoise);
             InCmdList->SetComputeRootDescriptorTable(0, dnHeap.GetTableGPUStart());
-            InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
-        }
-
-        // Pass 4b: À-Trous Wide Pass (step = 3, Medium/Full tier)
-        if (twoPassDenoise)
-        {
-            barriers.Transition(_denoisedGiScratch, _denoisedGiScratchState,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            barriers.Transition(_denoisedSsrScratch, _denoisedSsrScratchState,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            barriers.Transition(_denoisedMetaScratch, _denoisedMetaScratchState,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            barriers.Transition(_denoisedGiDirScratch, _denoisedGiDirScratchState,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            barriers.Transition(_denoisedGiBuffer, _denoisedGiState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Transition(_denoisedSsrBuffer, _denoisedSsrState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Transition(_denoisedMetaBuffer, _denoisedMetaState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Transition(_denoisedGiDirBuffer, _denoisedGiDirState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            barriers.Flush(InCmdList);
-
-            FrameDescriptorHeap& dnHeap2 = _frameHeapsDenoise2[_counter];
-            CreateShaderResourceView(_device, _halfColorDepthBuffer, dnHeap2.GetSrvCPU(0));
-            CreateShaderResourceView(_device, _halfNormalBuffers[_giWriteIdx], dnHeap2.GetSrvCPU(1));
-            CreateShaderResourceView(_device, _denoisedGiScratch, dnHeap2.GetSrvCPU(2));
-            CreateShaderResourceView(_device, _denoisedSsrScratch, dnHeap2.GetSrvCPU(3));
-            CreateShaderResourceView(_device, _denoisedMetaScratch, dnHeap2.GetSrvCPU(4));
-            CreateShaderResourceView(_device, _denoisedGiDirScratch, dnHeap2.GetSrvCPU(5));
-            CreateShaderResourceView(_device, _material1Buffers[_giWriteIdx], dnHeap2.GetSrvCPU(6));
-            CreateUnorderedAccessView(_device, _denoisedGiBuffer, dnHeap2.GetUavCPU(0), 0);
-            CreateUnorderedAccessView(_device, _denoisedSsrBuffer, dnHeap2.GetUavCPU(1), 0);
-            CreateUnorderedAccessView(_device, _denoisedMetaBuffer, dnHeap2.GetUavCPU(2), 0);
-            CreateUnorderedAccessView(_device, _denoisedGiDirBuffer, dnHeap2.GetUavCPU(3), 0);
-
-            NLDenoiseInternalConstants dnConst2 {};
-            FillDenoiseConstants(dnConst2, temporalConstIn, static_cast<int32_t>(_giWidth),
-                                 static_cast<int32_t>(_giHeight), ssrEnabled, 3, 1);
-            if (!CreateConstantsBuffer(_device, dnHeap2, dnConst2, dnHeap2.GetCbvCPU(0)))
-                return false;
-
-            ID3D12DescriptorHeap* dnHeaps2[] = { dnHeap2.GetHeapCSU() };
-            InCmdList->SetDescriptorHeaps(1, dnHeaps2);
-            InCmdList->SetComputeRootSignature(_rootSignatureDenoise);
-            InCmdList->SetPipelineState(_pipelineStateDenoise);
-            InCmdList->SetComputeRootDescriptorTable(0, dnHeap2.GetTableGPUStart());
             InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
         }
     }
@@ -935,8 +878,8 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         CreateUnorderedAccessView(_device, OutResource, compHeap.GetUavCPU(0), 0);
 
         NLCompositeInternalConstants compConst {};
-        compConst.OutputWidth = static_cast<int32_t>(outDesc.Width);
-        compConst.OutputHeight = static_cast<int32_t>(outDesc.Height);
+        compConst.OutputWidth = static_cast<int32_t>(activeW);
+        compConst.OutputHeight = static_cast<int32_t>(activeH);
         compConst.GiWidth = static_cast<int32_t>(_giWidth);
         compConst.GiHeight = static_cast<int32_t>(_giHeight);
         compConst.DepthWidth = static_cast<int32_t>(depthDesc.Width);
@@ -957,7 +900,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         InCmdList->SetComputeRootSignature(_rootSignature);
         InCmdList->SetPipelineState(_pipelineState);
         InCmdList->SetComputeRootDescriptorTable(0, compHeap.GetTableGPUStart());
-        InCmdList->Dispatch((static_cast<UINT>(outDesc.Width) + 15u) / 16u, (outDesc.Height + 15u) / 16u, 1);
+        InCmdList->Dispatch((activeW + 15u) / 16u, (activeH + 15u) / 16u, 1);
     }
 
     return true;
@@ -980,7 +923,7 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
         !SetupPassRootSigAndPso(InDevice, 13, 4, 1, 1, nl_gi_temporal_cso, sizeof(nl_gi_temporal_cso), &_rootSignatureGi,
                                 &_pipelineStateGi, _frameHeapsGi) ||
         !SetupPassRootSigAndPso(InDevice, 7, 4, 1, 1, nl_denoise_cso, sizeof(nl_denoise_cso), &_rootSignatureDenoise,
-                                &_pipelineStateDenoise, _frameHeapsDenoise, _frameHeapsDenoise2) ||
+                                &_pipelineStateDenoise, _frameHeapsDenoise) ||
         !SetupPassRootSigAndPso(InDevice, 21, 1, 1, 1, nl_composite_cso, sizeof(nl_composite_cso), &_rootSignature,
                                 &_pipelineState, _frameHeapsComposite))
     {
@@ -1014,7 +957,6 @@ NL_Dx12::~NL_Dx12()
         _frameHeapsPrior[i].ReleaseHeaps();
         _frameHeapsGi[i].ReleaseHeaps();
         _frameHeapsDenoise[i].ReleaseHeaps();
-        _frameHeapsDenoise2[i].ReleaseHeaps();
         _frameHeapsComposite[i].ReleaseHeaps();
     }
 

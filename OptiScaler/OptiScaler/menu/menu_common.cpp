@@ -8221,19 +8221,19 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
     bool nlEnabled = config->NeuralLookEnabled.value_or_default();
     if (GnuUi::Checkbox("Enable 3D Neural Look", &nlEnabled))
         config->NeuralLookEnabled = nlEnabled;
-    ShowTooltip("Real-time 3D-Guided Neural Rendering pipeline (DX12 & Vulkan, pre-HUD):\n"
-                "- 5-Mip Hi-Z Depth + Color Pyramid, Multi-Cue Surface Features & Scene L1 SH\n"
-                "- Trained 1/8-res ConvNeXt-Micro v2 (Fabric/Sand/Soil/Grass/Skin/Hard) + 3D Bilateral Grid\n"
-                "- Visibility-Bitmask SSGI + Bent Normals + Directional GI + Hi-Z Stochastic GGX SSR\n"
-                "- Decoupled 2-Pass À-Trous Denoiser, 2-Ring Anti-Halo Guards, Per-Channel AgX & Fused RCAS");
+    ShowTooltip("Pre-Upscale 1:1 3D-Guided Neural Rendering pipeline (DX12 & Vulkan, before DLSS/FSR/XeSS):\n"
+                "- Exact render-res alignment eliminates character/object silhouette outlines & depth lag\n"
+                "- 5-Mip Hi-Z Depth + Color Pyramid & Scene L1 SH directional lighting\n"
+                "- Trained 1/8-res ConvNeXt-Nano v3 (Fabric/Sand/Soil/Grass/Skin/Hard) + 3D Bilateral Grid\n"
+                "- Visibility-Bitmask SSGI + Bent Normals + GGX SSR + 1-Pass 9-Tap À-Trous + Filmic Shoulder");
 
     if (currentFeature != nullptr)
     {
         const int tier = currentFeature->NeuralLookActiveTier();
         const auto gpuMs = currentFeature->LastNeuralLookTime();
-        const char* tierName = (tier == 2) ? "Full (2-slice VisBitmask SSGI + 16-step Hi-Z GGX SSR + 2-pass Denoise)"
-                               : (tier == 1) ? "Medium (2-slice VisBitmask SSGI + 10-step Hi-Z GGX SSR + 2-pass Denoise)"
-                               : (tier == 0) ? "Light (1-slice SSGI + 1-pass Denoise + Neural Grid + AgX)"
+        const char* tierName = (tier == 2) ? "Full (Pre-Upscale: 2-slice SSGI + 12-step SSR + 1-pass Denoise)"
+                               : (tier == 1) ? "Medium (Pre-Upscale: 2-slice SSGI + 8-step SSR + 1-pass Denoise)"
+                               : (tier == 0) ? "Light (Pre-Upscale: 1-slice SSGI + 1-pass Denoise + Neural Grid)"
                                              : "Inactive / DX11 unsupported";
         if (nlEnabled && gpuMs.has_value())
             ImGui::TextDisabled("Active Tier: %s | GPU Pass: %.2f ms", tierName, gpuMs.value());
@@ -8250,55 +8250,55 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
         config->NeuralLookPreset = preset;
         if (preset == 0) // Subtle
         {
-            config->NeuralLookGiIntensity = 0.50f;
-            config->NeuralLookAoIntensity = 0.45f;
+            config->NeuralLookGiIntensity = 0.45f;
+            config->NeuralLookAoIntensity = 0.40f;
             config->NeuralLookSsrIntensity = 0.45f;
-            config->NeuralLookRelightIntensity = 0.35f;
-            config->NeuralLookVolumetricGlow = 0.20f;
-            config->NeuralLookDetail = 0.35f;
-            config->NeuralLookSpecularRelief = 0.30f;
-            config->NeuralLookToneContrast = 0.15f;
-            config->NeuralLookSssIntensity = 0.45f;
-            config->NeuralLookContactShadowIntensity = 0.40f;
+            config->NeuralLookRelightIntensity = 0.30f;
+            config->NeuralLookVolumetricGlow = 0.12f;
+            config->NeuralLookDetail = 0.30f;
+            config->NeuralLookSpecularRelief = 0.25f;
+            config->NeuralLookToneContrast = 0.12f;
+            config->NeuralLookSssIntensity = 0.40f;
+            config->NeuralLookContactShadowIntensity = 0.35f;
         }
         else if (preset == 1) // Balanced
         {
-            config->NeuralLookGiIntensity = 1.00f;
-            config->NeuralLookAoIntensity = 0.85f;
-            config->NeuralLookSsrIntensity = 0.85f;
-            config->NeuralLookRelightIntensity = 0.75f;
-            config->NeuralLookVolumetricGlow = 0.45f;
-            config->NeuralLookDetail = 0.55f;
-            config->NeuralLookSpecularRelief = 0.50f;
-            config->NeuralLookToneContrast = 0.32f;
-            config->NeuralLookSssIntensity = 0.75f;
-            config->NeuralLookContactShadowIntensity = 0.70f;
+            config->NeuralLookGiIntensity = 0.85f;
+            config->NeuralLookAoIntensity = 0.80f;
+            config->NeuralLookSsrIntensity = 0.80f;
+            config->NeuralLookRelightIntensity = 0.65f;
+            config->NeuralLookVolumetricGlow = 0.25f;
+            config->NeuralLookDetail = 0.45f;
+            config->NeuralLookSpecularRelief = 0.45f;
+            config->NeuralLookToneContrast = 0.22f;
+            config->NeuralLookSssIntensity = 0.70f;
+            config->NeuralLookContactShadowIntensity = 0.65f;
         }
         else if (preset == 2) // Dramatic (DLSS 5)
         {
-            config->NeuralLookGiIntensity = 1.50f;
-            config->NeuralLookAoIntensity = 1.20f;
-            config->NeuralLookSsrIntensity = 1.35f;
-            config->NeuralLookRelightIntensity = 1.25f;
-            config->NeuralLookVolumetricGlow = 0.85f;
-            config->NeuralLookDetail = 0.65f;
-            config->NeuralLookSpecularRelief = 0.60f;
-            config->NeuralLookToneContrast = 0.50f;
-            config->NeuralLookSssIntensity = 1.05f;
-            config->NeuralLookContactShadowIntensity = 1.00f;
+            config->NeuralLookGiIntensity = 1.25f;
+            config->NeuralLookAoIntensity = 1.10f;
+            config->NeuralLookSsrIntensity = 1.15f;
+            config->NeuralLookRelightIntensity = 1.00f;
+            config->NeuralLookVolumetricGlow = 0.45f;
+            config->NeuralLookDetail = 0.60f;
+            config->NeuralLookSpecularRelief = 0.55f;
+            config->NeuralLookToneContrast = 0.38f;
+            config->NeuralLookSssIntensity = 0.95f;
+            config->NeuralLookContactShadowIntensity = 0.90f;
         }
         else // Ultra Cinematic
         {
-            config->NeuralLookGiIntensity = 1.90f;
-            config->NeuralLookAoIntensity = 1.45f;
-            config->NeuralLookSsrIntensity = 1.75f;
-            config->NeuralLookRelightIntensity = 1.60f;
-            config->NeuralLookVolumetricGlow = 1.20f;
-            config->NeuralLookDetail = 0.75f;
-            config->NeuralLookSpecularRelief = 0.70f;
-            config->NeuralLookToneContrast = 0.68f;
-            config->NeuralLookSssIntensity = 1.30f;
-            config->NeuralLookContactShadowIntensity = 1.25f;
+            config->NeuralLookGiIntensity = 1.60f;
+            config->NeuralLookAoIntensity = 1.35f;
+            config->NeuralLookSsrIntensity = 1.50f;
+            config->NeuralLookRelightIntensity = 1.30f;
+            config->NeuralLookVolumetricGlow = 0.70f;
+            config->NeuralLookDetail = 0.70f;
+            config->NeuralLookSpecularRelief = 0.65f;
+            config->NeuralLookToneContrast = 0.52f;
+            config->NeuralLookSssIntensity = 1.15f;
+            config->NeuralLookContactShadowIntensity = 1.10f;
         }
     }
 

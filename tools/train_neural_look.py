@@ -23,9 +23,9 @@ from pathlib import Path
 import numpy as np
 
 NL_MODEL_MAGIC = 0x4D4C4E47  # "GNLM"
-NL_MODEL_VERSION = 2
-NL_MODEL_FLOAT4_COUNT = 3143
-NL_MODEL_FLOAT_COUNT = NL_MODEL_FLOAT4_COUNT * 4  # 12,572 floats
+NL_MODEL_VERSION = 3
+NL_MODEL_FLOAT4_COUNT = 1841
+NL_MODEL_FLOAT_COUNT = NL_MODEL_FLOAT4_COUNT * 4  # 7,364 floats
 
 IN_CHANNELS = 20
 MAT_CHANNELS = 16
@@ -130,21 +130,17 @@ class ConvNeXtMicroNet:
             "B_stem": np.zeros(32, np.float32),
             "W_dw1": init_dw(),
             "B_dw1": np.zeros(32, np.float32),
-            "W_pw1a": init_w(64, 32),
-            "B_pw1a": np.zeros(64, np.float32),
-            "W_pw1b": init_w(32, 64, 0.25),
+            "W_pw1a": init_w(48, 32),
+            "B_pw1a": np.zeros(48, np.float32),
+            "W_pw1b": init_w(32, 48, 0.25),
             "B_pw1b": np.zeros(32, np.float32),
-            "W_dw2": init_dw(),
-            "B_dw2": np.zeros(32, np.float32),
-            "W_pw2a": init_w(64, 40),
-            "B_pw2a": np.zeros(64, np.float32),
-            "W_pw2b": init_w(32, 64, 0.25),
-            "B_pw2b": np.zeros(32, np.float32),
+            "W_pw2": init_w(32, 40, 0.25),
+            "B_pw2": np.zeros(32, np.float32),
             "W_mat": init_w(MAT_CHANNELS, 32, 0.5),
             "B_mat": np.zeros(MAT_CHANNELS, np.float32),
-            "W_bg1": init_w(32, 44),
-            "B_bg1": np.zeros(32, np.float32),
-            "W_bg2": init_w(12, 32, 0.2),
+            "W_bg1": init_w(24, 44),
+            "B_bg1": np.zeros(24, np.float32),
+            "W_bg2": init_w(12, 24, 0.2),
             "B_bg2": np.zeros(12, np.float32),
         }
         self.m = {k: np.zeros_like(v) for k, v in self.params.items()}
@@ -165,12 +161,10 @@ class ConvNeXtMicroNet:
         g = h1[:, :8, :, :].mean(axis=(2, 3))
         g_broad = np.broadcast_to(g[:, :, None, None], (h1.shape[0], 8, h1.shape[2], h1.shape[3]))
 
-        dw2 = depthwise_3x3_forward(h1, p["W_dw2"], p["B_dw2"])
-        dw2_cat = np.concatenate([dw2, g_broad], axis=1)
-        pw2a_pre = pw_forward(dw2_cat, p["W_pw2a"], p["B_pw2a"])
-        pw2a, s_pw2a = silu(pw2a_pre)
-        pw2b = pw_forward(pw2a, p["W_pw2b"], p["B_pw2b"])
-        h2 = h1 + pw2b
+        h1_cat = np.concatenate([h1, g_broad], axis=1)  # (N, 40, H, W)
+        pw2_pre = pw_forward(h1_cat, p["W_pw2"], p["B_pw2"])
+        pw2, s_pw2 = silu(pw2_pre)
+        h2 = h1 + pw2
 
         mat_logits = pw_forward(h2, p["W_mat"], p["B_mat"])  # (N, 16, H, W)
         mat_cont = sigmoid(mat_logits[:, 0:7, :, :])         # albedo(3), direct, rough, metal, wetness
@@ -185,7 +179,7 @@ class ConvNeXtMicroNet:
 
         cache = (
             x, h0_pre, h0, s_h0, dw1, pw1a_pre, pw1a, s_pw1a, h1,
-            g, dw2, dw2_cat, pw2a_pre, pw2a, s_pw2a, h2, mat_cont, mat_sem, mat_aux,
+            g, h1_cat, pw2_pre, pw2, s_pw2, h2, mat_cont, mat_sem, mat_aux,
             h2_pool, bg_in, bg1_pre, bg1, s_bg1
         )
         return mat_cont, mat_sem, bg_pred, cache
@@ -193,7 +187,7 @@ class ConvNeXtMicroNet:
     def backward_and_step(self, cache, d_mat_logits, d_bg, lr=2e-3, wd=1e-4):
         (
             x, h0_pre, h0, s_h0, dw1, pw1a_pre, pw1a, s_pw1a, h1,
-            g, dw2, dw2_cat, pw2a_pre, pw2a, s_pw2a, h2, mat_cont, mat_sem, mat_aux,
+            g, h1_cat, pw2_pre, pw2, s_pw2, h2, mat_cont, mat_sem, mat_aux,
             h2_pool, bg_in, bg1_pre, bg1, s_bg1
         ) = cache
         p = self.params
@@ -211,15 +205,13 @@ class ConvNeXtMicroNet:
         H, W = h2.shape[2], h2.shape[3]
         d_h2 = d_h2_mat + d_h2_pool[:, :, None, None] / float(H * W)
 
-        d_pw2a, grads["W_pw2b"], grads["B_pw2b"] = pw_backward(pw2a, p["W_pw2b"], d_h2)
-        d_pw2a_pre = silu_grad(pw2a_pre, s_pw2a, d_pw2a)
-        d_dw2_cat, grads["W_pw2a"], grads["B_pw2a"] = pw_backward(dw2_cat, p["W_pw2a"], d_pw2a_pre)
+        d_pw2_pre = silu_grad(pw2_pre, s_pw2, d_h2)
+        d_h1_cat, grads["W_pw2"], grads["B_pw2"] = pw_backward(h1_cat, p["W_pw2"], d_pw2_pre)
 
-        d_dw2 = d_dw2_cat[:, :32, :, :]
-        d_g_from_pw2 = d_dw2_cat[:, 32:40, :, :].sum(axis=(2, 3))
-        d_h1_from_dw2, grads["W_dw2"], grads["B_dw2"] = depthwise_3x3_backward(h1, p["W_dw2"], d_dw2)
+        d_h1_from_pw2 = d_h1_cat[:, :32, :, :]
+        d_g_from_pw2 = d_h1_cat[:, 32:40, :, :].sum(axis=(2, 3))
 
-        d_h1 = d_h2 + d_h1_from_dw2
+        d_h1 = d_h2 + d_h1_from_pw2
         d_h1[:, :8, :, :] += (d_g_from_bg + d_g_from_pw2)[:, :, None, None] / float(H * W)
 
         d_pw1a, grads["W_pw1b"], grads["B_pw1b"] = pw_backward(pw1a, p["W_pw1b"], d_h1)
@@ -244,7 +236,7 @@ class ConvNeXtMicroNet:
             self.params[k] -= lr * (m_hat / (np.sqrt(v_hat) + eps) + wd * self.params[k])
 
     def pack_weights_float4(self):
-        """Pack all weights into exact (3143, 4) float32 layout matching nl_neural_prior.hlsl."""
+        """Pack all weights into exact (1841, 4) float32 layout matching nl_neural_prior.hlsl."""
         p = self.params
         chunks = []
 
@@ -260,17 +252,12 @@ class ConvNeXtMicroNet:
         chunks.append(p["W_dw1"].T.reshape(9 * 8, 4))  # 72
         chunks.append(p["B_dw1"].reshape(8, 4))        # 8
 
-        pack_pw(p["W_pw1a"], p["B_pw1a"])  # 512 + 16 = 528
-        pack_pw(p["W_pw1b"], p["B_pw1b"])  # 512 + 8  = 520
-
-        chunks.append(p["W_dw2"].T.reshape(9 * 8, 4))  # 72
-        chunks.append(p["B_dw2"].reshape(8, 4))        # 8
-
-        pack_pw(p["W_pw2a"], p["B_pw2a"])  # 640 + 16 = 656
-        pack_pw(p["W_pw2b"], p["B_pw2b"])  # 512 + 8  = 520
+        pack_pw(p["W_pw1a"], p["B_pw1a"])  # 384 + 12 = 396
+        pack_pw(p["W_pw1b"], p["B_pw1b"])  # 384 + 8  = 392
+        pack_pw(p["W_pw2"], p["B_pw2"])    # 320 + 8  = 328
         pack_pw(p["W_mat"], p["B_mat"])    # 128 + 4  = 132
-        pack_pw(p["W_bg1"], p["B_bg1"])    # 352 + 8  = 360
-        pack_pw(p["W_bg2"], p["B_bg2"])    # 96 + 3   = 99
+        pack_pw(p["W_bg1"], p["B_bg1"])    # 264 + 6  = 270
+        pack_pw(p["W_bg2"], p["B_bg2"])    # 72 + 3   = 75
 
         packed = np.concatenate(chunks, axis=0).astype(np.float32)
         assert packed.shape == (NL_MODEL_FLOAT4_COUNT, 4), f"Got {packed.shape}"
@@ -622,43 +609,43 @@ def generate_pbr_batch(batch_size, rng, preset_style, H=16, W=16):
         mid_zone = math.exp(-((lz - 0.42) ** 2) / 0.08)
 
         if preset_style == "photorealistic_pbr":
-            gain = np.array([1.0 + 0.05 * mid_zone - 0.04 * high_zone,
-                             1.0 + 0.04 * mid_zone - 0.04 * high_zone,
-                             1.0 + 0.03 * mid_zone - 0.03 * high_zone])
-            gain += np.array([0.04, 0.01, -0.02]) * mean_skin * mid_zone
-            shadow_lift = 0.03 * shadow_zone * (1.0 - 0.4 * mean_metal)
+            gain = np.array([1.0 + 0.02 * mid_zone - 0.03 * high_zone,
+                             1.0 + 0.02 * mid_zone - 0.03 * high_zone,
+                             1.0 + 0.015 * mid_zone - 0.02 * high_zone])
+            gain += np.array([0.02, 0.005, -0.01]) * mean_skin * mid_zone
+            shadow_lift = 0.02 * shadow_zone * (1.0 - 0.4 * mean_metal)
             off = np.zeros(3, dtype=np.float32)
-            detail = 0.16 * (0.4 + 0.6 * mean_var) * (1.0 - 0.45 * mean_skin) * (1.0 - 0.55 * mean_grass)
-            chroma = 0.10 * mid_zone + 0.06 * mean_grass
-            spec_boost = 0.14 * mean_metal + 0.05 * (1.0 - float(np.mean(rough)))
-            hl_roll = 0.16 * high_zone
-        elif preset_style == "path_traced_cinema":
-            gain = np.array([1.05 * mid_zone + 0.95 * (1.0 - mid_zone),
-                             1.02 * mid_zone + 0.96 * (1.0 - mid_zone),
-                             0.97 * mid_zone + 1.02 * (1.0 - mid_zone)])
-            gain += np.array([0.05, 0.02, -0.03]) * mean_skin
-            shadow_lift = 0.02 * shadow_zone - 0.01 * (1.0 - shadow_zone)
-            off = np.zeros(3, dtype=np.float32)
-            detail = 0.20 * (0.45 + 0.55 * mean_var) * (1.0 - 0.50 * mean_skin) * (1.0 - 0.55 * mean_grass)
-            chroma = 0.18 * mid_zone + 0.08 * mean_grass
-            spec_boost = 0.20 * mean_metal + 0.08 * (1.0 - float(np.mean(rough)))
-            hl_roll = 0.24 * high_zone
-        elif preset_style == "natural_daylight":
-            gain = np.array([1.02, 1.03, 1.04]) - 0.05 * high_zone
-            shadow_lift = 0.04 * shadow_zone
-            off = np.zeros(3, dtype=np.float32)
-            detail = 0.13 * (0.5 + 0.5 * mean_var) * (1.0 - 0.40 * mean_skin) * (1.0 - 0.50 * mean_grass)
-            chroma = 0.08 * mid_zone + 0.06 * mean_grass
+            detail = 0.08 * (0.4 + 0.6 * mean_var) * (1.0 - 0.50 * mean_skin) * (1.0 - 0.65 * mean_grass)
+            chroma = 0.02 * mid_zone + 0.02 * mean_grass - 0.03 * high_zone
             spec_boost = 0.10 * mean_metal + 0.04 * (1.0 - float(np.mean(rough)))
             hl_roll = 0.14 * high_zone
-        else:  # filmic_noir
-            gain = np.array([0.96 + 0.10 * mid_zone, 0.95 + 0.08 * mid_zone, 0.98 + 0.07 * mid_zone])
-            shadow_lift = -0.04 * shadow_zone
+        elif preset_style == "path_traced_cinema":
+            gain = np.array([1.03 * mid_zone + 0.97 * (1.0 - mid_zone),
+                             1.01 * mid_zone + 0.98 * (1.0 - mid_zone),
+                             0.98 * mid_zone + 1.01 * (1.0 - mid_zone)])
+            gain += np.array([0.025, 0.01, -0.015]) * mean_skin
+            shadow_lift = 0.015 * shadow_zone - 0.01 * (1.0 - shadow_zone)
             off = np.zeros(3, dtype=np.float32)
-            detail = 0.22 * (0.4 + 0.6 * mean_var) * (1.0 - 0.35 * mean_skin) * (1.0 - 0.50 * mean_grass)
-            chroma = -0.08 + 0.08 * mean_skin
-            spec_boost = 0.24 * mean_metal + 0.10 * (1.0 - float(np.mean(rough)))
-            hl_roll = 0.30 * high_zone
+            detail = 0.10 * (0.45 + 0.55 * mean_var) * (1.0 - 0.55 * mean_skin) * (1.0 - 0.65 * mean_grass)
+            chroma = 0.04 * mid_zone + 0.03 * mean_grass - 0.04 * high_zone
+            spec_boost = 0.14 * mean_metal + 0.06 * (1.0 - float(np.mean(rough)))
+            hl_roll = 0.20 * high_zone
+        elif preset_style == "natural_daylight":
+            gain = np.array([1.01, 1.015, 1.02]) - 0.04 * high_zone
+            shadow_lift = 0.025 * shadow_zone
+            off = np.zeros(3, dtype=np.float32)
+            detail = 0.06 * (0.5 + 0.5 * mean_var) * (1.0 - 0.45 * mean_skin) * (1.0 - 0.60 * mean_grass)
+            chroma = 0.01 * mid_zone + 0.02 * mean_grass - 0.03 * high_zone
+            spec_boost = 0.08 * mean_metal + 0.03 * (1.0 - float(np.mean(rough)))
+            hl_roll = 0.12 * high_zone
+        else:  # filmic_noir
+            gain = np.array([0.97 + 0.06 * mid_zone, 0.96 + 0.05 * mid_zone, 0.99 + 0.04 * mid_zone])
+            shadow_lift = -0.03 * shadow_zone
+            off = np.zeros(3, dtype=np.float32)
+            detail = 0.11 * (0.4 + 0.6 * mean_var) * (1.0 - 0.40 * mean_skin) * (1.0 - 0.60 * mean_grass)
+            chroma = -0.06 + 0.04 * mean_skin
+            spec_boost = 0.16 * mean_metal + 0.07 * (1.0 - float(np.mean(rough)))
+            hl_roll = 0.24 * high_zone
 
         y_bg[i, 0:3] = gain - 1.0
         y_bg[i, 3] = shadow_lift

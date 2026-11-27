@@ -397,10 +397,6 @@ bool NL_Vk::CreateGiImages(uint32_t width, uint32_t height)
 
     const VkFormat fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
     if (!CreateImage2D(targetW, targetH, fmt, _halfColorDepth) ||
-        !CreateImage2D(targetW, targetH, fmt, _denoisedGiScratch) ||
-        !CreateImage2D(targetW, targetH, fmt, _denoisedSsrScratch) ||
-        !CreateImage2D(targetW, targetH, fmt, _denoisedMetaScratch) ||
-        !CreateImage2D(targetW, targetH, fmt, _denoisedGiDirScratch) ||
         !CreateImage2D(targetW, targetH, fmt, _denoisedGi) ||
         !CreateImage2D(targetW, targetH, fmt, _denoisedSsr) ||
         !CreateImage2D(targetW, targetH, fmt, _denoisedMeta) ||
@@ -476,10 +472,6 @@ bool NL_Vk::CreateGiImages(uint32_t width, uint32_t height)
 void NL_Vk::ReleaseGiImages()
 {
     ReleaseImageRes(_halfColorDepth);
-    ReleaseImageRes(_denoisedGiScratch);
-    ReleaseImageRes(_denoisedSsrScratch);
-    ReleaseImageRes(_denoisedMetaScratch);
-    ReleaseImageRes(_denoisedGiDirScratch);
     ReleaseImageRes(_denoisedGi);
     ReleaseImageRes(_denoisedSsr);
     ReleaseImageRes(_denoisedMeta);
@@ -598,9 +590,9 @@ NL_Vk::NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalD
             CreateBinding(7, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
             CreateBinding(8, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
             CreateBinding(9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
-            CreateBinding(10, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
-            CreateBinding(11, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
-            CreateBinding(12, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
+            CreateBinding(10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+            CreateBinding(12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
             CreateBinding(13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
             CreateBinding(14, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
             CreateBinding(15, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
@@ -616,8 +608,8 @@ NL_Vk::NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalD
 
         std::vector<VkDescriptorPoolSize> ps = {
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, _maxFramesInFlight },
-            { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 15 * _maxFramesInFlight },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * _maxFramesInFlight },
+            { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 12 * _maxFramesInFlight },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 7 * _maxFramesInFlight },
             { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * _maxFramesInFlight },
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, _maxFramesInFlight }
         };
@@ -758,7 +750,7 @@ NL_Vk::NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalD
             return;
     }
 
-    // Pass 4a & 4b: Decoupled 2-Pass À-Trous Variance Denoise
+    // Pass 4: Single-Pass 9-Tap À-Trous Variance Denoise
     {
         std::vector<VkDescriptorSetLayoutBinding> b = {
             CreateBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
@@ -781,8 +773,6 @@ NL_Vk::NL_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InPhysicalD
             { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * _maxFramesInFlight }
         };
         if (!CreatePassPipeline(_passDenoise, b, ps, sizeof(NLDenoiseInternalConstants), nl_denoise_spv,
-                                sizeof(nl_denoise_spv)) ||
-            !CreatePassPipeline(_passDenoise2, b, ps, sizeof(NLDenoiseInternalConstants), nl_denoise_spv,
                                 sizeof(nl_denoise_spv)))
         {
             return;
@@ -801,7 +791,6 @@ NL_Vk::~NL_Vk()
     DestroyPassPipeline(_passPrior);
     DestroyPassPipeline(_passGi);
     DestroyPassPipeline(_passDenoise);
-    DestroyPassPipeline(_passDenoise2);
 }
 
 bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookConstants InConstants,
@@ -818,7 +807,12 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         return false;
     }
 
-    if (!CreateGiImages(OutResourceInfo.Width, OutResourceInfo.Height))
+    const uint32_t activeW =
+        (InConstants.PreUpscale && InConstants.RenderWidth > 0) ? InConstants.RenderWidth : OutResourceInfo.Width;
+    const uint32_t activeH =
+        (InConstants.PreUpscale && InConstants.RenderHeight > 0) ? InConstants.RenderHeight : OutResourceInfo.Height;
+
+    if (!CreateGiImages(activeW, activeH))
         return false;
 
     UpdateModelWeightsIfNeeded();
@@ -916,8 +910,8 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         BatchImageBarriers(InCmdList, bar);
 
         NLPrepInternalConstants prepConst {};
-        prepConst.OutputWidth = static_cast<int32_t>(OutResourceInfo.Width);
-        prepConst.OutputHeight = static_cast<int32_t>(OutResourceInfo.Height);
+        prepConst.OutputWidth = static_cast<int32_t>(activeW);
+        prepConst.OutputHeight = static_cast<int32_t>(activeH);
         prepConst.HalfWidth = static_cast<int32_t>(_giWidth);
         prepConst.HalfHeight = static_cast<int32_t>(_giHeight);
         prepConst.DepthWidth = static_cast<int32_t>(InDepthInfo->Width);
@@ -1011,8 +1005,8 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         pyrConst.Mip3Height = static_cast<int32_t>(_mipDims[3][1]);
         pyrConst.Mip4Width = static_cast<int32_t>(_mipDims[4][0]);
         pyrConst.Mip4Height = static_cast<int32_t>(_mipDims[4][1]);
-        FillPyramidConstants(pyrConst, temporalConstIn, static_cast<int32_t>(OutResourceInfo.Width),
-                             static_cast<int32_t>(OutResourceInfo.Height));
+        FillPyramidConstants(pyrConst, temporalConstIn, static_cast<int32_t>(activeW),
+                             static_cast<int32_t>(activeH));
 
         const VkDescriptorBufferInfo uboInfo { _passPyramid.constantBuffer,
                                                _passPyramid.constantStride * _currentSetIndex,
@@ -1116,8 +1110,8 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         priorConst.Mip3Height = static_cast<int32_t>(_mipDims[3][1]);
         priorConst.GridWidth = static_cast<int32_t>(_gridWidth);
         priorConst.GridHeight = static_cast<int32_t>(_gridHeight);
-        priorConst.OutputWidth = static_cast<int32_t>(OutResourceInfo.Width);
-        priorConst.OutputHeight = static_cast<int32_t>(OutResourceInfo.Height);
+        priorConst.OutputWidth = static_cast<int32_t>(activeW);
+        priorConst.OutputHeight = static_cast<int32_t>(activeH);
         priorConst.MotionWidth = static_cast<int32_t>(InMotionVectorsInfo.Width);
         priorConst.MotionHeight = static_cast<int32_t>(InMotionVectorsInfo.Height);
         FillNeuralPriorConstants(priorConst, temporalConstIn);
@@ -1178,7 +1172,7 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         vkCmdDispatch(InCmdList, _gridWidth, _gridHeight, 1);
     }
 
-    // --- Pass 3 & Pass 4 (2-Pass Decoupled À-Trous Denoiser) ---
+    // --- Pass 3 & Pass 4 (1-Pass Decoupled À-Trous Denoiser) ---
     if (runGiPass)
     {
         std::vector<VkImageMemoryBarrier> bar = {
@@ -1235,8 +1229,8 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
                              0, nullptr, 2, bufBars, static_cast<uint32_t>(bar.size()), bar.data());
 
         NLGiInternalConstants giConst {};
-        giConst.OutputWidth = static_cast<int32_t>(OutResourceInfo.Width);
-        giConst.OutputHeight = static_cast<int32_t>(OutResourceInfo.Height);
+        giConst.OutputWidth = static_cast<int32_t>(activeW);
+        giConst.OutputHeight = static_cast<int32_t>(activeH);
         giConst.GiWidth = static_cast<int32_t>(_giWidth);
         giConst.GiHeight = static_cast<int32_t>(_giHeight);
         giConst.MotionWidth = static_cast<int32_t>(InMotionVectorsInfo.Width);
@@ -1290,90 +1284,14 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
                                 nullptr);
         vkCmdDispatch(InCmdList, (_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
 
-        const bool twoPassDenoise = (_activeTier >= 1);
-
-        // Pass 4a: À-Trous Denoise (step = 1)
+        // Pass 4: Single-Pass 9-Tap À-Trous Denoise
         {
-            Image2DRes& outGi = twoPassDenoise ? _denoisedGiScratch : _denoisedGi;
-            Image2DRes& outSsr = twoPassDenoise ? _denoisedSsrScratch : _denoisedSsr;
-            Image2DRes& outMeta = twoPassDenoise ? _denoisedMetaScratch : _denoisedMeta;
-            Image2DRes& outDir = twoPassDenoise ? _denoisedGiDirScratch : _denoisedGiDir;
-
             std::vector<VkImageMemoryBarrier> dnBar = {
                 MakeImgBarrier(_gi[_giWriteIdx].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
                 MakeImgBarrier(_ssr[_giWriteIdx].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
                 MakeImgBarrier(_giMeta[_giWriteIdx].image, VK_IMAGE_LAYOUT_GENERAL,
                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
                 MakeImgBarrier(_giDir[_giWriteIdx].image, VK_IMAGE_LAYOUT_GENERAL,
-                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
-                MakeImgBarrier(outGi.image,
-                               outGi.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                               VK_IMAGE_LAYOUT_GENERAL),
-                MakeImgBarrier(outSsr.image,
-                               outSsr.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                               VK_IMAGE_LAYOUT_GENERAL),
-                MakeImgBarrier(outMeta.image,
-                               outMeta.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                               VK_IMAGE_LAYOUT_GENERAL),
-                MakeImgBarrier(outDir.image,
-                               outDir.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                               VK_IMAGE_LAYOUT_GENERAL)
-            };
-            outGi.initialized = true;
-            outSsr.initialized = true;
-            outMeta.initialized = true;
-            outDir.initialized = true;
-            BatchImageBarriers(InCmdList, dnBar);
-
-            NLDenoiseInternalConstants dnConst {};
-            FillDenoiseConstants(dnConst, temporalConstIn, static_cast<int32_t>(_giWidth),
-                                 static_cast<int32_t>(_giHeight), ssrEnabled, 1, 0);
-
-            const VkDescriptorBufferInfo dnUbo { _passDenoise.constantBuffer,
-                                                 _passDenoise.constantStride * _currentSetIndex,
-                                                 sizeof(NLDenoiseInternalConstants) };
-            if (_passDenoise.mappedConstants != nullptr)
-                std::memcpy((uint8_t*) _passDenoise.mappedConstants + dnUbo.offset, &dnConst, sizeof(dnConst));
-
-            const VkDescriptorImageInfo inGiI { VK_NULL_HANDLE, _gi[_giWriteIdx].view,
-                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            const VkDescriptorImageInfo inSsrI { VK_NULL_HANDLE, _ssr[_giWriteIdx].view,
-                                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            const VkDescriptorImageInfo inMetaI { VK_NULL_HANDLE, _giMeta[_giWriteIdx].view,
-                                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            const VkDescriptorImageInfo inDirI { VK_NULL_HANDLE, _giDir[_giWriteIdx].view,
-                                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            const VkDescriptorImageInfo outDGi { VK_NULL_HANDLE, outGi.view, VK_IMAGE_LAYOUT_GENERAL };
-            const VkDescriptorImageInfo outDSsr { VK_NULL_HANDLE, outSsr.view, VK_IMAGE_LAYOUT_GENERAL };
-            const VkDescriptorImageInfo outDMeta { VK_NULL_HANDLE, outMeta.view, VK_IMAGE_LAYOUT_GENERAL };
-            const VkDescriptorImageInfo outDDir { VK_NULL_HANDLE, outDir.view, VK_IMAGE_LAYOUT_GENERAL };
-
-            VkDescriptorSet dnDs = _passDenoise.descriptorSets[_currentSetIndex];
-            std::vector<VkWriteDescriptorSet> dnWrites = {
-                WriteUbo(dnDs, 0, &dnUbo),        WriteSampledImg(dnDs, 1, &cdI),     WriteSampledImg(dnDs, 2, &nrmI),
-                WriteSampledImg(dnDs, 3, &inGiI), WriteSampledImg(dnDs, 4, &inSsrI),  WriteSampledImg(dnDs, 5, &inMetaI),
-                WriteSampledImg(dnDs, 6, &inDirI), WriteCombinedImg(dnDs, 7, &mat1I), WriteStorageImg(dnDs, 8, &outDGi),
-                WriteStorageImg(dnDs, 9, &outDSsr), WriteStorageImg(dnDs, 10, &outDMeta), WriteStorageImg(dnDs, 11, &outDDir)
-            };
-            vkUpdateDescriptorSets(_device, static_cast<uint32_t>(dnWrites.size()), dnWrites.data(), 0, nullptr);
-
-            vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _passDenoise.pipeline);
-            vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _passDenoise.pipelineLayout, 0, 1, &dnDs,
-                                    0, nullptr);
-            vkCmdDispatch(InCmdList, (_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
-        }
-
-        // Pass 4b: À-Trous Wide Pass (step = 3, Medium/Full tier)
-        if (twoPassDenoise)
-        {
-            std::vector<VkImageMemoryBarrier> dnBar2 = {
-                MakeImgBarrier(_denoisedGiScratch.image, VK_IMAGE_LAYOUT_GENERAL,
-                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
-                MakeImgBarrier(_denoisedSsrScratch.image, VK_IMAGE_LAYOUT_GENERAL,
-                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
-                MakeImgBarrier(_denoisedMetaScratch.image, VK_IMAGE_LAYOUT_GENERAL,
-                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
-                MakeImgBarrier(_denoisedGiDirScratch.image, VK_IMAGE_LAYOUT_GENERAL,
                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
                 MakeImgBarrier(_denoisedGi.image,
                                _denoisedGi.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
@@ -1396,43 +1314,43 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
             _denoisedSsr.initialized = true;
             _denoisedMeta.initialized = true;
             _denoisedGiDir.initialized = true;
-            BatchImageBarriers(InCmdList, dnBar2);
+            BatchImageBarriers(InCmdList, dnBar);
 
-            NLDenoiseInternalConstants dnConst2 {};
-            FillDenoiseConstants(dnConst2, temporalConstIn, static_cast<int32_t>(_giWidth),
-                                 static_cast<int32_t>(_giHeight), ssrEnabled, 3, 1);
+            NLDenoiseInternalConstants dnConst {};
+            FillDenoiseConstants(dnConst, temporalConstIn, static_cast<int32_t>(_giWidth),
+                                 static_cast<int32_t>(_giHeight), ssrEnabled, 1, 0);
 
-            const VkDescriptorBufferInfo dnUbo2 { _passDenoise2.constantBuffer,
-                                                  _passDenoise2.constantStride * _currentSetIndex,
-                                                  sizeof(NLDenoiseInternalConstants) };
-            if (_passDenoise2.mappedConstants != nullptr)
-                std::memcpy((uint8_t*) _passDenoise2.mappedConstants + dnUbo2.offset, &dnConst2, sizeof(dnConst2));
+            const VkDescriptorBufferInfo dnUbo { _passDenoise.constantBuffer,
+                                                 _passDenoise.constantStride * _currentSetIndex,
+                                                 sizeof(NLDenoiseInternalConstants) };
+            if (_passDenoise.mappedConstants != nullptr)
+                std::memcpy((uint8_t*) _passDenoise.mappedConstants + dnUbo.offset, &dnConst, sizeof(dnConst));
 
-            const VkDescriptorImageInfo inGiI { VK_NULL_HANDLE, _denoisedGiScratch.view,
+            const VkDescriptorImageInfo inGiI { VK_NULL_HANDLE, _gi[_giWriteIdx].view,
                                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            const VkDescriptorImageInfo inSsrI { VK_NULL_HANDLE, _denoisedSsrScratch.view,
+            const VkDescriptorImageInfo inSsrI { VK_NULL_HANDLE, _ssr[_giWriteIdx].view,
                                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            const VkDescriptorImageInfo inMetaI { VK_NULL_HANDLE, _denoisedMetaScratch.view,
+            const VkDescriptorImageInfo inMetaI { VK_NULL_HANDLE, _giMeta[_giWriteIdx].view,
                                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-            const VkDescriptorImageInfo inDirI { VK_NULL_HANDLE, _denoisedGiDirScratch.view,
+            const VkDescriptorImageInfo inDirI { VK_NULL_HANDLE, _giDir[_giWriteIdx].view,
                                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             const VkDescriptorImageInfo outDGi { VK_NULL_HANDLE, _denoisedGi.view, VK_IMAGE_LAYOUT_GENERAL };
             const VkDescriptorImageInfo outDSsr { VK_NULL_HANDLE, _denoisedSsr.view, VK_IMAGE_LAYOUT_GENERAL };
             const VkDescriptorImageInfo outDMeta { VK_NULL_HANDLE, _denoisedMeta.view, VK_IMAGE_LAYOUT_GENERAL };
             const VkDescriptorImageInfo outDDir { VK_NULL_HANDLE, _denoisedGiDir.view, VK_IMAGE_LAYOUT_GENERAL };
 
-            VkDescriptorSet dnDs2 = _passDenoise2.descriptorSets[_currentSetIndex];
-            std::vector<VkWriteDescriptorSet> dnWrites2 = {
-                WriteUbo(dnDs2, 0, &dnUbo2),        WriteSampledImg(dnDs2, 1, &cdI),     WriteSampledImg(dnDs2, 2, &nrmI),
-                WriteSampledImg(dnDs2, 3, &inGiI),  WriteSampledImg(dnDs2, 4, &inSsrI),  WriteSampledImg(dnDs2, 5, &inMetaI),
-                WriteSampledImg(dnDs2, 6, &inDirI), WriteCombinedImg(dnDs2, 7, &mat1I),  WriteStorageImg(dnDs2, 8, &outDGi),
-                WriteStorageImg(dnDs2, 9, &outDSsr), WriteStorageImg(dnDs2, 10, &outDMeta), WriteStorageImg(dnDs2, 11, &outDDir)
+            VkDescriptorSet dnDs = _passDenoise.descriptorSets[_currentSetIndex];
+            std::vector<VkWriteDescriptorSet> dnWrites = {
+                WriteUbo(dnDs, 0, &dnUbo),        WriteSampledImg(dnDs, 1, &cdI),     WriteSampledImg(dnDs, 2, &nrmI),
+                WriteSampledImg(dnDs, 3, &inGiI), WriteSampledImg(dnDs, 4, &inSsrI),  WriteSampledImg(dnDs, 5, &inMetaI),
+                WriteSampledImg(dnDs, 6, &inDirI), WriteCombinedImg(dnDs, 7, &mat1I), WriteStorageImg(dnDs, 8, &outDGi),
+                WriteStorageImg(dnDs, 9, &outDSsr), WriteStorageImg(dnDs, 10, &outDMeta), WriteStorageImg(dnDs, 11, &outDDir)
             };
-            vkUpdateDescriptorSets(_device, static_cast<uint32_t>(dnWrites2.size()), dnWrites2.data(), 0, nullptr);
+            vkUpdateDescriptorSets(_device, static_cast<uint32_t>(dnWrites.size()), dnWrites.data(), 0, nullptr);
 
-            vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _passDenoise2.pipeline);
-            vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _passDenoise2.pipelineLayout, 0, 1,
-                                    &dnDs2, 0, nullptr);
+            vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _passDenoise.pipeline);
+            vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _passDenoise.pipelineLayout, 0, 1, &dnDs,
+                                    0, nullptr);
             vkCmdDispatch(InCmdList, (_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
         }
     }
@@ -1500,8 +1418,8 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
         }
 
         NLCompositeInternalConstants compConst {};
-        compConst.OutputWidth = static_cast<int32_t>(OutResourceInfo.Width);
-        compConst.OutputHeight = static_cast<int32_t>(OutResourceInfo.Height);
+        compConst.OutputWidth = static_cast<int32_t>(activeW);
+        compConst.OutputHeight = static_cast<int32_t>(activeH);
         compConst.GiWidth = static_cast<int32_t>(_giWidth);
         compConst.GiHeight = static_cast<int32_t>(_giHeight);
         compConst.DepthWidth = static_cast<int32_t>(InDepthInfo->Width);
@@ -1530,11 +1448,11 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         const VkDescriptorImageInfo pyrI { _textureSampler, _colorPyramidView,
                                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        const VkDescriptorImageInfo mat0I { VK_NULL_HANDLE, _material0[_giWriteIdx].view,
+        const VkDescriptorImageInfo mat0I { _textureSampler, _material0[_giWriteIdx].view,
                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        const VkDescriptorImageInfo mat1I { VK_NULL_HANDLE, _material1[_giWriteIdx].view,
+        const VkDescriptorImageInfo mat1I { _textureSampler, _material1[_giWriteIdx].view,
                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-        const VkDescriptorImageInfo mat2I { VK_NULL_HANDLE, _material2[_giWriteIdx].view,
+        const VkDescriptorImageInfo mat2I { _textureSampler, _material2[_giWriteIdx].view,
                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         const VkDescriptorImageInfo bg0I { _textureSampler, _bilateralGrid[_giWriteIdx][0].view,
                                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -1563,8 +1481,8 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
             WriteUbo(ds, 0, &uboInfo),       WriteSampledImg(ds, 1, &colI),    WriteSampledImg(ds, 2, &depI),
             WriteSampledImg(ds, 3, &mvI),    WriteSampledImg(ds, 4, &dGiI),    WriteSampledImg(ds, 5, &nrmI),
             WriteSampledImg(ds, 6, &dSsrI),  WriteSampledImg(ds, 7, &dMetaI),  WriteSampledImg(ds, 8, &dDirI),
-            WriteCombinedImg(ds, 9, &pyrI),  WriteSampledImg(ds, 10, &mat0I),  WriteSampledImg(ds, 11, &mat1I),
-            WriteSampledImg(ds, 12, &mat2I), WriteCombinedImg(ds, 13, &bg0I),  WriteCombinedImg(ds, 14, &bg1I),
+            WriteCombinedImg(ds, 9, &pyrI),  WriteCombinedImg(ds, 10, &mat0I), WriteCombinedImg(ds, 11, &mat1I),
+            WriteCombinedImg(ds, 12, &mat2I), WriteCombinedImg(ds, 13, &bg0I), WriteCombinedImg(ds, 14, &bg1I),
             WriteCombinedImg(ds, 15, &bg2I), WriteSampledImg(ds, 16, &albI),   WriteSampledImg(ds, 17, &rghI),
             WriteSampledImg(ds, 18, &metI),  WriteSampledImg(ds, 19, &sssI),   WriteStorageBuf(ds, 20, &rslI),
             WriteStorageBuf(ds, 21, &whI),   WriteStorageImg(ds, 22, &outI)
@@ -1573,7 +1491,7 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
 
         vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipeline);
         vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelineLayout, 0, 1, &ds, 0, nullptr);
-        vkCmdDispatch(InCmdList, (OutResourceInfo.Width + 15u) / 16u, (OutResourceInfo.Height + 15u) / 16u, 1);
+        vkCmdDispatch(InCmdList, (activeW + 15u) / 16u, (activeH + 15u) / 16u, 1);
     }
 
     return true;

@@ -383,17 +383,17 @@ class Config
     // 3D Neural Look (DLSS 5-Style)
     CustomOptional<bool> NeuralLookEnabled { false };
     CustomOptional<int> NeuralLookPreset { 1 };
-    CustomOptional<float> NeuralLookGiIntensity { 1.00f };
-    CustomOptional<float> NeuralLookAoIntensity { 0.85f };
-    CustomOptional<float> NeuralLookSsrIntensity { 0.85f };
-    CustomOptional<float> NeuralLookRelightIntensity { 0.75f };
-    CustomOptional<float> NeuralLookVolumetricGlow { 0.45f };
-    CustomOptional<float> NeuralLookDetail { 0.55f };
-    CustomOptional<float> NeuralLookSpecularRelief { 0.50f };
-    CustomOptional<float> NeuralLookToneContrast { 0.32f };
-    CustomOptional<float> NeuralLookSssIntensity { 0.75f };
-    CustomOptional<float> NeuralLookContactShadowIntensity { 0.70f };
-    CustomOptional<float> NeuralLookMaxGpuMs { 3.00f };
+    CustomOptional<float> NeuralLookGiIntensity { 0.85f };
+    CustomOptional<float> NeuralLookAoIntensity { 0.80f };
+    CustomOptional<float> NeuralLookSsrIntensity { 0.80f };
+    CustomOptional<float> NeuralLookRelightIntensity { 0.65f };
+    CustomOptional<float> NeuralLookVolumetricGlow { 0.25f };
+    CustomOptional<float> NeuralLookDetail { 0.45f };
+    CustomOptional<float> NeuralLookSpecularRelief { 0.45f };
+    CustomOptional<float> NeuralLookToneContrast { 0.22f };
+    CustomOptional<float> NeuralLookSssIntensity { 0.70f };
+    CustomOptional<float> NeuralLookContactShadowIntensity { 0.65f };
+    CustomOptional<float> NeuralLookMaxGpuMs { 1.50f };
     CustomOptional<float> NeuralLookSplitScreen { 0.0f };
     CustomOptional<bool> NeuralLookUseGBuffers { true };
     CustomOptional<bool> NeuralLookWorldHashEnabled { true };

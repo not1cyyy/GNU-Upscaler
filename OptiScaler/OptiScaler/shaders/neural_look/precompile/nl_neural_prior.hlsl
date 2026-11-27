@@ -158,31 +158,26 @@ RWTexture3D<float4> OutBilateralGrid2 : register(u5);
 #endif
 RWStructuredBuffer<float4> ResolvedSceneLightBuf : register(u6);
 
-// Exact float4 layer offsets matching tools/train_neural_look.py & NL_Model.h (v2: 3143 float4s)
+// Exact float4 layer offsets matching tools/train_neural_look.py & NL_Model.h (v3 lean: 1841 float4s)
 static const uint OFF_W_STEM = 0u;      // 160 (32 x 20)
 static const uint OFF_B_STEM = 160u;    // 8
 static const uint OFF_W_DW1  = 168u;    // 72
 static const uint OFF_B_DW1  = 240u;    // 8
-static const uint OFF_W_PW1A = 248u;    // 512
-static const uint OFF_B_PW1A = 760u;    // 16
-static const uint OFF_W_PW1B = 776u;    // 512
-static const uint OFF_B_PW1B = 1288u;   // 8
-static const uint OFF_W_DW2  = 1296u;   // 72
-static const uint OFF_B_DW2  = 1368u;   // 8
-static const uint OFF_W_PW2A = 1376u;   // 640
-static const uint OFF_B_PW2A = 2016u;   // 16
-static const uint OFF_W_PW2B = 2032u;   // 512
-static const uint OFF_B_PW2B = 2544u;   // 8
-static const uint OFF_W_MAT  = 2552u;   // 128 (16 x 32)
-static const uint OFF_B_MAT  = 2680u;   // 4
-static const uint OFF_W_BG1  = 2684u;   // 352
-static const uint OFF_B_BG1  = 3036u;   // 8
-static const uint OFF_W_BG2  = 3044u;   // 96
-static const uint OFF_B_BG2  = 3140u;   // 3
+static const uint OFF_W_PW1A = 248u;    // 384 (48 x 32)
+static const uint OFF_B_PW1A = 632u;    // 12
+static const uint OFF_W_PW1B = 644u;    // 384 (32 x 48)
+static const uint OFF_B_PW1B = 1028u;   // 8
+static const uint OFF_W_PW2  = 1036u;   // 320 (32 x 40)
+static const uint OFF_B_PW2  = 1356u;   // 8
+static const uint OFF_W_MAT  = 1364u;   // 128 (16 x 32)
+static const uint OFF_B_MAT  = 1492u;   // 4
+static const uint OFF_W_BG1  = 1496u;   // 264 (24 x 44)
+static const uint OFF_B_BG1  = 1760u;   // 6
+static const uint OFF_W_BG2  = 1766u;   // 72  (12 x 24)
+static const uint OFF_B_BG2  = 1838u;   // 3
 
-// 12x12 tile (2-px halo for zero-seam DW1+DW2) + 10x10 h1 tile = ~25.9 KB LDS < 32 KB limit
-groupshared uint s_feat[12][12][16];
-groupshared uint s_h1[10][10][16];
+// Single 10x10 LDS tile (6.4 KB) + pool buffers (~16.6 KB total LDS -> high GPU occupancy, zero register spills!)
+groupshared uint s_feat[10][10][16];
 groupshared float4 s_globalPool[64][2];
 groupshared float4 s_h2Pool[64][8];
 groupshared float4 s_sceneKeyView;
@@ -211,29 +206,6 @@ void UnpackFeat32(int ly, int lx, out min16float4 v[8])
     {
         uint p0 = s_feat[ly][lx][i * 2 + 0];
         uint p1 = s_feat[ly][lx][i * 2 + 1];
-        v[i] = min16float4(f16tof32(p0 & 0xFFFFu), f16tof32(p0 >> 16),
-                           f16tof32(p1 & 0xFFFFu), f16tof32(p1 >> 16));
-    }
-}
-
-void PackH1_32(int ly, int lx, min16float4 v[8])
-{
-    [unroll]
-    for (int i = 0; i < 8; ++i)
-    {
-        float4 fv = float4(v[i]);
-        s_h1[ly][lx][i * 2 + 0] = f32tof16(fv.x) | (f32tof16(fv.y) << 16);
-        s_h1[ly][lx][i * 2 + 1] = f32tof16(fv.z) | (f32tof16(fv.w) << 16);
-    }
-}
-
-void UnpackH1_32(int ly, int lx, out min16float4 v[8])
-{
-    [unroll]
-    for (int i = 0; i < 8; ++i)
-    {
-        uint p0 = s_h1[ly][lx][i * 2 + 0];
-        uint p1 = s_h1[ly][lx][i * 2 + 1];
         v[i] = min16float4(f16tof32(p0 & 0xFFFFu), f16tof32(p0 >> 16),
                            f16tof32(p1 & 0xFFFFu), f16tof32(p1 >> 16));
     }
@@ -350,18 +322,18 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     float3 keyDirView = s_sceneKeyView.xyz;
     float3 worldUpInView = s_worldUpView.xyz;
-    int2 tileOrigin12 = int2(gid.xy) * 8 - 2;
+    int2 tileOrigin10 = int2(gid.xy) * 8 - 1;
 
-    // Step A: Load 12x12 tile (covering 8x8 interior + 2px halo for zero-seam DW1+DW2), run 20-ch Stem -> s_feat
-    [unroll]
-    for (uint passIdx = 0u; passIdx < 3u; ++passIdx)
+    // Step A: Load 10x10 tile ([loop] prevents DXIL register bloat!) -> 20-ch Stem -> s_feat
+    [loop]
+    for (uint passIdx = 0u; passIdx < 2u; ++passIdx)
     {
         uint idx = tid + passIdx * 64u;
-        if (idx < 144u)
+        if (idx < 100u)
         {
-            int ly = int(idx / 12u);
-            int lx = int(idx % 12u);
-            int2 p8 = Clamp8(tileOrigin12 + int2(lx, ly));
+            int ly = int(idx / 10u);
+            int lx = int(idx % 10u);
+            int2 p8 = Clamp8(tileOrigin10 + int2(lx, ly));
             float2 uv8 = (float2(p8) + 0.5f) / float2(max(EighthWidth, 1), max(EighthHeight, 1));
 
             float4 cd8 = PyramidMip1Tex.Load(int3(p8, 0));
@@ -400,7 +372,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
                                 uv8.y * 2.0f - 1.0f);
 
             min16float4 h0[8];
-            [unroll]
+            [loop]
             for (int og = 0; og < 8; ++og)
             {
                 float4 acc = ModelWeightsBuf[OFF_B_STEM + og];
@@ -426,97 +398,81 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Step B: Block 1 on 10x10 tile (interior 8x8 + 1px halo for zero-seam Block 2 DW2) -> s_h1[10][10]
+    // Step B: Block 1 on 8x8 interior (exact 3x3 DW1 with 1px halo -> PW1a 32->48 -> PW1b 48->32 + skip)
+    int lx = int(gtid.x) + 1;
+    int ly = int(gtid.y) + 1;
+
+    min16float4 h0Center[8];
+    UnpackFeat32(ly, lx, h0Center);
+
+    min16float4 dw1[8];
     [unroll]
-    for (uint passB = 0u; passB < 2u; ++passB)
+    for (int og = 0; og < 8; ++og)
+        dw1[og] = min16float4(ModelWeightsBuf[OFF_B_DW1 + og]);
+
+    [loop]
+    for (int dy = -1; dy <= 1; ++dy)
     {
-        uint idx = tid + passB * 64u;
-        if (idx < 100u)
+        [loop]
+        for (int dx = -1; dx <= 1; ++dx)
         {
-            int by = int(idx / 10u);
-            int bx = int(idx % 10u);
-            int fy = by + 1;
-            int fx = bx + 1;
-
-            min16float4 h0Center[8];
-            UnpackFeat32(fy, fx, h0Center);
-
-            min16float4 dw1[8];
+            uint tap = uint((dy + 1) * 3 + (dx + 1));
+            min16float4 nVec[8];
+            UnpackFeat32(ly + dy, lx + dx, nVec);
             [unroll]
             for (int og = 0; og < 8; ++og)
-                dw1[og] = min16float4(ModelWeightsBuf[OFF_B_DW1 + og]);
-
-            [unroll]
-            for (int dy = -1; dy <= 1; ++dy)
-            {
-                [unroll]
-                for (int dx = -1; dx <= 1; ++dx)
-                {
-                    uint tap = uint((dy + 1) * 3 + (dx + 1));
-                    min16float4 nVec[8];
-                    UnpackFeat32(fy + dy, fx + dx, nVec);
-                    [unroll]
-                    for (int og = 0; og < 8; ++og)
-                        dw1[og] += nVec[og] * min16float4(ModelWeightsBuf[OFF_W_DW1 + tap * 8u + og]);
-                }
-            }
-
-            min16float4 pw1a[16];
-            [unroll]
-            for (int og = 0; og < 16; ++og)
-            {
-                min16float4 acc = min16float4(ModelWeightsBuf[OFF_B_PW1A + og]);
-                uint baseW = OFF_W_PW1A + uint(og) * 32u;
-                [unroll]
-                for (int c = 0; c < 4; ++c)
-                {
-                    uint wIdx = baseW + uint(c) * 8u;
-                    min16float s = min16float(0.0f);
-                    [unroll]
-                    for (int k = 0; k < 8; ++k)
-                        s += dot(min16float4(ModelWeightsBuf[wIdx + k]), dw1[k]);
-                    if (c == 0) acc.x += s;
-                    else if (c == 1) acc.y += s;
-                    else if (c == 2) acc.z += s;
-                    else acc.w += s;
-                }
-                pw1a[og] = SiLU4H(acc);
-            }
-
-            min16float4 h1[8];
-            [unroll]
-            for (int og = 0; og < 8; ++og)
-            {
-                min16float4 acc = min16float4(ModelWeightsBuf[OFF_B_PW1B + og]) + h0Center[og];
-                uint baseW = OFF_W_PW1B + uint(og) * 64u;
-                [unroll]
-                for (int c = 0; c < 4; ++c)
-                {
-                    uint wIdx = baseW + uint(c) * 16u;
-                    min16float s = min16float(0.0f);
-                    [unroll]
-                    for (int k = 0; k < 16; ++k)
-                        s += dot(min16float4(ModelWeightsBuf[wIdx + k]), pw1a[k]);
-                    if (c == 0) acc.x += s;
-                    else if (c == 1) acc.y += s;
-                    else if (c == 2) acc.z += s;
-                    else acc.w += s;
-                }
-                h1[og] = acc;
-            }
-
-            PackH1_32(by, bx, h1);
-            if (by >= 1 && by <= 8 && bx >= 1 && bx <= 8)
-            {
-                uint innerTid = uint((by - 1) * 8 + (bx - 1));
-                s_globalPool[innerTid][0] = float4(h1[0]);
-                s_globalPool[innerTid][1] = float4(h1[1]);
-            }
+                dw1[og] += nVec[og] * min16float4(ModelWeightsBuf[OFF_W_DW1 + tap * 8u + og]);
         }
     }
+
+    min16float4 pw1a[12];
+    [loop]
+    for (int og = 0; og < 12; ++og)
+    {
+        min16float4 acc = min16float4(ModelWeightsBuf[OFF_B_PW1A + og]);
+        uint baseW = OFF_W_PW1A + uint(og) * 32u;
+        [unroll]
+        for (int c = 0; c < 4; ++c)
+        {
+            uint wIdx = baseW + uint(c) * 8u;
+            min16float s = min16float(0.0f);
+            [unroll]
+            for (int k = 0; k < 8; ++k)
+                s += dot(min16float4(ModelWeightsBuf[wIdx + k]), dw1[k]);
+            if (c == 0) acc.x += s;
+            else if (c == 1) acc.y += s;
+            else if (c == 2) acc.z += s;
+            else acc.w += s;
+        }
+        pw1a[og] = SiLU4H(acc);
+    }
+
+    min16float4 h1[8];
+    [loop]
+    for (int og = 0; og < 8; ++og)
+    {
+        min16float4 acc = min16float4(ModelWeightsBuf[OFF_B_PW1B + og]) + h0Center[og];
+        uint baseW = OFF_W_PW1B + uint(og) * 48u;
+        [unroll]
+        for (int c = 0; c < 4; ++c)
+        {
+            uint wIdx = baseW + uint(c) * 12u;
+            min16float s = min16float(0.0f);
+            [unroll]
+            for (int k = 0; k < 12; ++k)
+                s += dot(min16float4(ModelWeightsBuf[wIdx + k]), pw1a[k]);
+            if (c == 0) acc.x += s;
+            else if (c == 1) acc.y += s;
+            else if (c == 2) acc.z += s;
+            else acc.w += s;
+        }
+        h1[og] = acc;
+    }
+
+    s_globalPool[tid][0] = float4(h1[0]);
+    s_globalPool[tid][1] = float4(h1[1]);
     GroupMemoryBarrierWithGroupSync();
 
-    // Parallel reduce g[2] across 8x8 interior
     [unroll]
     for (uint s = 32u; s > 0u; s >>= 1u)
     {
@@ -531,38 +487,13 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     min16float4 g0 = min16float4(s_globalPool[0][0] / 64.0f);
     min16float4 g1 = min16float4(s_globalPool[0][1] / 64.0f);
 
-    // Step C: Block 2 on 8x8 interior (exact 3x3 DW2 with 1px halo in s_h1, ZERO tile edge clamping!)
-    int h1y = int(gtid.y) + 1;
-    int h1x = int(gtid.x) + 1;
-    min16float4 h1Center[8];
-    UnpackH1_32(h1y, h1x, h1Center);
-
-    min16float4 dw2[8];
-    [unroll]
+    // Step C: Global-Context Residual Block 2 (40 -> 32 + skip, zero spatial clamping!)
+    float4 h2[8];
+    [loop]
     for (int og = 0; og < 8; ++og)
-        dw2[og] = min16float4(ModelWeightsBuf[OFF_B_DW2 + og]);
-
-    [unroll]
-    for (int dy = -1; dy <= 1; ++dy)
     {
-        [unroll]
-        for (int dx = -1; dx <= 1; ++dx)
-        {
-            uint tap = uint((dy + 1) * 3 + (dx + 1));
-            min16float4 nVec[8];
-            UnpackH1_32(h1y + dy, h1x + dx, nVec);
-            [unroll]
-            for (int og = 0; og < 8; ++og)
-                dw2[og] += nVec[og] * min16float4(ModelWeightsBuf[OFF_W_DW2 + tap * 8u + og]);
-        }
-    }
-
-    min16float4 pw2a[16];
-    [unroll]
-    for (int og = 0; og < 16; ++og)
-    {
-        min16float4 acc = min16float4(ModelWeightsBuf[OFF_B_PW2A + og]);
-        uint baseW = OFF_W_PW2A + uint(og) * 40u;
+        min16float4 acc = min16float4(ModelWeightsBuf[OFF_B_PW2 + og]);
+        uint baseW = OFF_W_PW2 + uint(og) * 40u;
         [unroll]
         for (int c = 0; c < 4; ++c)
         {
@@ -571,35 +502,14 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
                          + dot(min16float4(ModelWeightsBuf[wIdx + 9u]), g1);
             [unroll]
             for (int k = 0; k < 8; ++k)
-                s += dot(min16float4(ModelWeightsBuf[wIdx + k]), dw2[k]);
+                s += dot(min16float4(ModelWeightsBuf[wIdx + k]), h1[k]);
             if (c == 0) acc.x += s;
             else if (c == 1) acc.y += s;
             else if (c == 2) acc.z += s;
             else acc.w += s;
         }
-        pw2a[og] = SiLU4H(acc);
-    }
-
-    float4 h2[8];
-    [unroll]
-    for (int og = 0; og < 8; ++og)
-    {
-        min16float4 acc = min16float4(ModelWeightsBuf[OFF_B_PW2B + og]) + h1Center[og];
-        uint baseW = OFF_W_PW2B + uint(og) * 64u;
-        [unroll]
-        for (int c = 0; c < 4; ++c)
-        {
-            uint wIdx = baseW + uint(c) * 16u;
-            min16float s = min16float(0.0f);
-            [unroll]
-            for (int k = 0; k < 16; ++k)
-                s += dot(min16float4(ModelWeightsBuf[wIdx + k]), pw2a[k]);
-            if (c == 0) acc.x += s;
-            else if (c == 1) acc.y += s;
-            else if (c == 2) acc.z += s;
-            else acc.w += s;
-        }
-        h2[og] = float4(acc);
+        min16float4 res = SiLU4H(acc) + h1[og];
+        h2[og] = float4(res);
         s_h2Pool[tid][og] = h2[og];
     }
 
@@ -608,7 +518,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     if (coord8.x < EighthWidth && coord8.y < EighthHeight)
     {
         float4 logits[4];
-        [unroll]
+        [loop]
         for (int og = 0; og < 4; ++og)
         {
             float4 acc = ModelWeightsBuf[OFF_B_MAT + og];
@@ -632,7 +542,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float4 sig0 = rcp(1.0f + exp(-logits[0]));
         float4 sig1 = rcp(1.0f + exp(-logits[1]));
 
-        // 6-class semantic softmax over channels 7..12: logits[1].w, logits[2].x, y, z, w, logits[3].x
         float s0 = logits[1].w; // skin
         float s1 = logits[2].x; // fabric
         float s2 = logits[2].y; // sand
@@ -648,15 +557,9 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float e5 = exp(s5 - sMax);
         float invSum = rcp(max(e0 + e1 + e2 + e3 + e4 + e5, 1e-6f));
 
-        float pSkin   = e0 * invSum;
-        float pFabric = e1 * invSum;
-        float pSand   = e2 * invSum;
-        float pSoil   = e3 * invSum;
-        float pGrass  = e4 * invSum;
-
-        float4 mat0 = sig0;                                       // albedo.rgb, directMask
-        float4 mat1 = float4(sig1.x, sig1.y, sig1.z, pSkin);      // roughness, metallic, wetness, skinProb
-        float4 mat2 = float4(pFabric, pSand, pSoil, pGrass);      // fabricProb, sandProb, soilProb, grassProb
+        float4 mat0 = sig0;
+        float4 mat1 = float4(sig1.x, sig1.y, sig1.z, e0 * invSum);
+        float4 mat2 = float4(e1 * invSum, e2 * invSum, e3 * invSum, e4 * invSum);
 
         float2 uv = (float2(coord8) + 0.5f) / float2(max(EighthWidth, 1), max(EighthHeight, 1));
         int activeW = (DisplaySizeMV > 0) ? OutputWidth : RenderWidth;
@@ -680,7 +583,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             mat1.w = lerp(prevM1.w, mat1.w, alphaSem);
             mat2 = lerp(prevM2, mat2, alphaSem);
 
-            // Re-normalize semantic probabilities if sum exceeds 1.0
             float semSum = mat1.w + mat2.x + mat2.y + mat2.z + mat2.w;
             if (semSum > 1.0f)
             {
@@ -697,15 +599,15 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     GroupMemoryBarrierWithGroupSync();
 
-    // Step E: Pool h2[8] across 8x8 tile -> threads 0..7 emit Bilateral Grid + temporal smoothing!
+    // Step E: Pool h2[8] across 8x8 tile -> threads 0..7 emit Bilateral Grid + temporal smoothing
     [unroll]
-    for (uint s = 32u; s > 0u; s >>= 1u)
+    for (uint s2 = 32u; s2 > 0u; s2 >>= 1u)
     {
-        if (tid < s)
+        if (tid < s2)
         {
             [unroll]
             for (int k = 0; k < 8; ++k)
-                s_h2Pool[tid][k] += s_h2Pool[tid + s][k];
+                s_h2Pool[tid][k] += s_h2Pool[tid + s2][k];
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -720,9 +622,9 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float lz = float(tid) / 7.0f;
         min16float4 lumaEmbed = min16float4(lz, 2.0f * lz - 1.0f, sin(kPi * lz), cos(kPi * lz));
 
-        min16float4 bg1[8];
-        [unroll]
-        for (int og = 0; og < 8; ++og)
+        min16float4 bg1[6];
+        [loop]
+        for (int og = 0; og < 6; ++og)
         {
             min16float4 acc = min16float4(ModelWeightsBuf[OFF_B_BG1 + og]);
             uint baseW = OFF_W_BG1 + uint(og) * 44u;
@@ -745,18 +647,18 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         }
 
         float4 bgOut[3];
-        [unroll]
+        [loop]
         for (int og = 0; og < 3; ++og)
         {
             float4 acc = ModelWeightsBuf[OFF_B_BG2 + og];
-            uint baseW = OFF_W_BG2 + uint(og) * 32u;
+            uint baseW = OFF_W_BG2 + uint(og) * 24u;
             [unroll]
             for (int c = 0; c < 4; ++c)
             {
-                uint wIdx = baseW + uint(c) * 8u;
+                uint wIdx = baseW + uint(c) * 6u;
                 min16float s = min16float(0.0f);
                 [unroll]
-                for (int k = 0; k < 8; ++k)
+                for (int k = 0; k < 6; ++k)
                     s += dot(min16float4(ModelWeightsBuf[wIdx + k]), bg1[k]);
                 if (c == 0) acc.x += float(s);
                 else if (c == 1) acc.y += float(s);

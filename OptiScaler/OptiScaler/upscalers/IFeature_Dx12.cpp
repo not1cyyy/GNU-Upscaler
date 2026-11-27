@@ -100,7 +100,7 @@ RcasConstants IFeature_Dx12::BuildRcasConstants(NVSDK_NGX_Parameter* InParameter
     return rcasConstants;
 }
 
-NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters, bool fuseRcas)
+NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters)
 {
     NeuralLookConstants nlConstants {};
 
@@ -121,6 +121,8 @@ NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter*
         nlConstants.RenderHeight = subH;
     }
 
+    InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, &nlConstants.ColorSubrectBaseX);
+    InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y, &nlConstants.ColorSubrectBaseY);
     InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &nlConstants.DepthSubrectBaseX);
     InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &nlConstants.DepthSubrectBaseY);
     InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, &nlConstants.MvSubrectBaseX);
@@ -136,18 +138,13 @@ NeuralLookConstants IFeature_Dx12::BuildNeuralLookConstants(NVSDK_NGX_Parameter*
         nlConstants.PreExposure = preExposure;
     }
 
+    nlConstants.PreUpscale = true;
     nlConstants.LowResMV = LowResMV();
     nlConstants.DepthIsLinear = DepthLinear();
     nlConstants.DepthIsReversed = DepthInverted();
     nlConstants.IsHdr =
         IsHdr() || State::Instance().hdrOutputActive || State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
-
-    if (fuseRcas)
-    {
-        nlConstants.FusedRcasSharpness = _actualSharpness.value_or(_sharpness);
-        _sharpness = _actualSharpness.value_or(_sharpness);
-        _actualSharpness.reset();
-    }
+    nlConstants.FusedRcasSharpness = 0.0f;
 
     InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &nlConstants.MvScaleX);
     InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &nlConstants.MvScaleY);
@@ -219,21 +216,6 @@ bool IFeature_Dx12::ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const
         }
     }
 
-    if (passes.runNeuralLook && NeuralLook != nullptr)
-    {
-        NeuralLook->SetBufferState(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-        if (!NeuralLook->Dispatch(cmdList, passes.nlInput, passes.paramMotion, passes.paramDepth, passes.nlConstants,
-                                  passes.nlOutput, passes.paramGBufferNormals, passes.paramGBufferAlbedo,
-                                  passes.paramGBufferRoughness, passes.paramGBufferMetallic,
-                                  passes.paramGBufferSubsurface, passes.paramReactiveMask,
-                                  passes.paramTransparencyMask, passes.paramExposure))
-        {
-            Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
-            return false;
-        }
-    }
-
     if (passes.runRcas)
     {
         RCAS->SetBufferState(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -280,8 +262,6 @@ bool IFeature_Dx12::BeginPendingPostPassesAsync(ID3D12CommandQueue* directQueue)
         // Unsubmitted compute recording may have mutated CPU-side _bufferState before failing
         if (passes.runOutputScaler && OutputScaler)
             OutputScaler->RestoreBufferState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (passes.runNeuralLook && NeuralLook)
-            NeuralLook->RestoreBufferState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (passes.runRcas && RCAS)
             RCAS->RestoreBufferState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (passes.runMagnifier && Magnifier)
@@ -359,6 +339,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     if (!OutputScaler->IsInit())
         useOutputScaling = false;
 
+    ID3D12Resource* paramColor = nullptr;
     ID3D12Resource* paramOutput = nullptr;
     ID3D12Resource* paramMotion = nullptr;
     ID3D12Resource* paramDepth = nullptr;
@@ -371,6 +352,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     ID3D12Resource* paramTransparencyMask = nullptr;
     ID3D12Resource* paramExposure = nullptr;
 
+    InParameters->Get(NVSDK_NGX_Parameter_Color, &paramColor);
     InParameters->Get(NVSDK_NGX_Parameter_Output, &paramOutput);
     InParameters->Get(NVSDK_NGX_Parameter_MotionVectors, &paramMotion);
     InParameters->Get(NVSDK_NGX_Parameter_Depth, &paramDepth);
@@ -389,12 +371,8 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     }
 
     const bool useNeuralLook = Config::Instance()->NeuralLookEnabled.value_or_default() && NeuralLook != nullptr &&
-                               NeuralLook->IsInit() && paramDepth != nullptr && paramMotion != nullptr;
-
-    const bool fuseRcasIntoNeuralLook =
-        useNeuralLook && useRcas && Config::Instance()->SharpnessShader.value_or_default() == SharpenShader::RCAS &&
-        !Config::Instance()->MotionSharpnessEnabled.value_or_default() &&
-        !Config::Instance()->MotionSharpnessDebug.value_or_default();
+                               NeuralLook->IsInit() && paramColor != nullptr && paramDepth != nullptr &&
+                               paramMotion != nullptr;
 
     // Order is important as that's the order of shader dispatch
     struct PostPass
@@ -404,17 +382,14 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
         ID3D12Resource* outputBuffer = nullptr;
     };
 
-    std::array<PostPass, 4> pipeline {};
+    std::array<PostPass, 3> pipeline {};
     size_t passCount = 0;
 
     if (useOutputScaling)
         pipeline[passCount++].stage = PostPassStage::OutputScaling;
 
-    if (useNeuralLook)
-        pipeline[passCount++].stage = PostPassStage::NeuralLook;
-
     _actualSharpness.reset();
-    if (useRcas && !fuseRcasIntoNeuralLook)
+    if (useRcas)
         pipeline[passCount++].stage = PostPassStage::Rcas;
 
     if (Magnifier->ShouldRun())
@@ -440,23 +415,6 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
             {
                 OutputScaler->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 requiredInput = OutputScaler->Buffer();
-            }
-            break;
-
-        case PostPassStage::NeuralLook:
-            if (paramMotion && paramDepth && paramOutput &&
-                NeuralLook->CreateBufferResource(Device, currentTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
-                NeuralLook->CanRender())
-            {
-                if (fuseRcasIntoNeuralLook)
-                {
-                    InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
-                    _actualSharpness = _sharpness;
-                    _sharpness = 0.0f;
-                }
-
-                NeuralLook->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                requiredInput = NeuralLook->Buffer();
             }
             break;
 
@@ -496,6 +454,83 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
         }
     }
 
+    // Run 3D Neural Look PRE-UPSCALE on exact 1:1 jittered render-res Color + Depth + MV
+    bool neuralLookSwappedColor = false;
+    if (useNeuralLook && NeuralLook->CanRender())
+    {
+        const bool applyManualBarriers = (upscaler != Upscaler::DLSS && upscaler != Upscaler::DLSSD);
+        const std::optional<int32_t> colorBarrier =
+            applyManualBarriers ? Config::Instance()->ColorResourceBarrier : std::nullopt;
+        const std::optional<int32_t> depthBarrier =
+            applyManualBarriers ? Config::Instance()->DepthResourceBarrier : std::nullopt;
+        const std::optional<int32_t> mvBarrier =
+            applyManualBarriers ? Config::Instance()->MVResourceBarrier : std::nullopt;
+        const std::optional<int32_t> maskBarrier =
+            applyManualBarriers ? Config::Instance()->MaskResourceBarrier : std::nullopt;
+        const std::optional<int32_t> expBarrier =
+            applyManualBarriers ? Config::Instance()->ExposureResourceBarrier : std::nullopt;
+
+        const D3D12_RESOURCE_STATES nlInitialState = colorBarrier.has_value()
+                                                         ? static_cast<D3D12_RESOURCE_STATES>(colorBarrier.value())
+                                                         : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+        if (NeuralLook->CreateBufferResource(Device, paramColor, nlInitialState))
+        {
+            auto pushBarrier = [&](ID3D12Resource* res, const std::optional<int32_t>& entryState,
+                                   std::vector<D3D12_RESOURCE_BARRIER>& list, bool toSrv)
+            {
+                if (res == nullptr || !entryState.has_value())
+                    return;
+                const auto s = static_cast<D3D12_RESOURCE_STATES>(entryState.value());
+                if (s == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+                    return;
+                D3D12_RESOURCE_BARRIER b {};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = res;
+                b.Transition.StateBefore = toSrv ? s : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                b.Transition.StateAfter = toSrv ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : s;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                list.push_back(b);
+            };
+
+            std::vector<D3D12_RESOURCE_BARRIER> preBarriers;
+            pushBarrier(paramColor, colorBarrier, preBarriers, true);
+            pushBarrier(paramDepth, depthBarrier, preBarriers, true);
+            pushBarrier(paramMotion, mvBarrier, preBarriers, true);
+            pushBarrier(paramReactiveMask, maskBarrier, preBarriers, true);
+            pushBarrier(paramExposure, expBarrier, preBarriers, true);
+            if (!preBarriers.empty())
+                InCommandList->ResourceBarrier(static_cast<UINT>(preBarriers.size()), preBarriers.data());
+
+            NeuralLook->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            const NeuralLookConstants nlConstants = BuildNeuralLookConstants(InParameters);
+
+            if (NeuralLook->Dispatch(InCommandList, paramColor, paramMotion, paramDepth, nlConstants,
+                                     NeuralLook->Buffer(), paramGBufferNormals, paramGBufferAlbedo,
+                                     paramGBufferRoughness, paramGBufferMetallic, paramGBufferSubsurface,
+                                     paramReactiveMask, paramTransparencyMask, paramExposure))
+            {
+                NeuralLook->SetBufferState(InCommandList, nlInitialState);
+                InParameters->Set(NVSDK_NGX_Parameter_Color, NeuralLook->Buffer());
+                neuralLookSwappedColor = true;
+            }
+            else
+            {
+                NeuralLook->SetBufferState(InCommandList, nlInitialState);
+                Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
+            }
+
+            std::vector<D3D12_RESOURCE_BARRIER> postBarriers;
+            pushBarrier(paramColor, colorBarrier, postBarriers, false);
+            pushBarrier(paramDepth, depthBarrier, postBarriers, false);
+            pushBarrier(paramMotion, mvBarrier, postBarriers, false);
+            pushBarrier(paramReactiveMask, maskBarrier, postBarriers, false);
+            pushBarrier(paramExposure, expBarrier, postBarriers, false);
+            if (!postBarriers.empty())
+                InCommandList->ResourceBarrier(static_cast<UINT>(postBarriers.size()), postBarriers.data());
+        }
+    }
+
     // Upscaler will write to the first active shader, or just output
     InParameters->Set(NVSDK_NGX_Parameter_Output, currentTarget);
 
@@ -514,6 +549,9 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     auto evalResult = EvaluateInternal(InCommandList, InParameters);
 
     UpscalerTime->End(InCommandList);
+
+    if (neuralLookSwappedColor)
+        InParameters->Set(NVSDK_NGX_Parameter_Color, paramColor);
 
     InParameters->Set(NVSDK_NGX_Parameter_Output, paramOutput);
 
@@ -553,25 +591,6 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
                     pending.runOutputScaler = true;
                     pending.osInput = pass.inputBuffer;
                     pending.osOutput = pass.outputBuffer;
-                    pending.active = true;
-                }
-                break;
-
-            case PostPassStage::NeuralLook:
-                if (NeuralLook && NeuralLook->CanRender() && paramMotion && paramDepth && paramOutput)
-                {
-                    pending.runNeuralLook = true;
-                    pending.nlInput = pass.inputBuffer;
-                    pending.nlOutput = pass.outputBuffer;
-                    pending.paramGBufferNormals = paramGBufferNormals;
-                    pending.paramGBufferAlbedo = paramGBufferAlbedo;
-                    pending.paramGBufferRoughness = paramGBufferRoughness;
-                    pending.paramGBufferMetallic = paramGBufferMetallic;
-                    pending.paramGBufferSubsurface = paramGBufferSubsurface;
-                    pending.paramReactiveMask = paramReactiveMask;
-                    pending.paramTransparencyMask = paramTransparencyMask;
-                    pending.paramExposure = paramExposure;
-                    pending.nlConstants = BuildNeuralLookConstants(InParameters, fuseRcasIntoNeuralLook);
                     pending.active = true;
                 }
                 break;
@@ -626,23 +645,6 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
                 Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
                 State::Instance().changeBackend[Handle()->Id] = true;
                 ok = false;
-            }
-            break;
-
-        case PostPassStage::NeuralLook:
-            if (NeuralLook && NeuralLook->CanRender() && paramMotion && paramDepth && paramOutput)
-            {
-                NeuralLook->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                const NeuralLookConstants nlConstants = BuildNeuralLookConstants(InParameters, fuseRcasIntoNeuralLook);
-
-                if (!NeuralLook->Dispatch(InCommandList, pass.inputBuffer, paramMotion, paramDepth, nlConstants,
-                                          pass.outputBuffer, paramGBufferNormals, paramGBufferAlbedo,
-                                          paramGBufferRoughness, paramGBufferMetallic, paramGBufferSubsurface,
-                                          paramReactiveMask, paramTransparencyMask, paramExposure))
-                {
-                    Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
-                    ok = false;
-                }
             }
             break;
 

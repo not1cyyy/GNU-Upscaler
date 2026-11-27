@@ -188,15 +188,11 @@ float3 QueryFallbackRadiance(float3 viewPos, float3 rayDirView, float rayDist, f
     float3 rayDir = (HasCameraBasis > 0) ? ViewToWorldDir(rayDirView, CameraRight, CameraUp, CameraFwd) : rayDirView;
     if (WorldHashEnabled > 0 && HasCameraBasis > 0)
     {
-        float3 probeView = viewPos + rayDirView * rayDist;
-        float3 probeWorld = ViewToWorldPos(probeView, CameraPos, CameraRight, CameraUp, CameraFwd);
-        float3 upRef = (abs(rayDir.y) < 0.9f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-        float3 tU = normalize(cross(upRef, rayDir));
-        float3 tV = cross(rayDir, tU);
-        float3 hashRad;
-        if (LookupWorldHashJittered(WorldHashBuf, probeWorld, -rayDir, max(viewPos.z, 1.0f), FrameIndex,
-                                    jitter2, tU, tV, hashRad))
-            return hashRad;
+        float3 worldOrigin = ViewToWorldPos(viewPos, CameraPos, CameraRight, CameraUp, CameraFwd);
+        float3 hitWorld = worldOrigin + rayDir * rayDist;
+        float3 rad;
+        if (LookupWorldHash(WorldHashBuf, hitWorld, -rayDir, rayDist, FrameIndex, rad))
+            return rad;
     }
     return EvalSceneSH(rayDir);
 }
@@ -244,7 +240,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float soilProb = saturate(mat2.z);
     float grassProb = saturate(mat2.w);
 
-    // Fixed MV coordinate & scaling (handles LowResMV + subrect)
+    // Motion vector lookup aligned 1:1 with active image space (pre-upscale = RenderWidth/Height)
     int activeW = (DisplaySizeMV > 0) ? OutputWidth : RenderWidth;
     int activeH = (DisplaySizeMV > 0) ? OutputHeight : RenderHeight;
     int2 mvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeW, activeH)));
@@ -255,7 +251,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     bool inBounds = (ResetHistory == 0 && FrameIndex > 3 && all(prevUv >= 0.002f) && all(prevUv <= 0.998f));
 
-    // 2x2 Depth + Normal Bilateral Temporal Reprojection (zero bilinear silhouette smear!)
+    // 2x2 Depth + Normal Bilateral Temporal Reprojection
     bool validHistory = false;
     float4 prevGi = float4(0.0f, 0.0f, 0.0f, 1.0f);
     float4 prevMeta = float4(1.0f, 0.25f, 0.0f, 1.0f);
@@ -310,7 +306,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float3 viewDir = normalize(centerPos);
     float3 toEye = -viewDir;
 
-    // R2 quasirandom spatiotemporal blue-noise sequence (no 16-frame periodic crawl)
+    // R2 quasirandom spatiotemporal blue-noise sequence
     float2 r2 = R2Sequence(uint(FrameIndex));
     float noiseA = frac(InterleavedGradientNoise(float2(giCoord)) + r2.x);
     float noiseB = frac(InterleavedGradientNoise(float2(giCoord) * 1.37f + float2(13.0f, 29.0f)) + r2.y);
@@ -318,21 +314,21 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float maxRadiusPx = max(GiRadius, 24.0f);
     float2 invOutSize = 1.0f / float2(OutputWidth, OutputHeight);
 
-    int slices = clamp(RayCount, 1, 4);
-    int steps = clamp(StepCount, 3, 8);
+    int slices = clamp(RayCount, 1, 2);
+    int steps = clamp(StepCount, 3, 6);
     float tightRange = clamp(centerDepth * 0.08f, 0.25f, 1.35f);
     float broadRange = clamp(centerDepth * 0.24f, 0.90f, 4.5f);
     float aoThickness = clamp(centerDepth * 0.024f, 0.04f, 0.32f);
     float maxFgGap = clamp(centerDepth * 0.055f, 0.14f, 0.85f);
     float maxBroadGap = clamp(centerDepth * 0.10f, 0.30f, 1.60f);
-    float giWorldRange = clamp(centerDepth * 0.48f, 2.5f, 13.0f);
+    float giWorldRange = clamp(centerDepth * 0.45f, 2.5f, 12.0f);
 
     float3 accumGi = float3(0.0f, 0.0f, 0.0f);
     float accumAo = 0.0f;
     float3 bentNormalAccum = float3(0.0f, 0.0f, 0.0f);
     float3 giDirAccum = float3(0.0f, 0.0f, 0.0f);
 
-    // 1. Dual-Scale Multi-Bounce GTAO + Bent Normal + Directional Chromatic SSGI
+    // 1. Dual-Scale Multi-Bounce GTAO + Bent Normal + Natural-Chroma SSGI
     [loop]
     for (int r = 0; r < slices; ++r)
     {
@@ -372,7 +368,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 if (any(sampleUv < 0.002f) || any(sampleUv > 0.998f))
                 {
                     float3 exitDir = normalize(lerp(viewNormal, float3(marchDirPx.x, -marchDirPx.y, -0.3f), 0.55f));
-                    float3 fb = QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f, float2(noiseA, noiseB)) * 0.08f;
+                    float3 fb = QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f, float2(noiseA, noiseB)) * 0.06f;
                     sliceGi += fb;
                     giDirAccum += exitDir * Luma(fb);
                     break;
@@ -392,7 +388,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 float dist = sqrt(distSq);
                 float3 frontDir = deltaFront / dist;
 
-                // Band 1: Dual-Scale Visibility-Bitmask AO + Directional Occlusion for Bent Normals
+                // Dual-Scale Visibility-Bitmask AO + Directional Occlusion for Bent Normals
                 float fgGap = centerDepth - sampleDepth;
                 if (fgGap <= maxBroadGap && dist < broadRange)
                 {
@@ -444,7 +440,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     }
                 }
 
-                // Band 2: Strict Front-Hemisphere Chromatic Bounce GI with Depth-Validated Mip Lookup
+                // Natural-Chroma Front-Hemisphere SSGI (restored saturation balance for bright sand & foliage)
                 float fgStep = max(centerDepth - sampleDepth, 0.0f);
                 float fgReject = 1.0f - smoothstep(clamp(centerDepth * 0.12f, 0.22f, 1.2f),
                                                    clamp(centerDepth * 0.30f, 0.55f, 3.0f), fgStep);
@@ -453,8 +449,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     float nDotL = saturate(dot(viewNormal, frontDir) - 0.02f);
                     float2 sNxy = clamp(HalfNormalTex.Load(int3(sGiCoord, 0)).xy, -1.0f, 1.0f);
                     float3 sNorm = float3(sNxy, -sqrt(max(0.0f, 1.0f - dot(sNxy, sNxy))));
-                    float emitterDot = dot(sNorm, -frontDir);
-                    float emitterFace = smoothstep(-0.12f, 0.85f, emitterDot);
+                    float emitterFace = smoothstep(-0.12f, 0.85f, dot(sNorm, -frontDir));
 
                     if (nDotL > 0.0f && emitterFace > 0.01f)
                     {
@@ -463,21 +458,19 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                         float3 sampleColor = (abs(pyrSample.a - sampleDepth) <= max(sampleDepth * 0.20f, 0.10f))
                                                  ? pyrSample.rgb
                                                  : HalfColorDepthTex.Load(int3(sGiCoord, 0)).rgb;
-                        sampleColor = clamp(sampleColor, 0.0f, 6.0f);
+                        sampleColor = clamp(sampleColor, 0.0f, 4.5f);
 
                         float hitLuma = Luma(sampleColor);
-                        float hitChroma = max(sampleColor.r, max(sampleColor.g, sampleColor.b)) -
-                                          min(sampleColor.r, min(sampleColor.g, sampleColor.b));
-
-                        float lightSignal = smoothstep(0.14f, 0.55f, hitLuma + hitChroma * 0.50f);
-                        float emitterBoost = 1.0f + smoothstep(0.45f, 1.60f, hitLuma) * 1.85f + hitChroma * 0.90f;
-                        float3 hitCol = max(lerp(hitLuma.xxx, sampleColor, 1.30f), 0.0f);
+                        float lightSignal = smoothstep(0.12f, 0.58f, hitLuma);
+                        float emitterBoost = 1.0f + smoothstep(0.55f, 1.80f, hitLuma) * 1.15f;
+                        // Slightly restrain bounce chroma (0.88) instead of amplifying it -> zero neon sand/grass
+                        float3 hitCol = max(lerp(hitLuma.xxx, sampleColor, 0.88f), 0.0f);
 
                         float normD = dist / max(giWorldRange * 0.38f, 0.5f);
                         float giAtten = rcp(1.0f + normD * normD) * pow(1.0f - saturate(dist / giWorldRange), 1.25f);
 
                         float3 hitContrib = hitCol * nDotL * emitterFace * lightSignal * emitterBoost * giAtten *
-                                            fgReject * (2.60f / float(steps));
+                                            fgReject * (2.10f / float(steps));
                         sliceGi += hitContrib;
                         giDirAccum += frontDir * Luma(hitContrib);
                     }
@@ -508,7 +501,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     float3 giDir = (dot(giDirAccum, giDirAccum) > 1e-6f) ? normalize(giDirAccum) : bentNormal;
 
-    // 2. Soft-Penumbra Ray-Marched Contact Shadows toward Dominant Key Light (suppressed on grass)
+    // 2. Soft-Penumbra Ray-Marched Contact Shadows toward Dominant Key Light
     float contactShadow = 1.0f;
     float4 keyDirData = ResolvedSceneLightBuf[4];
     float3 keyDirView = normalize(keyDirData.xyz);
@@ -516,7 +509,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float nDotKey = dot(viewNormal, keyDirView);
     if (nDotKey > 0.02f && keyStrength > 0.05f)
     {
-        int cSteps = clamp(int(ContactShadowSteps), 2, 8);
+        int cSteps = clamp(int(ContactShadowSteps), 2, 6);
         float maxShadowDist = clamp(centerDepth * 0.065f, 0.08f, 1.80f);
         float occ = 0.0f;
         float invTanV = rcp(max(TanHalfFov, 1e-4f));
@@ -547,22 +540,22 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         }
         float csDistFade = rcp(1.0f + centerDepth * 0.022f);
         float grassDamp = 1.0f - grassProb * 0.65f;
-        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * grassDamp * 0.82f);
+        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * grassDamp * 0.80f);
     }
 
-    // 3. True Hi-Z Mip-Skipping + Stochastic GGX Roughness-Cone SSR
+    // 3. Warp-Coherent Fixed-Stride SSR + 2-Step Binary Refinement (zero divergent Hi-Z branching)
     float effRoughness = lerp(roughness, 0.14f, soilProb * wetness);
     float4 currentSsr = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float ssrHitDist = centerDepth * 0.5f;
     float2 ssrHitUv = uv;
 
-    if (SsrEnabled > 0 && effRoughness < 0.85f && !(fabricProb > 0.72f && effRoughness > 0.72f))
+    if (SsrEnabled > 0 && effRoughness < 0.80f && !(fabricProb > 0.65f && effRoughness > 0.65f))
     {
         float3 tUp = (abs(viewNormal.y) < 0.9f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
         float3 tU = normalize(cross(tUp, viewNormal));
         float3 tV = cross(viewNormal, tU);
         float phi = noiseA * 2.0f * kPi;
-        float ggxSpread = effRoughness * effRoughness * 0.35f * (1.0f - 0.50f * saturate(1.0f - dot(toEye, viewNormal)));
+        float ggxSpread = effRoughness * effRoughness * 0.32f * (1.0f - 0.50f * saturate(1.0f - dot(toEye, viewNormal)));
         float3 microNormal = normalize(viewNormal + (tU * cos(phi) + tV * sin(phi)) * ggxSpread);
         if (dot(microNormal, toEye) < 0.05f)
             microNormal = viewNormal;
@@ -570,7 +563,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float3 reflDir = normalize(reflect(viewDir, microNormal));
         if (reflDir.z > -0.65f)
         {
-            float ssrMaxDist = max(centerDepth * 3.5f, 0.2f);
+            float ssrMaxDist = max(centerDepth * 3.0f, 0.2f);
             float minZClip = max(centerPos.z * 0.05f, 1e-3f);
             float rayLen = ssrMaxDist;
             if (reflDir.z < 0.0f)
@@ -596,7 +589,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 float endZ = rcp(lerp(invZ0, rcp(max(endPos.z, minZClip)), maxT));
                 float invZ1 = rcp(endZ);
 
-                int ssrSteps = clamp(SsrSteps, 4, 16);
+                int ssrSteps = clamp(SsrSteps, 4, 12);
                 float invSteps = rcp(float(ssrSteps));
                 float prevKt = 0.0f;
                 float prevRayZ = centerPos.z;
@@ -604,39 +597,21 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 float2 hitUv = uv;
                 float hitThickness = 0.0f;
                 bool hit = false;
-                int hiZMip = (effRoughness < 0.25f) ? 1 : 2;
-                float kt = (0.35f + noiseB * 0.45f) * invSteps;
+                float mipBias = (effRoughness < 0.22f) ? 0.0f : 1.0f;
 
                 [loop]
-                for (int k = 1; k <= ssrSteps + 2; ++k)
+                for (int k = 1; k <= ssrSteps; ++k)
                 {
-                    if (kt > 1.0f)
-                        break;
+                    float kt = (float(k) - 0.55f + noiseB * 0.45f) * invSteps;
                     float kt2 = kt * kt;
                     float2 rayUv = lerp(uv, clippedEndUv, kt2);
                     float rayZ = rcp(lerp(invZ0, invZ1, kt2));
+                    float rayDepth = ColorPyramidTex.SampleLevel(LinearClampPyr, rayUv, mipBias).a;
 
-                    if (hiZMip > 0)
-                    {
-                        float hiZDepth = ColorPyramidTex.SampleLevel(LinearClampPyr, rayUv, float(hiZMip)).a;
-                        if (rayZ < hiZDepth - max(hiZDepth * 0.01f, 0.02f))
-                        {
-                            prevKt = kt2;
-                            prevRayZ = rayZ;
-                            kt += invSteps * (hiZMip == 2 ? 1.5f : 1.15f);
-                        }
-                        else
-                        {
-                            hiZMip--;
-                        }
-                        continue;
-                    }
-
-                    float rayDepth = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rayUv * float2(GiWidth, GiHeight))), 0)).a;
                     if (rayDepth < 64000.0f)
                     {
                         float diff = rayZ - rayDepth;
-                        float stepThickness = max(rayDepth * 0.12f, abs(rayZ - prevRayZ) * 1.45f);
+                        float stepThickness = max(rayDepth * 0.14f, abs(rayZ - prevRayZ) * 1.45f);
                         if (diff > rayZ * 0.002f && diff < stepThickness)
                         {
                             hit = true;
@@ -649,7 +624,6 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
                     prevKt = kt2;
                     prevRayZ = rayZ;
-                    kt += invSteps;
                 }
 
                 if (hit)
@@ -707,7 +681,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 envRefl = lerp(envRefl, pyrRefl, 0.55f);
             }
             currentSsr.rgb = lerp(envRefl, currentSsr.rgb, currentSsr.a);
-            currentSsr.a = max(currentSsr.a, 0.24f * (1.0f - effRoughness));
+            currentSsr.a = max(currentSsr.a, 0.22f * (1.0f - effRoughness));
         }
     }
 

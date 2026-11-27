@@ -56,6 +56,11 @@ cbuffer Params : register(b0)
     float JitterOffsetY;
     float PreExposure;
 
+    int ColorSubrectBaseX;
+    int ColorSubrectBaseY;
+    int PreUpscale;
+    int _padPre;
+
     float3 CameraPos;
     float _padCam0;
     float3 CameraRight;
@@ -167,8 +172,8 @@ int2 ClampDepthCoord(int2 p)
 
 int2 ClampMotionCoord(int2 p)
 {
-    int activeW = (DisplaySizeMV > 0) ? OutputWidth : RenderWidth;
-    int activeH = (DisplaySizeMV > 0) ? OutputHeight : RenderHeight;
+    int activeW = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputWidth : RenderWidth;
+    int activeH = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputHeight : RenderHeight;
     int2 minC = int2(MvSubrectBaseX, MvSubrectBaseY);
     int2 maxC = int2(min(MvSubrectBaseX + activeW - 1, MotionWidth - 1),
                      min(MvSubrectBaseY + activeH - 1, MotionHeight - 1));
@@ -177,15 +182,17 @@ int2 ClampMotionCoord(int2 p)
 
 int2 UvToDepthCoord(float2 uv)
 {
-    float2 jitterUv = uv - float2(JitterOffsetX, JitterOffsetY) / float2(max(RenderWidth, 1), max(RenderHeight, 1));
+    float2 jitterUv = (PreUpscale > 0)
+                          ? uv
+                          : (uv - float2(JitterOffsetX, JitterOffsetY) / float2(max(RenderWidth, 1), max(RenderHeight, 1)));
     int2 c = int2(DepthSubrectBaseX, DepthSubrectBaseY) + int2(saturate(jitterUv) * float2(RenderWidth, RenderHeight));
     return ClampDepthCoord(c);
 }
 
 int2 UvToMotionCoord(float2 uv)
 {
-    int activeW = (DisplaySizeMV > 0) ? OutputWidth : RenderWidth;
-    int activeH = (DisplaySizeMV > 0) ? OutputHeight : RenderHeight;
+    int activeW = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputWidth : RenderWidth;
+    int activeH = (DisplaySizeMV > 0 && PreUpscale == 0) ? OutputHeight : RenderHeight;
     int2 c = int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeW, activeH));
     return ClampMotionCoord(c);
 }
@@ -232,7 +239,6 @@ float SignedSpike(float c, float a, float b)
 void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID,
             uint tid : SV_GroupIndex)
 {
-    // Clear SceneLightBuf (32 uints) for Pass 1 atomic reduction
     if (dtid.x == 0 && dtid.y == 0)
     {
         [unroll]
@@ -240,7 +246,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             SceneLightBuf[si] = 0u;
     }
 
-    // Populate 10x10 LDS half-res depth tile (100 loads across 64 threads vs 9/pixel)
     int2 tileOrigin = int2(gid.xy) * 8 - 1;
     float2 invHalf = 1.0f / float2(max(HalfWidth, 1), max(HalfHeight, 1));
     [unroll]
@@ -261,7 +266,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     if ((int) dtid.x >= HalfWidth || (int) dtid.y >= HalfHeight)
         return;
 
-    // Clear WorldHashBuf on history reset
     if (ResetHistory > 0)
     {
         uint flatIdx = dtid.y * uint(HalfWidth) + dtid.x;
@@ -291,7 +295,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     float minD = min(dC, min(min(min(dL, dR), min(dU, dD)), min(min(dUL, dUR), min(dDL, dDR))));
 
-    // Depth-guided 2x2 color downsample (prevents sky/background bleeding into foreground edges)
     int2 baseOut = halfCoord * 2;
     float2 invOut = 1.0f / float2(max(OutputWidth, 1), max(OutputHeight, 1));
     float3 linColor = float3(0.0f, 0.0f, 0.0f);
@@ -304,9 +307,11 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         for (int ox = 0; ox < 2; ++ox)
         {
             int2 pOut = ClampOutputCoord(baseOut + int2(ox, oy));
-            float3 cTap = ToLinearColor(SourceColor.Load(int3(pOut, 0)).rgb, InColorEncodeMode) * exposureNorm;
-            float2 pUv = (float2(pOut) + 0.5f) * invOut;
-            float pDepth = LoadLinearDepth(UvToDepthCoord(pUv));
+            int2 pCol = int2(ColorSubrectBaseX, ColorSubrectBaseY) + pOut;
+            float3 cTap = ToLinearColor(SourceColor.Load(int3(pCol, 0)).rgb, InColorEncodeMode) * exposureNorm;
+            float pDepth = (PreUpscale > 0)
+                               ? LoadLinearDepth(int2(DepthSubrectBaseX, DepthSubrectBaseY) + pOut)
+                               : LoadLinearDepth(UvToDepthCoord((float2(pOut) + 0.5f) * invOut));
             float w = exp2(-abs(pDepth - dC) / max(dC * 0.06f, 0.02f)) + 1e-3f;
             linColor += cTap * w;
             wColSum += w;
@@ -324,7 +329,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         return;
     }
 
-    // Strict 2D collinear-triple stipple/dither detector (threshold tuned so dense grass is not killed)
     float spH     = SignedSpike(dC, dL,  dR);
     float spV     = SignedSpike(dC, dU,  dD);
     float spD1    = SignedSpike(dC, dUL, dDR);
@@ -341,8 +345,9 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     int2 mvCoord = UvToMotionCoord(uv);
     float2 mv = MotionTex.Load(int3(mvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
-    float2 mvRefSize = (DisplaySizeMV > 0) ? float2(OutputWidth, OutputHeight)
-                                           : float2(max(RenderWidth, 1), max(RenderHeight, 1));
+    float2 mvRefSize = (DisplaySizeMV > 0 && PreUpscale == 0)
+                           ? float2(OutputWidth, OutputHeight)
+                           : float2(max(RenderWidth, 1), max(RenderHeight, 1));
     float2 mvUv = mv / mvRefSize;
     float mvMagPx = length(mvUv * float2(OutputWidth, OutputHeight));
     float2 prevUv = uv + mvUv;
@@ -423,7 +428,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     OutHalfNormal[halfCoord] = float4(viewNormal.xy, saturate(flickerEma), min(dC, 65000.0f));
 
-    // Phase 4: World-Space Spatial Hash Radiance Cache injection (4-slot probing, 1-in-4 staggered pixels)
     if (WorldHashEnabled > 0 && HasCameraBasis > 0 && ResetHistory == 0 && flickerEma < 0.45f &&
         (((halfCoord.x & 1) + (halfCoord.y & 1) * 2) == (FrameIndex & 3)))
     {

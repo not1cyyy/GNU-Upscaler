@@ -11,6 +11,8 @@ struct NeuralLookConstants
 {
     uint32_t RenderWidth = 0;
     uint32_t RenderHeight = 0;
+    int32_t ColorSubrectBaseX = 0;
+    int32_t ColorSubrectBaseY = 0;
     int32_t DepthSubrectBaseX = 0;
     int32_t DepthSubrectBaseY = 0;
     int32_t MvSubrectBaseX = 0;
@@ -28,6 +30,7 @@ struct NeuralLookConstants
     float AspectRatio = 16.0f / 9.0f;
     float FusedRcasSharpness = 0.0f;
 
+    bool PreUpscale = true;
     bool DepthIsLinear = false;
     bool DepthIsReversed = false;
     bool IsHdr = false;
@@ -46,9 +49,9 @@ class NL_Common
   public:
     enum class BudgetTier : int
     {
-        Light = 0,  // 1-slice SSGI + 3-step Contact Shadows + 1-pass Denoise + Composite (no SSR)
-        Medium = 1, // 2-slice VisBitmask SSGI + 5-step Contact Shadows + 10-step Hi-Z GGX SSR + 2-pass Denoise
-        Full = 2    // 2-slice VisBitmask SSGI + 8-step Contact Shadows + 16-step Hi-Z GGX SSR + 2-pass Denoise
+        Light = 0,  // Pre-Upscale: 1-slice SSGI + 3-step Contact Shadows + 1-pass 9-tap Denoise (no SSR)
+        Medium = 1, // Pre-Upscale: 2-slice VisBitmask SSGI + 4-step Contact Shadows + 8-step SSR + 1-pass 9-tap Denoise
+        Full = 2    // Pre-Upscale: 2-slice VisBitmask SSGI + 6-step Contact Shadows + 12-step SSR + 1-pass 9-tap Denoise
     };
 
     void UpdateBudget(double gpuMs)
@@ -151,6 +154,11 @@ class NL_Common
         float JitterOffsetX = 0.0f;
         float JitterOffsetY = 0.0f;
         float PreExposure = 1.0f;
+
+        int32_t ColorSubrectBaseX = 0;
+        int32_t ColorSubrectBaseY = 0;
+        int32_t PreUpscale = 1;
+        int32_t _padPre = 0;
 
         float CameraPos[3] = { 0.0f, 0.0f, 0.0f };
         float _padCam0 = 0.0f;
@@ -379,6 +387,11 @@ class NL_Common
         int32_t _pad2 = 0;
         int32_t _pad3 = 0;
 
+        int32_t ColorSubrectBaseX = 0;
+        int32_t ColorSubrectBaseY = 0;
+        int32_t PreUpscale = 1;
+        int32_t _padPre = 0;
+
         float CameraPos[3] = { 0.0f, 0.0f, 0.0f };
         float _padCam0 = 0.0f;
         float CameraRight[3] = { 1.0f, 0.0f, 0.0f };
@@ -503,6 +516,9 @@ class NL_Common
         c.JitterOffsetX = inConst.JitterOffsetX;
         c.JitterOffsetY = inConst.JitterOffsetY;
         c.PreExposure = std::max(inConst.PreExposure, 1e-4f);
+        c.ColorSubrectBaseX = inConst.ColorSubrectBaseX;
+        c.ColorSubrectBaseY = inConst.ColorSubrectBaseY;
+        c.PreUpscale = inConst.PreUpscale ? 1 : 0;
 
         CopyCameraBasis(inConst, c.CameraPos, c.CameraRight, c.CameraUp, c.CameraFwd);
     }
@@ -546,9 +562,9 @@ class NL_Common
         c.FrameIndex = static_cast<int32_t>(_frameIndex);
 
         c.RayCount = (_activeTier == 0) ? 1 : 2;
-        c.StepCount = (_activeTier >= 2) ? 6 : 4;
+        c.StepCount = (_activeTier >= 2) ? 5 : 4;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
-        c.SsrSteps = (_activeTier >= 2) ? 16 : 10;
+        c.SsrSteps = (_activeTier >= 2) ? 12 : 8;
         c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
         c.WorldHashEnabled = (worldHashEnabled && inConst.HasCameraBasis) ? 1 : 0;
 
@@ -558,9 +574,9 @@ class NL_Common
         ComputeTanFov(c.OutputWidth, c.OutputHeight, inConst, c.TanHalfFov, c.TanHalfFovAspect);
 
         const float minDim = (float) std::min(c.OutputWidth, c.OutputHeight);
-        c.GiRadius = std::clamp(minDim * 0.18f, 72.0f, 256.0f);
+        c.GiRadius = std::clamp(minDim * 0.16f, 56.0f, 192.0f);
         c.GiBias = 0.04f;
-        c.ContactShadowSteps = (_activeTier >= 2) ? 8.0f : ((_activeTier == 1) ? 5.0f : 3.0f);
+        c.ContactShadowSteps = (_activeTier >= 2) ? 6.0f : ((_activeTier == 1) ? 4.0f : 3.0f);
 
         CopyCameraBasis(inConst, c.CameraPos, c.CameraRight, c.CameraUp, c.CameraFwd);
     }
@@ -632,6 +648,9 @@ class NL_Common
         c.SplitScreenPos = std::clamp(cfg->NeuralLookSplitScreen.value_or_default(), 0.0f, 1.0f);
         c.FusedRcasSharpness = std::clamp(inConst.FusedRcasSharpness, 0.0f, 1.0f);
         c.PreExposure = std::max(inConst.PreExposure, 1e-4f);
+        c.ColorSubrectBaseX = inConst.ColorSubrectBaseX;
+        c.ColorSubrectBaseY = inConst.ColorSubrectBaseY;
+        c.PreUpscale = inConst.PreUpscale ? 1 : 0;
 
         CopyCameraBasis(inConst, c.CameraPos, c.CameraRight, c.CameraUp, c.CameraFwd);
     }

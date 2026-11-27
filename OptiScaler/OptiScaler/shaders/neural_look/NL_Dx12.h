@@ -20,13 +20,12 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
     FrameDescriptorHeap _frameHeapsPrior[NL_NUM_OF_HEAPS];
     FrameDescriptorHeap _frameHeapsGi[NL_NUM_OF_HEAPS];
     FrameDescriptorHeap _frameHeapsDenoise[NL_NUM_OF_HEAPS];
-    FrameDescriptorHeap _frameHeapsDenoise2[NL_NUM_OF_HEAPS];
     FrameDescriptorHeap _frameHeapsComposite[NL_NUM_OF_HEAPS];
 
     ID3D12Resource* _buffer = nullptr;
     D3D12_RESOURCE_STATES _bufferState = D3D12_RESOURCE_STATE_COMMON;
 
-    // Half-res Temporal G-Proxy & GI/SSR/Meta/Dir + 2-Pass Denoised targets
+    // Half-res Temporal G-Proxy & GI/SSR/Meta/Dir + 1-Pass Denoised targets
     ID3D12Resource* _halfColorDepthBuffer = nullptr;
     D3D12_RESOURCE_STATES _halfColorDepthState = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* _halfNormalBuffers[2] = { nullptr, nullptr };
@@ -40,15 +39,6 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
     D3D12_RESOURCE_STATES _giMetaStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
     ID3D12Resource* _giDirBuffers[2] = { nullptr, nullptr };
     D3D12_RESOURCE_STATES _giDirStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
-
-    ID3D12Resource* _denoisedGiScratch = nullptr;
-    D3D12_RESOURCE_STATES _denoisedGiScratchState = D3D12_RESOURCE_STATE_COMMON;
-    ID3D12Resource* _denoisedSsrScratch = nullptr;
-    D3D12_RESOURCE_STATES _denoisedSsrScratchState = D3D12_RESOURCE_STATE_COMMON;
-    ID3D12Resource* _denoisedMetaScratch = nullptr;
-    D3D12_RESOURCE_STATES _denoisedMetaScratchState = D3D12_RESOURCE_STATE_COMMON;
-    ID3D12Resource* _denoisedGiDirScratch = nullptr;
-    D3D12_RESOURCE_STATES _denoisedGiDirScratchState = D3D12_RESOURCE_STATE_COMMON;
 
     ID3D12Resource* _denoisedGiBuffer = nullptr;
     D3D12_RESOURCE_STATES _denoisedGiState = D3D12_RESOURCE_STATE_COMMON;

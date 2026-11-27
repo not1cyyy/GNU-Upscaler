@@ -77,6 +77,7 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
     if (!OutputScaler->IsInit())
         useOutputScaling = false;
 
+    NVSDK_NGX_Resource_VK* paramColor = nullptr;
     NVSDK_NGX_Resource_VK* paramOutput = nullptr;
     NVSDK_NGX_Resource_VK* paramMotion = nullptr;
     NVSDK_NGX_Resource_VK* paramDepth = nullptr;
@@ -89,6 +90,7 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
     NVSDK_NGX_Resource_VK* paramTransparencyMask = nullptr;
     NVSDK_NGX_Resource_VK* paramExposure = nullptr;
 
+    InParameters->Get(NVSDK_NGX_Parameter_Color, (void**) &paramColor);
     InParameters->Get(NVSDK_NGX_Parameter_Output, (void**) &paramOutput);
     InParameters->Get(NVSDK_NGX_Parameter_MotionVectors, (void**) &paramMotion);
     InParameters->Get(NVSDK_NGX_Parameter_Depth, (void**) &paramDepth);
@@ -110,12 +112,8 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
     }
 
     const bool useNeuralLook = Config::Instance()->NeuralLookEnabled.value_or_default() && NeuralLook != nullptr &&
-                               NeuralLook->IsInit() && paramDepth != nullptr && paramMotion != nullptr;
-
-    const bool fuseRcasIntoNeuralLook =
-        useNeuralLook && useRcas && Config::Instance()->SharpnessShader.value_or_default() == SharpenShader::RCAS &&
-        !Config::Instance()->MotionSharpnessEnabled.value_or_default() &&
-        !Config::Instance()->MotionSharpnessDebug.value_or_default();
+                               NeuralLook->IsInit() && paramColor != nullptr && paramDepth != nullptr &&
+                               paramMotion != nullptr;
 
     // Save the original output so we can restore it later
     VkImageInfo originalOutput {};
@@ -140,17 +138,14 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
         VkImageInfo outputBuffer {};
     };
 
-    std::array<PostPass, 4> pipeline {};
+    std::array<PostPass, 3> pipeline {};
     size_t passCount = 0;
 
     if (useOutputScaling)
         pipeline[passCount++].stage = PostPassStage::OutputScaling;
 
-    if (useNeuralLook)
-        pipeline[passCount++].stage = PostPassStage::NeuralLook;
-
     _actualSharpness.reset();
-    if (useRcas && !fuseRcasIntoNeuralLook)
+    if (useRcas)
         pipeline[passCount++].stage = PostPassStage::Rcas;
 
     if (Magnifier->ShouldRun())
@@ -183,28 +178,6 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
                 info.ImageView = OutputScaler->GetImageView();
                 info.Width = TargetWidth();
                 info.Height = TargetHeight();
-                requiredInput = info;
-            }
-            break;
-
-        case PostPassStage::NeuralLook:
-            if (paramMotion && paramDepth && paramOutput && NeuralLook->IsInit() &&
-                NeuralLook->CreateImageResource(Device, PhysicalDevice, currentTarget.Width, currentTarget.Height,
-                                                currentTarget.Format, intermediateUsage))
-            {
-                if (fuseRcasIntoNeuralLook)
-                {
-                    InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
-                    _actualSharpness = _sharpness;
-                    _sharpness = 0.0f;
-                }
-
-                NeuralLook->SetImageLayout(InCmdBuffer, NeuralLook->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
-                                           VK_IMAGE_LAYOUT_GENERAL, currentTarget.SubresourceRange);
-
-                VkImageInfo info = currentTarget;
-                info.Image = NeuralLook->GetImage();
-                info.ImageView = NeuralLook->GetImageView();
                 requiredInput = info;
             }
             break;
@@ -267,13 +240,167 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
         paramOutput->Resource.ImageViewInfo.Height = currentTarget.Height;
     }
 
+    // Run 3D Neural Look PRE-UPSCALE on exact 1:1 jittered render-res Color + Depth + MV
+    bool neuralLookSwappedColor = false;
+    NVSDK_NGX_ImageViewInfo_VK originalColor {};
+    if (useNeuralLook)
+    {
+        originalColor = paramColor->Resource.ImageViewInfo;
+        VkImageInfo inColorInfo = *(VkImageInfo*) &paramColor->Resource.ImageViewInfo;
+
+        if (NeuralLook->CreateImageResource(Device, PhysicalDevice, inColorInfo.Width, inColorInfo.Height,
+                                            inColorInfo.Format, intermediateUsage))
+        {
+            NeuralLook->SetImageLayout(InCmdBuffer, NeuralLook->GetImage(), VK_IMAGE_LAYOUT_UNDEFINED,
+                                       VK_IMAGE_LAYOUT_GENERAL, inColorInfo.SubresourceRange);
+
+            VkImageInfo nlOutInfo = inColorInfo;
+            nlOutInfo.Image = NeuralLook->GetImage();
+            nlOutInfo.ImageView = NeuralLook->GetImageView();
+
+            NeuralLookConstants nlConstants {};
+            nlConstants.RenderWidth = RenderWidth();
+            nlConstants.RenderHeight = RenderHeight();
+            uint32_t subW = 0;
+            uint32_t subH = 0;
+            if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &subW) ==
+                    NVSDK_NGX_Result_Success &&
+                subW > 0)
+            {
+                nlConstants.RenderWidth = subW;
+            }
+            if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &subH) ==
+                    NVSDK_NGX_Result_Success &&
+                subH > 0)
+            {
+                nlConstants.RenderHeight = subH;
+            }
+            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, &nlConstants.ColorSubrectBaseX);
+            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y, &nlConstants.ColorSubrectBaseY);
+            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &nlConstants.DepthSubrectBaseX);
+            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &nlConstants.DepthSubrectBaseY);
+            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, &nlConstants.MvSubrectBaseX);
+            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, &nlConstants.MvSubrectBaseY);
+            InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &nlConstants.JitterOffsetX);
+            InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &nlConstants.JitterOffsetY);
+
+            float preExposure = 1.0f;
+            if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &preExposure) == NVSDK_NGX_Result_Success &&
+                preExposure > 1e-4f)
+            {
+                nlConstants.PreExposure = preExposure;
+            }
+
+            nlConstants.PreUpscale = true;
+            nlConstants.LowResMV = LowResMV();
+            nlConstants.DepthIsLinear = DepthLinear();
+            nlConstants.DepthIsReversed = DepthInverted();
+            nlConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
+                                State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
+            nlConstants.FusedRcasSharpness = 0.0f;
+
+            InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &nlConstants.MvScaleX);
+            InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &nlConstants.MvScaleY);
+
+            float nearPlane = 0.0f;
+            float farPlane = 0.0f;
+            if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
+            {
+                nlConstants.CameraNear = nearPlane;
+                nlConstants.CameraFar = farPlane;
+            }
+            else
+            {
+                nlConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+                nlConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+            }
+
+            float vFov = 0.0f;
+            if (InParameters->Get("DLSSG.CameraVFov", &vFov) == NVSDK_NGX_Result_Success && vFov > 0.05f)
+                nlConstants.CameraVFov = vFov;
+
+            float aspectRatio = 0.0f;
+            if (InParameters->Get("DLSSG.CameraAspectRatio", &aspectRatio) == NVSDK_NGX_Result_Success &&
+                aspectRatio > 0.1f)
+            {
+                nlConstants.AspectRatio = aspectRatio;
+            }
+            else if (TargetHeight() > 0)
+            {
+                nlConstants.AspectRatio = static_cast<float>(TargetWidth()) / static_cast<float>(TargetHeight());
+            }
+
+            int resetFlag = 0;
+            if (InParameters->Get(NVSDK_NGX_Parameter_Reset, &resetFlag) == NVSDK_NGX_Result_Success && resetFlag != 0)
+                nlConstants.ResetHistory = true;
+
+            if (InParameters->Get("DLSSG.CameraPosX", &nlConstants.CameraPos[0]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraPosY", &nlConstants.CameraPos[1]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraPosZ", &nlConstants.CameraPos[2]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraRightX", &nlConstants.CameraRight[0]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraRightY", &nlConstants.CameraRight[1]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraRightZ", &nlConstants.CameraRight[2]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraUpX", &nlConstants.CameraUp[0]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraUpY", &nlConstants.CameraUp[1]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraUpZ", &nlConstants.CameraUp[2]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraFwdX", &nlConstants.CameraFwd[0]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraFwdY", &nlConstants.CameraFwd[1]) == NVSDK_NGX_Result_Success &&
+                InParameters->Get("DLSSG.CameraFwdZ", &nlConstants.CameraFwd[2]) == NVSDK_NGX_Result_Success)
+            {
+                nlConstants.HasCameraBasis = true;
+            }
+            else if (auto* fg = State::Instance().CurrentFG(); fg != nullptr)
+            {
+                nlConstants.HasCameraBasis = fg->GetLatestCameraBasis(
+                    nlConstants.CameraPos, nlConstants.CameraUp, nlConstants.CameraRight, nlConstants.CameraFwd);
+            }
+
+            VkImageInfo mvInfo = *(VkImageInfo*) &paramMotion->Resource.ImageViewInfo;
+            VkImageInfo* depthInfo = paramDepth ? (VkImageInfo*) &paramDepth->Resource.ImageViewInfo : nullptr;
+            VkImageInfo* normInfo =
+                paramGBufferNormals ? (VkImageInfo*) &paramGBufferNormals->Resource.ImageViewInfo : nullptr;
+            VkImageInfo* albedoInfo =
+                paramGBufferAlbedo ? (VkImageInfo*) &paramGBufferAlbedo->Resource.ImageViewInfo : nullptr;
+            VkImageInfo* roughInfo =
+                paramGBufferRoughness ? (VkImageInfo*) &paramGBufferRoughness->Resource.ImageViewInfo : nullptr;
+            VkImageInfo* metalInfo =
+                paramGBufferMetallic ? (VkImageInfo*) &paramGBufferMetallic->Resource.ImageViewInfo : nullptr;
+            VkImageInfo* sssInfo =
+                paramGBufferSubsurface ? (VkImageInfo*) &paramGBufferSubsurface->Resource.ImageViewInfo : nullptr;
+            VkImageInfo* reactInfo =
+                paramReactiveMask ? (VkImageInfo*) &paramReactiveMask->Resource.ImageViewInfo : nullptr;
+            VkImageInfo* transInfo =
+                paramTransparencyMask ? (VkImageInfo*) &paramTransparencyMask->Resource.ImageViewInfo : nullptr;
+            VkImageInfo* expInfo = paramExposure ? (VkImageInfo*) &paramExposure->Resource.ImageViewInfo : nullptr;
+
+            if (NeuralLook->Dispatch(Device, InCmdBuffer, nlConstants, inColorInfo, mvInfo, nlOutInfo, depthInfo,
+                                     normInfo, albedoInfo, roughInfo, metalInfo, sssInfo, reactInfo, transInfo,
+                                     expInfo))
+            {
+                NeuralLook->SetImageLayout(InCmdBuffer, NeuralLook->GetImage(), VK_IMAGE_LAYOUT_GENERAL,
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, inColorInfo.SubresourceRange);
+                paramColor->Resource.ImageViewInfo.Image = NeuralLook->GetImage();
+                paramColor->Resource.ImageViewInfo.ImageView = NeuralLook->GetImageView();
+                neuralLookSwappedColor = true;
+            }
+            else
+            {
+                Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
+            }
+        }
+    }
+
     UpscalerTime->Start(InCmdBuffer);
 
     auto evalResult = EvaluateInternal(InCmdBuffer, InParameters);
 
     UpscalerTime->End(InCmdBuffer);
 
-    // Restore original output pointer
+    // Restore original color & output pointers
+    if (neuralLookSwappedColor && paramColor)
+        paramColor->Resource.ImageViewInfo = originalColor;
+
     if (paramOutput)
     {
         paramOutput->Resource.ImageViewInfo.Image = originalOutput.Image;
@@ -310,143 +437,6 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
                 Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
                 State::Instance().changeBackend[Handle()->Id] = true;
                 ok = false;
-            }
-            break;
-
-        case PostPassStage::NeuralLook:
-            if (NeuralLook && NeuralLook->IsInit() && paramMotion && paramDepth && paramOutput)
-            {
-                NeuralLook->SetImageLayout(InCmdBuffer, pass.inputBuffer.Image, VK_IMAGE_LAYOUT_GENERAL,
-                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, pass.inputBuffer.SubresourceRange);
-
-                NeuralLookConstants nlConstants {};
-                nlConstants.RenderWidth = RenderWidth();
-                nlConstants.RenderHeight = RenderHeight();
-                uint32_t subW = 0;
-                uint32_t subH = 0;
-                if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &subW) ==
-                        NVSDK_NGX_Result_Success &&
-                    subW > 0)
-                {
-                    nlConstants.RenderWidth = subW;
-                }
-                if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &subH) ==
-                        NVSDK_NGX_Result_Success &&
-                    subH > 0)
-                {
-                    nlConstants.RenderHeight = subH;
-                }
-                InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &nlConstants.DepthSubrectBaseX);
-                InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &nlConstants.DepthSubrectBaseY);
-                InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, &nlConstants.MvSubrectBaseX);
-                InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, &nlConstants.MvSubrectBaseY);
-                InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &nlConstants.JitterOffsetX);
-                InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &nlConstants.JitterOffsetY);
-
-                float preExposure = 1.0f;
-                if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &preExposure) ==
-                        NVSDK_NGX_Result_Success &&
-                    preExposure > 1e-4f)
-                {
-                    nlConstants.PreExposure = preExposure;
-                }
-
-                nlConstants.LowResMV = LowResMV();
-                nlConstants.DepthIsLinear = DepthLinear();
-                nlConstants.DepthIsReversed = DepthInverted();
-                nlConstants.IsHdr = IsHdr() || State::Instance().hdrOutputActive ||
-                                    State::Instance().outputColorSpace.transfer == ColorTransfer::PQ;
-                if (fuseRcasIntoNeuralLook)
-                {
-                    nlConstants.FusedRcasSharpness = _actualSharpness.value_or(_sharpness);
-                    _sharpness = _actualSharpness.value_or(_sharpness);
-                    _actualSharpness.reset();
-                }
-
-                InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &nlConstants.MvScaleX);
-                InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &nlConstants.MvScaleY);
-
-                float nearPlane = 0.0f;
-                float farPlane = 0.0f;
-                if (InParameters->Get("DLSSG.CameraNear", &nearPlane) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraFar", &farPlane) == NVSDK_NGX_Result_Success)
-                {
-                    nlConstants.CameraNear = nearPlane;
-                    nlConstants.CameraFar = farPlane;
-                }
-                else
-                {
-                    nlConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
-                    nlConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
-                }
-
-                float vFov = 0.0f;
-                if (InParameters->Get("DLSSG.CameraVFov", &vFov) == NVSDK_NGX_Result_Success && vFov > 0.05f)
-                    nlConstants.CameraVFov = vFov;
-
-                float aspectRatio = 0.0f;
-                if (InParameters->Get("DLSSG.CameraAspectRatio", &aspectRatio) == NVSDK_NGX_Result_Success &&
-                    aspectRatio > 0.1f)
-                {
-                    nlConstants.AspectRatio = aspectRatio;
-                }
-                else if (TargetHeight() > 0)
-                {
-                    nlConstants.AspectRatio = static_cast<float>(TargetWidth()) / static_cast<float>(TargetHeight());
-                }
-
-                int resetFlag = 0;
-                if (InParameters->Get(NVSDK_NGX_Parameter_Reset, &resetFlag) == NVSDK_NGX_Result_Success &&
-                    resetFlag != 0)
-                    nlConstants.ResetHistory = true;
-
-                if (InParameters->Get("DLSSG.CameraPosX", &nlConstants.CameraPos[0]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraPosY", &nlConstants.CameraPos[1]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraPosZ", &nlConstants.CameraPos[2]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraRightX", &nlConstants.CameraRight[0]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraRightY", &nlConstants.CameraRight[1]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraRightZ", &nlConstants.CameraRight[2]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraUpX", &nlConstants.CameraUp[0]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraUpY", &nlConstants.CameraUp[1]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraUpZ", &nlConstants.CameraUp[2]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraFwdX", &nlConstants.CameraFwd[0]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraFwdY", &nlConstants.CameraFwd[1]) == NVSDK_NGX_Result_Success &&
-                    InParameters->Get("DLSSG.CameraFwdZ", &nlConstants.CameraFwd[2]) == NVSDK_NGX_Result_Success)
-                {
-                    nlConstants.HasCameraBasis = true;
-                }
-                else if (auto* fg = State::Instance().CurrentFG(); fg != nullptr)
-                {
-                    nlConstants.HasCameraBasis = fg->GetLatestCameraBasis(
-                        nlConstants.CameraPos, nlConstants.CameraUp, nlConstants.CameraRight, nlConstants.CameraFwd);
-                }
-
-                VkImageInfo mvInfo = *(VkImageInfo*) &paramMotion->Resource.ImageViewInfo;
-                VkImageInfo* depthInfo = paramDepth ? (VkImageInfo*) &paramDepth->Resource.ImageViewInfo : nullptr;
-                VkImageInfo* normInfo =
-                    paramGBufferNormals ? (VkImageInfo*) &paramGBufferNormals->Resource.ImageViewInfo : nullptr;
-                VkImageInfo* albedoInfo =
-                    paramGBufferAlbedo ? (VkImageInfo*) &paramGBufferAlbedo->Resource.ImageViewInfo : nullptr;
-                VkImageInfo* roughInfo =
-                    paramGBufferRoughness ? (VkImageInfo*) &paramGBufferRoughness->Resource.ImageViewInfo : nullptr;
-                VkImageInfo* metalInfo =
-                    paramGBufferMetallic ? (VkImageInfo*) &paramGBufferMetallic->Resource.ImageViewInfo : nullptr;
-                VkImageInfo* sssInfo =
-                    paramGBufferSubsurface ? (VkImageInfo*) &paramGBufferSubsurface->Resource.ImageViewInfo : nullptr;
-                VkImageInfo* reactInfo =
-                    paramReactiveMask ? (VkImageInfo*) &paramReactiveMask->Resource.ImageViewInfo : nullptr;
-                VkImageInfo* transInfo =
-                    paramTransparencyMask ? (VkImageInfo*) &paramTransparencyMask->Resource.ImageViewInfo : nullptr;
-                VkImageInfo* expInfo =
-                    paramExposure ? (VkImageInfo*) &paramExposure->Resource.ImageViewInfo : nullptr;
-
-                if (!NeuralLook->Dispatch(Device, InCmdBuffer, nlConstants, pass.inputBuffer, mvInfo, pass.outputBuffer,
-                                          depthInfo, normInfo, albedoInfo, roughInfo, metalInfo, sssInfo, reactInfo,
-                                          transInfo, expInfo))
-                {
-                    Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
-                    ok = false;
-                }
             }
             break;
 

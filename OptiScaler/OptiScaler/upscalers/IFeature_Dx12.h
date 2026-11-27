@@ -24,18 +24,6 @@ class IFeature_Dx12 : public virtual IFeature
         bool runOutputScaler = false;
         ID3D12Resource* osInput = nullptr;
         ID3D12Resource* osOutput = nullptr;
-        bool runNeuralLook = false;
-        ID3D12Resource* nlInput = nullptr;
-        ID3D12Resource* nlOutput = nullptr;
-        ID3D12Resource* paramGBufferNormals = nullptr;
-        ID3D12Resource* paramGBufferAlbedo = nullptr;
-        ID3D12Resource* paramGBufferRoughness = nullptr;
-        ID3D12Resource* paramGBufferMetallic = nullptr;
-        ID3D12Resource* paramGBufferSubsurface = nullptr;
-        ID3D12Resource* paramReactiveMask = nullptr;
-        ID3D12Resource* paramTransparencyMask = nullptr;
-        ID3D12Resource* paramExposure = nullptr;
-        NeuralLookConstants nlConstants {};
         bool runRcas = false;
         ID3D12Resource* rcasInput = nullptr;
         ID3D12Resource* rcasOutput = nullptr;
@@ -52,7 +40,7 @@ class IFeature_Dx12 : public virtual IFeature
 
     void RestoreBarriers(ID3D12GraphicsCommandList* InCommandList);
     RcasConstants BuildRcasConstants(NVSDK_NGX_Parameter* InParameters);
-    NeuralLookConstants BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters, bool fuseRcas);
+    NeuralLookConstants BuildNeuralLookConstants(NVSDK_NGX_Parameter* InParameters);
     bool ExecutePostPassSet(ID3D12GraphicsCommandList* cmdList, const PendingAsyncPostPasses& passes);
 
   protected:

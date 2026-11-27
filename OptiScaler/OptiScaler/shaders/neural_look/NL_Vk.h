@@ -28,7 +28,6 @@ class NL_Vk : public Shader_Vk, public NL_Common
     VkPassObjects _passPrior {};
     VkPassObjects _passGi {};
     VkPassObjects _passDenoise {};
-    VkPassObjects _passDenoise2 {};
 
     struct Image2DRes
     {
@@ -52,11 +51,6 @@ class NL_Vk : public Shader_Vk, public NL_Common
     Image2DRes _ssr[2] {};
     Image2DRes _giMeta[2] {};
     Image2DRes _giDir[2] {};
-
-    Image2DRes _denoisedGiScratch {};
-    Image2DRes _denoisedSsrScratch {};
-    Image2DRes _denoisedMetaScratch {};
-    Image2DRes _denoisedGiDirScratch {};
 
     Image2DRes _denoisedGi {};
     Image2DRes _denoisedSsr {};
