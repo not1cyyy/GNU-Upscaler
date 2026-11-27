@@ -459,16 +459,19 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     if (useNeuralLook && NeuralLook->CanRender())
     {
         const bool applyManualBarriers = (upscaler != Upscaler::DLSS && upscaler != Upscaler::DLSSD);
-        const std::optional<int32_t> colorBarrier =
-            applyManualBarriers ? Config::Instance()->ColorResourceBarrier : std::nullopt;
-        const std::optional<int32_t> depthBarrier =
-            applyManualBarriers ? Config::Instance()->DepthResourceBarrier : std::nullopt;
-        const std::optional<int32_t> mvBarrier =
-            applyManualBarriers ? Config::Instance()->MVResourceBarrier : std::nullopt;
-        const std::optional<int32_t> maskBarrier =
-            applyManualBarriers ? Config::Instance()->MaskResourceBarrier : std::nullopt;
-        const std::optional<int32_t> expBarrier =
-            applyManualBarriers ? Config::Instance()->ExposureResourceBarrier : std::nullopt;
+        std::optional<int32_t> colorBarrier = Config::Instance()->ColorResourceBarrier;
+        std::optional<int32_t> depthBarrier = Config::Instance()->DepthResourceBarrier;
+        std::optional<int32_t> mvBarrier = Config::Instance()->MVResourceBarrier;
+        std::optional<int32_t> maskBarrier = Config::Instance()->MaskResourceBarrier;
+        std::optional<int32_t> expBarrier = Config::Instance()->ExposureResourceBarrier;
+        if (!applyManualBarriers)
+        {
+            colorBarrier.reset();
+            depthBarrier.reset();
+            mvBarrier.reset();
+            maskBarrier.reset();
+            expBarrier.reset();
+        }
 
         const D3D12_RESOURCE_STATES nlInitialState = colorBarrier.has_value()
                                                          ? static_cast<D3D12_RESOURCE_STATES>(colorBarrier.value())
