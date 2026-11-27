@@ -709,6 +709,13 @@ def verify_nlmodel(path: Path):
     return name_str, arr.reshape(NL_MODEL_FLOAT4_COUNT, 4)
 
 
+def _fmt_c_float(v: float) -> str:
+    s = f"{float(v):.9g}"
+    if "." not in s and "e" not in s and "E" not in s:
+        s += ".0"
+    return s + "f"
+
+
 def emit_default_header(path: Path, weights_f4: np.ndarray):
     lines = [
         "#pragma once",
@@ -721,7 +728,7 @@ def emit_default_header(path: Path, weights_f4: np.ndarray):
     ]
     flat = weights_f4.reshape(-1)
     for idx in range(0, len(flat), 8):
-        chunk = ", ".join(f"{float(v):.9g}f" for v in flat[idx : idx + 8])
+        chunk = ", ".join(_fmt_c_float(v) for v in flat[idx : idx + 8])
         comma = "," if idx + 8 < len(flat) else ""
         lines.append(f"    {chunk}{comma}")
     lines.append("};")
