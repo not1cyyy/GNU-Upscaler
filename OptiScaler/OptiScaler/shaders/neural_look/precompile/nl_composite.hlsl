@@ -320,6 +320,62 @@ float3 ApplySubtleFilmicCurve(float3 linearCol, float contrastStr)
     return max(linearCol * (targetL / l), 0.0f);
 }
 
+float Hash31(float3 p)
+{
+    p = frac(p * 0.1031f);
+    p += dot(p, p.yzx + 33.33f);
+    return frac((p.x + p.y) * p.z);
+}
+
+// Smooth 3D value noise with exact analytical gradient: float4(value, d/dx, d/dy, d/dz)
+float4 ValueNoise3DGrad(float3 x)
+{
+    float3 i = floor(x);
+    float3 f = frac(x);
+    float3 u = f * f * (3.0f - 2.0f * f);
+    float3 du = 6.0f * f * (1.0f - f);
+
+    float a  = Hash31(i + float3(0, 0, 0));
+    float b  = Hash31(i + float3(1, 0, 0));
+    float c  = Hash31(i + float3(0, 1, 0));
+    float d  = Hash31(i + float3(1, 1, 0));
+    float e  = Hash31(i + float3(0, 0, 1));
+    float f1 = Hash31(i + float3(1, 0, 1));
+    float g  = Hash31(i + float3(0, 1, 1));
+    float h  = Hash31(i + float3(1, 1, 1));
+
+    float k0 = a;
+    float k1 = b - a;
+    float k2 = c - a;
+    float k3 = e - a;
+    float k4 = a - b - c + d;
+    float k5 = a - c - e + g;
+    float k6 = a - b - e + f1;
+    float k7 = -a + b + c - d + e - f1 - g + h;
+
+    float val = k0 + k1 * u.x + k2 * u.y + k3 * u.z + k4 * u.x * u.y + k5 * u.y * u.z + k6 * u.z * u.x + k7 * u.x * u.y * u.z;
+    float3 grad = du * float3(
+        k1 + k4 * u.y + k6 * u.z + k7 * u.y * u.z,
+        k2 + k5 * u.z + k4 * u.x + k7 * u.z * u.x,
+        k3 + k6 * u.x + k5 * u.y + k7 * u.x * u.y);
+    return float4(val, grad);
+}
+
+float EvalSkinMotionStillness(float2 uv)
+{
+    int activeW = (DisplaySizeMV > 0)
+                      ? ((PreUpscale == 0) ? OutputWidth : max(MotionWidth - MvSubrectBaseX, 1))
+                      : RenderWidth;
+    int activeH = (DisplaySizeMV > 0)
+                      ? ((PreUpscale == 0) ? OutputHeight : max(MotionHeight - MvSubrectBaseY, 1))
+                      : RenderHeight;
+    int2 mvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeW, activeH)));
+    float2 mv = MotionTex.Load(int3(mvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
+    float2 mvUv = mv / float2(max(activeW, 1), max(activeH, 1));
+    float mvPx = length(mvUv * float2(OutputWidth, OutputHeight));
+    return rcp(1.0f + mvPx * 0.45f);
+}
+
 // Full-res silhouette-safe normal reconstruction directly from LDS depth (zero 2x2 staircasing)
 float3 ReconstructFullResViewNormal(int2 outCoord, float2 uv, float2 invOut,
                                     float dC, float dL, float dR, float dU, float dD,
@@ -842,9 +898,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float invL = rcp(max(centerLuma + 0.05f, 0.05f));
         float rg = (centerColor.r - centerColor.g) * invL;
         float rb = (centerColor.r - centerColor.b) * invL;
-        float warmSkin = smoothstep(0.015f, 0.12f, rb) * smoothstep(-0.03f, 0.06f, rg) *
-                         (1.0f - smoothstep(0.95f, 1.45f, rb));
-        float nearCharDist = 1.0f - smoothstep(14.0f, 32.0f, centerDepth);
+        // Human skin spans fair/peach/olive/deep-brown with G cleanly between B and R (rejects crimson cloth & neutral grey)
+        float skinHueRatio = (centerColor.g - centerColor.b) / max(centerColor.r - centerColor.b, 1e-4f);
+        float hueBand = smoothstep(0.10f, 0.24f, skinHueRatio) * (1.0f - smoothstep(0.72f, 0.88f, skinHueRatio));
+        float warmSkin = smoothstep(0.015f, 0.11f, rb) * smoothstep(-0.02f, 0.06f, rg) *
+                         (1.0f - smoothstep(0.95f, 1.45f, rb)) * hueBand;
+        float nearCharDist = 1.0f - smoothstep(12.0f, 28.0f, centerDepth);
         skinChromaGate = warmSkin * nearCharDist;
     }
 
@@ -871,9 +930,62 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             shadedNormal = normalize(viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * microStrength);
     }
 
-    // Photorealistic Detail-Preserving Dermis SSS + Terminator Hemoglobin Warmth
+    float3 skinDetailNormal = shadedNormal;
+    float poreDimple = 0.0f;
+    float poreRoughMod = 0.0f;
+    float skinDetailMask = exp(-pVar * 14.0f);
+    float closeUpSkin = 1.0f - smoothstep(1.5f, 3.6f, centerDepth);
+
+    if (skinW > 0.03f && solidMask > 0.05f)
+    {
+        // 1) UV-locked micro-normal from real game skin texture (pores, freckles, fine creases; zero swimming!)
+        float texMicroStr = 0.22f * skinW * edgeSafeMask * meshGuard;
+        float3 texSkinNorm = normalize(viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * texMicroStr);
+        skinDetailNormal = texSkinNorm;
+
+        // 2) Nyquist-filtered, motion-guarded close-up 3D micro-pore & fine skin-grain synthesis
+        if (closeUpSkin > 0.01f && edgeSafeMask > 0.05f && skinDetailMask > 0.05f)
+        {
+            float pxWorldSize = (2.0f * TanHalfFov * centerDepth) / float(max(OutputHeight, 1));
+            float nyqGrain = 1.0f - smoothstep(0.00055f, 0.0017f, pxWorldSize); // ~2.1mm fine skin grain
+            float nyqPore  = 1.0f - smoothstep(0.00022f, 0.00080f, pxWorldSize); // ~0.8mm pores
+            float motionStill = EvalSkinMotionStillness(uv);
+            float procGate = closeUpSkin * motionStill * skinDetailMask * edgeSafeMask * skinW;
+
+            if (procGate * max(nyqGrain, nyqPore) > 0.01f)
+            {
+                // Relative to integer meter cell -> full 24-bit FP32 precision anywhere in world with zero wrap seams
+                float3 relWorldPos = (HasCameraBasis > 0)
+                                         ? ((CameraPos - floor(CameraPos)) + CameraRight * viewPos.x +
+                                            CameraUp * viewPos.y + CameraFwd * viewPos.z)
+                                         : viewPos;
+                float3 surfNorm3 = (HasCameraBasis > 0)
+                                       ? ViewToWorldDir(viewNormal, CameraRight, CameraUp, CameraFwd)
+                                       : viewNormal;
+
+                float4 nGrain = ValueNoise3DGrad(relWorldPos * 480.0f);
+                float4 nPore  = ValueNoise3DGrad(relWorldPos * 1250.0f);
+
+                // Concave pore dimples (only upper ~15% peaks become tiny recessed pores, smooth ridges between)
+                float rawDimple = smoothstep(0.56f, 0.92f, nPore.x);
+                poreDimple = rawDimple * nyqPore * procGate;
+                poreRoughMod = ((nGrain.x - 0.5f) * 0.14f * nyqGrain + rawDimple * 0.14f * nyqPore) * procGate;
+
+                float3 grad3 = nGrain.yzw * (0.14f * nyqGrain) + nPore.yzw * (0.24f * nyqPore * (0.35f + 0.65f * rawDimple));
+                // Project onto surface tangent plane so micro-relief stays flush at any angle
+                grad3 -= surfNorm3 * dot(grad3, surfNorm3);
+                float3 gradView = (HasCameraBasis > 0)
+                                      ? float3(dot(grad3, CameraRight), dot(grad3, CameraUp), dot(grad3, CameraFwd))
+                                      : grad3;
+
+                skinDetailNormal = normalize(texSkinNorm - gradView * (0.42f * procGate));
+            }
+        }
+    }
+
+    // 3-Layer Jimenez Skin SSS (Epidermis / Dermis / Subcutis) + Tactile Epidermal Pore Micro-Relief
     float3 litColor = centerColor;
-    float effSkinSss = saturate(skinProb * SssIntensity * 0.85f) * skinChromaGate;
+    float effSkinSss = saturate(skinProb * SssIntensity * 0.90f) * skinChromaGate;
     if (effSkinSss > 0.03f && SssIntensity > 1e-4f && solidMask > 0.05f)
     {
         float sssInvSigma = rcp(max(centerDepth * 0.024f, 0.015f));
@@ -896,27 +1008,45 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
         float sssPyrSigma = rcp(max(centerDepth * 0.032f, 0.020f));
         float4 pyr0 = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, 0.0f);
-        float w2 = exp(-abs(centerDepth - pyr0.a) * sssPyrSigma) * (1.0f - silEdge) * (1.0f - fgSilEdge);
+        float4 pyr1 = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, 1.0f);
+        float silGuard = (1.0f - silEdge) * (1.0f - fgSilEdge);
+        float w2 = exp(-abs(centerDepth - pyr0.a) * sssPyrSigma) * silGuard;
+        float w3 = exp(-abs(centerDepth - pyr1.a) * (sssPyrSigma * 0.85f)) * silGuard;
         float3 ring2 = lerp(ring1, max(pyr0.rgb, 0.0f), w2);
+        float3 ring3 = lerp(ring2, max(pyr1.rgb, 0.0f), w3 * 0.65f);
 
+        // Real human skin optical mean free paths: R ~3.5mm (deep dermis), G ~1.0mm, B ~0.3mm (epidermis)
         float3 diffusedSkin = float3(
-            lerp(ring1.r, ring2.r, 0.70f),
-            lerp(ring1.g, ring2.g, 0.42f),
-            lerp(centerColor.b, ring1.b, 0.48f)
-        ) * float3(1.01f, 0.995f, 0.99f) + epiDetail * float3(0.45f, 0.78f, 0.88f);
+            lerp(ring2.r, ring3.r, 0.55f),
+            lerp(ring1.g, ring2.g, 0.45f),
+            lerp(centerColor.b, ring1.b, 0.40f)
+        ) * float3(1.005f, 0.996f, 0.992f) + epiDetail * float3(0.42f, 0.76f, 0.90f);
 
+        // Pre-integrated hemoglobin terminator warmth + subtle backlit thin-tissue translucency
         float skinNdotK = dot(shadedNormal, keyDirView);
-        float termBand = exp(-pow((skinNdotK - 0.10f) / 0.34f, 2.0f)) * saturate(keyStrength * 1.15f + 0.15f);
-        float3 dermisTint = float3(1.00f, 0.34f, 0.16f);
-        float3 termScatter = dermisTint * max(ring2, centerColor) * termBand * effSkinSss *
-                             (0.16f + 0.12f * (1.0f - directMask)) * solidMask * (1.0f - silEdge * 0.85f);
+        float termBand = exp(-pow((skinNdotK - 0.08f) / 0.34f, 2.0f)) * saturate(keyStrength * 1.15f + 0.15f);
+        float3 dermisTint = float3(1.00f, 0.28f, 0.11f);
+        float3 termScatter = dermisTint * max(ring3, centerColor) * termBand * effSkinSss *
+                             (0.18f + 0.12f * (1.0f - directMask)) * solidMask * (1.0f - silEdge * 0.85f);
+
+        float backView = pow(saturate(dot(viewDir, -keyDirView)), 2.2f);
+        float backRim = pow(1.0f - safeNdotV, 2.2f) * backView * directMask * contactShadow;
+        float3 backScatter = float3(1.00f, 0.24f, 0.09f) * max(ring2, centerColor) * backRim * effSkinSss *
+                             0.26f * edgeSafeMask;
 
         float3 blendedSkin = lerp(litColor, max(diffusedSkin, 0.0f),
-                                  float3(0.70f, 0.35f, 0.15f) * effSkinSss * solidMask * (1.0f - silEdge * 0.85f)) +
-                             termScatter;
+                                  float3(0.72f, 0.36f, 0.14f) * effSkinSss * solidMask * (1.0f - silEdge * 0.85f)) +
+                             termScatter + backScatter;
+
+        // Restore tactile epidermal micro-texture (pores/freckles/skin grain) & subtle close-up pore recess occlusion
+        float epiMicro = clamp((pC - pAvg) * 0.65f, -0.06f, 0.06f) * skinW * edgeSafeMask * skinDetailMask *
+                         (0.45f + 0.55f * closeUpSkin);
+        float poreOcc = 1.0f - poreDimple * 0.085f;
+        blendedSkin *= (1.0f + epiMicro) * poreOcc;
+
         float diffLuma = Luma(blendedSkin);
-        if (diffLuma > centerLuma * 1.14f + 0.01f)
-            blendedSkin *= (centerLuma * 1.14f + 0.01f) / max(diffLuma, 1e-4f);
+        if (diffLuma > centerLuma * 1.15f + 0.01f)
+            blendedSkin *= (centerLuma * 1.15f + 0.01f) / max(diffLuma, 1e-4f);
 
         litColor = max(blendedSkin, 0.0f);
     }
@@ -952,10 +1082,11 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         litColor += giBounce * bounceAlbedo * dirGiShade * (1.0f - metallic * 0.50f) *
                     (effGi * (0.64f + 0.96f * sunAtten)) * solidMask;
 
-        // Subtle Bent-Normal Sky Fill in shadows
+        // Subtle Bent-Normal Sky Fill in shadows (suppress in pitch-black caves to avoid 1/8-res tint lift)
         float3 bentWorld = (HasCameraBasis > 0) ? ViewToWorldDir(bentNormal, CameraRight, CameraUp, CameraFwd) : bentNormal;
         float3 skyFill = max(sh0 + shX * bentWorld.x + shY * bentWorld.y + shZ * bentWorld.z, 0.0f);
-        litColor += skyFill * albedo * effectiveAo * indirectWeight * (0.18f * effGi) * solidMask * (1.0f - silEdge * 0.4f);
+        litColor += skyFill * albedo * effectiveAo * indirectWeight * (0.18f * effGi) *
+                    saturate(centerLuma * 6.0f + 0.12f) * solidMask * (1.0f - silEdge * 0.4f);
 
         // Indirect specular sheen (strictly interior-only via edgeSafeMask)
         float3 indSpecF0 = lerp(float3(0.04f, 0.04f, 0.04f), bounceAlbedo, metallic);
@@ -1006,20 +1137,27 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         sculptVec = min(sculptVec, max(sculptVec * brightDamp, 0.0f));
         litColor *= clamp(1.0f + sculptVec, 0.45f, 1.50f);
 
-        // 0) SKIN: Dual-lobe micro-sebum catchlight (neutral F0) + vellus peach-fuzz grazing rim
+        // 0) SKIN: Pore-modulated Dual-Lobe GGX Sebum + Epidermal Sheen (neutral F0=0.028) + Vellus Peach-Fuzz Rim
         if (skinW > 0.04f)
         {
             float3 halfVec = normalize(keyDirView + toEye);
-            float nDotH = saturate(dot(shadedNormal, halfVec));
-            float sebumLobe = pow(nDotH, 26.0f) * 0.065f + pow(nDotH, 7.0f) * 0.020f;
-            float keyVis = saturate(dot(shadedNormal, keyDirView) + 0.25f);
-            float3 sebumSpec = lerp(float3(1.0f, 1.0f, 1.0f), keyTint, 0.45f) * sebumLobe * keyVis *
-                               specOcc * edgeSafeMask * skinW * (0.45f + 0.55f * saturate(SssIntensity)) *
-                               (centerLuma * 0.70f + 0.06f);
-            float vellus = pow(1.0f - safeNdotV, 3.6f) * 0.075f * edgeSafeMask * specOcc * skinW *
+            float nDotH = saturate(dot(skinDetailNormal, halfVec));
+            float poreSpecMask = 1.0f - poreDimple * 0.42f; // Highlights peak on micro-ridges between pores
+            float tightExp = lerp(42.0f, 18.0f, saturate(0.35f + poreRoughMod * 2.0f));
+            float sebumTight = pow(nDotH, tightExp) * 0.085f;
+            float sebumBroad = pow(nDotH, 8.5f) * 0.026f;
+            float skinFresnel = 0.028f + 0.972f * pow(1.0f - saturate(dot(toEye, skinDetailNormal)), 5.0f);
+            float fresnelGain = lerp(0.80f, 1.85f, saturate(skinFresnel * 6.0f));
+            float keyVis = saturate(dot(skinDetailNormal, keyDirView) + 0.20f) * contactShadow;
+
+            float3 sebumSpec = lerp(float3(1.0f, 1.0f, 1.0f), keyTint, 0.40f) * (sebumTight + sebumBroad) *
+                               fresnelGain * poreSpecMask * keyVis * specOcc * edgeSafeMask * skinW *
+                               (0.45f + 0.55f * saturate(SssIntensity)) * (centerLuma * 0.72f + 0.04f);
+
+            float vellus = pow(1.0f - safeNdotV, 3.6f) * 0.070f * edgeSafeMask * specOcc * skinW *
                            saturate(SssIntensity * 0.75f + 0.25f);
-            float3 vellusRim = lerp(sh0, keyTint, 0.45f) * vellus * (centerLuma * 0.65f + 0.05f);
-            litColor += (sebumSpec + vellusRim) * saturate(effRelight * 0.85f + 0.25f);
+            float3 vellusRim = lerp(sh0, keyTint, 0.45f) * vellus * (centerLuma * 0.60f + 0.03f);
+            litColor += (sebumSpec + vellusRim) * saturate(effRelight * 0.85f + 0.30f);
         }
 
         // 1) FABRIC: Charlie / Estevez-Kulla grazing velvet sheen + fold depth
@@ -1052,12 +1190,16 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             litColor *= (1.0f - microCav * soilW * (1.0f - wetSoilW) * 0.16f * edgeSafeMask);
         }
 
-        // 4) GRASS / FOLIAGE: Subtle backlit chlorophyll transmission
-        if (grassW > 0.04f)
+        // 4) GRASS / FOLIAGE: Strictly sunlit green chlorophyll transmission (zero glow in dark shadows or on dry ground)
+        if (grassW > 0.04f && directMask > 0.08f)
         {
+            float invLg = rcp(max(centerLuma + 0.04f, 0.04f));
+            float greenChroma = smoothstep(0.01f, 0.12f, (centerColor.g - centerColor.b) * invLg) *
+                                smoothstep(-0.04f, 0.06f, (centerColor.g - centerColor.r * 0.82f) * invLg);
             float backLight = pow(saturate(dot(viewDir, -keyDirView)), 2.5f);
-            float trans = backLight * grassW * (effRelight * 0.35f + SssIntensity * 0.30f) * solidMask * (1.0f - silEdge * 0.75f);
-            litColor += albedo * keyTint * float3(1.02f, 1.08f, 0.85f) * trans * (0.24f + Luma(giBounce));
+            float trans = backLight * grassW * greenChroma * directMask * contactShadow *
+                          (effRelight * 0.25f + SssIntensity * 0.25f) * solidMask * (1.0f - silEdge * 0.75f);
+            litColor += centerColor * keyTint * float3(1.02f, 1.12f, 0.80f) * trans * 0.65f;
         }
     }
 
