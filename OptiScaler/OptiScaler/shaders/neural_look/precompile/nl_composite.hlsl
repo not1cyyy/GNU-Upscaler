@@ -282,13 +282,13 @@ float3 ApplyAgxFilmicContrast(float3 linearCol, float contrastStr)
     float l = max(Luma(inset), 1e-5f);
     float midGray = 0.18f;
     float logRatio = log2(max(l / midGray, 1e-4f));
-    float slope = 1.0f + contrastStr * 0.16f;
+    float slope = 1.0f + contrastStr * 0.26f;
     float contrasted = midGray * exp2(clamp(logRatio * slope, -10.0f, 6.0f));
 
     // Smooth highlight rolloff shoulder preserving HDR headroom
     float shoulder = l / (1.0f + max(l - 1.05f, 0.0f) * contrastStr * 0.15f);
     float targetL = lerp(contrasted, min(contrasted, shoulder), smoothstep(0.65f, 2.2f, l));
-    float3 graded = inset * clamp(targetL / l, 0.60f, 1.35f);
+    float3 graded = inset * clamp(targetL / l, 0.52f, 1.45f);
 
     // Subtle AgX highlight purity rolloff above 1.4
     float hiBlend = saturate((targetL - 1.4f) * 0.18f) * contrastStr;
@@ -433,42 +433,36 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float maxDepthGrad = max(abs(dR - dL), abs(dD - dU));
     float haloRisk = smoothstep(0.06f, 0.18f, maxDepthGrad / max(centerDepth, 0.05f));
 
-    // 3D Depth-Occluded Volumetric Light Scattering (foreground characters & beams occlude background light glow)
+    // Centered Continuous Depth-Safe Volumetric Airlight (zero foreground ghost clones!)
     float3 volumetricScatter = float3(0, 0, 0);
     if (VolumetricGlow > 1e-4f)
     {
-        float2 aspectScale = float2(1.0f, float(OutputWidth) / max(float(OutputHeight), 1.0f));
-        static const float2 vOffsets[4] = {
-            float2(-0.014f, -0.010f), float2(0.014f, -0.010f),
-            float2(-0.014f,  0.010f), float2(0.014f,  0.010f)
-        };
-        static const float vMips[4] = { 1.0f, 2.0f, 2.0f, 3.0f };
-        static const float vRadiusScale[4] = { 0.65f, 1.0f, 1.35f, 2.2f };
-        static const float vWeights[4] = { 0.22f, 0.26f, 0.26f, 0.26f };
+        static const float vMips[3] = { 2.0f, 3.0f, 4.0f };
+        static const float vWeights[3] = { 0.38f, 0.36f, 0.26f };
 
         [unroll]
-        for (int vi = 0; vi < 4; ++vi)
+        for (int vi = 0; vi < 3; ++vi)
         {
-            float2 tapUv = saturate(uv + vOffsets[vi] * aspectScale * vRadiusScale[vi]);
-            float4 pyr = ColorPyramidTex.SampleLevel(LinearClampPyr, tapUv, vMips[vi]);
+            float4 pyr = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, vMips[vi]);
             float3 tapCol = max(pyr.rgb, 0.0f);
             float wL = Luma(tapCol);
-            float brightGate = max(wL - 0.95f, 0.0f) / max(wL, 1e-4f);
+            float brightGate = max(wL - 0.85f, 0.0f) / max(wL, 1e-4f);
             float3 tapBright = tapCol * brightGate;
 
             float tapDepth = pyr.a;
+            float noFgBleed = smoothstep(0.38f, 0.78f, tapDepth / max(centerDepth, 0.05f));
             float frontOcc = smoothstep(0.55f, 1.05f, centerDepth / max(tapDepth, 0.05f));
-            float edgeWrap = haloRisk * 0.12f;
-            float airWeight = max(frontOcc, edgeWrap);
+            float depthValid = (centerDepth >= 64000.0f) ? smoothstep(15.0f, 40.0f, tapDepth)
+                                                         : (noFgBleed * frontOcc);
 
-            volumetricScatter += tapBright * airWeight * vWeights[vi];
+            volumetricScatter += tapBright * depthValid * vWeights[vi];
         }
     }
 
     // Fast skybox early-out
     if (skyMask <= 1e-4f && DebugView == 0)
     {
-        float3 skyOut = centerColor + volumetricScatter * (VolumetricGlow * 0.14f);
+        float3 skyOut = centerColor + volumetricScatter * (VolumetricGlow * 0.22f);
         if (FusedRcasSharpness > 1e-4f)
         {
             float minL = min(min(lumaU, lumaL), min(lumaR, lumaD));
@@ -591,13 +585,13 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float clothMask = saturate((1.0f - metallic) * (1.0f - skinMask) * (1.0f - foliageMask) *
                                smoothstep(0.60f, 0.92f, roughness));
 
-    // Phase 3: Zero-Bandwidth Separable Screen-Space Subsurface Scattering (SSSSS) in LDS for Skin!
+    // Phase 3: True 3-Ring Wavelength-Dependent Skin Subsurface Scattering (LDS + Depth-Guarded Pyramid Mips 0 & 1)
     float3 litColor = centerColor;
     if (skinMask > 0.06f && SssIntensity > 1e-4f && solidMask > 0.05f)
     {
-        float sssInvSigma = rcp(max(centerDepth * 0.028f, 0.015f));
-        float3 sumCol = centerColor * 0.40f;
-        float wSssSum = 0.40f;
+        float sssInvSigma = rcp(max(centerDepth * 0.032f, 0.015f));
+        float3 sumCol = centerColor * 0.36f;
+        float wSssSum = 0.36f;
 
         static const int2 sssTapOff[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
         [unroll]
@@ -605,17 +599,38 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         {
             int2 sp = ldsCoord + sssTapOff[st];
             float sd = s_depth[sp.y][sp.x];
-            float sw = exp(-abs(centerDepth - sd) * sssInvSigma) * 0.15f;
+            float sw = exp(-abs(centerDepth - sd) * sssInvSigma) * 0.16f;
             sumCol += s_color[sp.y][sp.x].rgb * sw;
             wSssSum += sw;
         }
-        float3 blurredSkin = sumCol / max(wSssSum, 1e-4f);
-        // Wavelength-dependent diffusion: warm red penetrates deepest, blue stays sharp
-        float3 rgbFalloff = float3(0.75f, 0.32f, 0.14f) * saturate(skinMask * SssIntensity * 0.85f) * solidMask * (1.0f - haloRisk);
-        litColor = lerp(litColor, blurredSkin, rgbFalloff);
+        float3 ring1 = sumCol / max(wSssSum, 1e-4f);
+
+        float sssPyrSigma = rcp(max(centerDepth * 0.040f, 0.020f));
+        float4 pyr0 = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, 0.0f);
+        float4 pyr1 = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, 1.0f);
+        float w2 = exp(-abs(centerDepth - pyr0.a) * sssPyrSigma);
+        float w3 = exp(-abs(centerDepth - pyr1.a) * sssPyrSigma);
+        float3 ring2 = lerp(ring1, max(pyr0.rgb, 0.0f), w2);
+        float3 ring3 = lerp(ring2, max(pyr1.rgb, 0.0f), w3);
+
+        // Wavelength-dependent hemoglobin profile: red diffuses deepest, green mid, blue stays crisp
+        float3 diffusedSkin = float3(
+            lerp(ring1.r, ring2.r * 0.50f + ring3.r * 0.50f, 0.72f),
+            lerp(ring1.g, ring2.g * 0.75f + ring3.g * 0.25f, 0.42f),
+            lerp(centerColor.b, ring1.b, 0.55f)
+        ) * float3(1.06f, 0.99f, 0.96f);
+
+        float3 rgbFalloff = float3(0.82f, 0.40f, 0.18f) * saturate(skinMask * SssIntensity * 0.90f) *
+                            solidMask * (1.0f - haloRisk * 0.75f);
+        litColor = lerp(litColor, max(diffusedSkin, 0.0f), rgbFalloff);
     }
 
-    // Scene-Derived Key Light, World Up, and Local 3D Light-Field Vector from Nearby Bright Emitters
+    // Scene L1 SH + Derived Key Light + World Up + Local 3D Light-Field Vector from Nearby Bright Emitters
+    float3 sh0 = max(ResolvedSceneLightBuf[0].rgb, 0.01f);
+    float3 shX = ResolvedSceneLightBuf[1].rgb;
+    float3 shY = ResolvedSceneLightBuf[2].rgb;
+    float3 shZ = ResolvedSceneLightBuf[3].rgb;
+
     float4 keyDirData = ResolvedSceneLightBuf[4];
     float3 keyDirView = normalize(keyDirData.xyz);
     float keyStrength = saturate(keyDirData.w);
@@ -668,67 +683,71 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float localLuma = max(Luma(localLightCol), 1e-4f);
     float3 localLightTint = clamp(localLightCol / localLuma, 0.50f, 1.80f);
 
-    // Energy-Conserving GI + Multi-Bounce AO + Frostbite Specular Occlusion + Calibrated Chromatic GI
+    // Path-Traced Ambient De-Lighting + Deep Sculptural Multi-Bounce AO + Frostbite Specular Occlusion + Vivid Chromatic GI
     float specOcc = 1.0f;
     if (GiEnabled > 0)
     {
-        float indirectWeight = saturate(1.0f - directMask * 0.72f) * (1.0f - skinMask * 0.50f);
-        float flooredAo = max(contactAo, 0.26f);
+        float indirectWeight = saturate(1.0f - directMask * 0.62f) * (1.0f - skinMask * 0.55f);
+        float flooredAo = max(contactAo, 0.14f);
         float effectiveAo = lerp(1.0f, flooredAo, indirectWeight);
         float3 coloredAo = float3(MultiBounceAO(min16float(effectiveAo), min16float3(albedo)));
         specOcc = ComputeSpecularOcclusion(NdotV, effectiveAo, roughness);
-        float csFactor = lerp(1.0f, max(contactShadow, 0.48f), 0.72f * solidMask);
+        float csFactor = lerp(1.0f, max(contactShadow, 0.30f), 0.85f * solidMask);
         litColor = litColor * lerp(float3(1, 1, 1), coloredAo, solidMask) * csFactor;
 
-        float shadowFocus = rcp(1.0f + centerLuma * 0.85f);
-        float3 bounceAlbedo = clamp(albedo, 0.03f, 0.90f);
-        // Diffuse colored bounce from glowing lights & walls (direct-light-protected so lit walls never turn white)
-        litColor += giBounce * bounceAlbedo * (1.0f - metallic * 0.65f) * (1.0f - directMask * 0.50f) *
-                    (GiIntensity * (0.45f + 0.65f * shadowFocus)) * solidMask;
+        float shadowFocus = rcp(1.0f + centerLuma * 0.70f);
+        float3 bounceAlbedo = max(clamp(albedo, 0.05f, 0.92f),
+                                  float3(0.14f, 0.14f, 0.14f) * (1.0f - metallic * 0.50f));
+        litColor += giBounce * bounceAlbedo * (1.0f - metallic * 0.50f) * (1.0f - directMask * 0.35f) *
+                    (GiIntensity * (0.85f + 1.15f * shadowFocus)) * solidMask;
 
-        // Subtle indirect colored specular sheen on smooth/metallic surfaces
+        // Indirect specular colored sheen so dark painted steel, armor, and pipes pick up colored environment light
         float3 indSpecF0 = lerp(float3(0.04f, 0.04f, 0.04f), bounceAlbedo, metallic);
         float indFresnel = 0.25f + 0.75f * pow(1.0f - NdotV, 4.0f);
-        litColor += giBounce * indSpecF0 * indFresnel * pow(smoothness, 2.0f) * specOcc *
-                    (1.0f - skinMask * 0.85f) * (GiIntensity * 0.22f) * solidMask;
+        litColor += giBounce * indSpecF0 * indFresnel * pow(smoothness, 1.45f) * specOcc *
+                    (1.0f - skinMask * 0.80f) * (GiIntensity * 0.55f) * solidMask;
     }
 
-    // Physically-Based Roughness-Cone SSR with Schlick Fresnel + Frostbite Specular Occlusion
-    if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && roughness < 0.80f)
+    // Stunning Ray-Traced Grazing & Metallic SSR (roughness < 0.82)
+    if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && roughness < 0.82f)
     {
         float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
         f0 = lerp(f0, float3(0.028f, 0.028f, 0.028f), skinMask);
         float fresnel = pow(1.0f - NdotV, 5.0f);
         float3 specF = f0 + (1.0f - f0) * fresnel;
-        float glossGate = pow(smoothness, 2.2f) * (1.0f - skinMask * 0.85f);
-        float reflWeight = saturate((max(specF.r, max(specF.g, specF.b)) + metallic * 0.14f) * glossGate *
-                                    SsrIntensity * 1.15f) *
-                           solidMask * (1.0f - haloRisk * 0.70f) * specOcc * saturate(ssrSample.a);
+        float glossGate = pow(smoothness, 1.55f) * (1.0f - skinMask * 0.85f);
+        float reflWeight = saturate((max(specF.r, max(specF.g, specF.b)) * 1.40f + metallic * 0.25f) * glossGate *
+                                    SsrIntensity * 1.35f) *
+                           solidMask * (1.0f - haloRisk * 0.65f) * specOcc * saturate(ssrSample.a);
         float3 reflTint = lerp(float3(1, 1, 1), albedo, metallic * 0.70f);
         litColor = lerp(litColor, ssrSample.rgb * reflTint, reflWeight);
     }
 
-    // Natural 3D Volume Sculpting & Grazing Rim (zero camera headlamp flash!)
+    // Scene L1 Spherical-Harmonics 3D Sculptural Relighting & Foreground Rim Separation
     if (RelightIntensity > 1e-4f)
     {
-        float macroKey = (dot(viewNormal, keyDirView) - 0.10f) * 0.08f * keyStrength;
-        float hemiTerm = dot(viewNormal, worldUpInView) * 0.09f;
+        float3 shNormal = (HasCameraBasis > 0) ? ViewToWorldDir(viewNormal, CameraRight, CameraUp, CameraFwd) : viewNormal;
+        float3 shDirRad = max(sh0 + shX * shNormal.x + shY * shNormal.y + shZ * shNormal.z, 0.0f);
+        float shMeanL = max(Luma(sh0), 0.04f);
+        float3 shRatio = clamp(shDirRad / shMeanL, 0.45f, 1.65f) - 1.0f;
 
-        float sculpt = (macroKey + hemiTerm) * RelightIntensity * solidMask;
-        float3 sculptTint = (sculpt >= 0.0f) ? keyTint : float3(0.88f, 0.94f, 1.08f);
-        litColor *= max(1.0f + sculpt * sculptTint, 0.58f);
+        float macroKey = (dot(viewNormal, keyDirView) - 0.12f) * 0.12f * keyStrength;
+        float hemiTerm = dot(viewNormal, worldUpInView) * 0.14f;
+        float3 sculptTint = (macroKey + hemiTerm >= 0.0f) ? keyTint : float3(0.88f, 0.94f, 1.08f);
+        float3 sculptVec = (shRatio * 0.22f + (macroKey + hemiTerm) * sculptTint) * RelightIntensity * solidMask;
+        litColor *= clamp(1.0f + sculptVec, 0.42f, 1.48f);
 
-        // Local-light grazing rim scatter with subtle foreground character/geometry separation
-        float fgBoost = 1.0f + 0.35f * (1.0f - smoothstep(2.0f, 10.0f, centerDepth));
-        float rim = pow(1.0f - NdotV, 3.0f) * RelightIntensity * solidMask * specOcc * 0.10f *
-                    (1.0f - roughness * 0.45f) * fgBoost;
+        // Foreground-emphasized grazing rim scatter tinted by scene key & local 3D lights
+        float fgBoost = 1.0f + 0.55f * (1.0f - smoothstep(1.5f, 9.0f, centerDepth));
+        float rim = pow(1.0f - NdotV, 3.0f) * RelightIntensity * solidMask * specOcc * 0.18f *
+                    (1.0f - roughness * 0.35f) * fgBoost;
         float3 rimTint = lerp(keyTint, localLightTint, localLightWeight);
-        litColor += litColor * rim * rimTint * saturate(Luma(giBounce) * 1.3f + localLightWeight * 0.55f + 0.25f);
+        litColor += litColor * rim * rimTint * saturate(Luma(giBounce) * 1.4f + localLightWeight * 0.65f + 0.30f);
 
         // Charlie velvet/cloth sheen at grazing angles (zero black-floor lift)
         if (clothMask > 0.05f)
         {
-            float sheen = pow(1.0f - NdotV, 4.0f) * clothMask * RelightIntensity * solidMask * 0.12f;
+            float sheen = pow(1.0f - NdotV, 4.0f) * clothMask * RelightIntensity * solidMask * 0.14f;
             litColor += (albedo * 0.6f + keyTint * 0.4f) * sheen * centerLuma;
         }
 
@@ -741,24 +760,24 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         }
     }
 
-    // Specular Micro-Relief
+    // Crisp Smooth/Metallic Highlight Clarity (no silhouette outlines)
     if (SpecularRelief > 1e-4f)
     {
         float microMag = length(microGrad) * meshGuard;
-        float grazing = pow(1.0f - NdotV, 3.5f) * smoothness;
+        float grazing = pow(1.0f - NdotV, 3.2f) * smoothness;
         float specSignal = 0.50f * grazing + 0.50f * saturate(microMag * 1.15f) * smoothness;
-        float specMod = SpecularRelief * detailGuard * specOcc * specSignal * 0.14f * (1.0f - skinMask * 0.45f);
+        float specMod = SpecularRelief * detailGuard * specOcc * specSignal * 0.24f * (1.0f - skinMask * 0.55f);
         litColor *= (1.0f + specMod);
     }
 
     if (VolumetricGlow > 1e-4f)
     {
-        litColor += volumetricScatter * (VolumetricGlow * 0.24f * (0.35f + 0.65f * (1.0f - flickerSoft)));
+        litColor += volumetricScatter * (VolumetricGlow * 0.36f * (0.35f + 0.65f * (1.0f - flickerSoft)));
 
-        // Subtle Beer-Lambert distant atmospheric depth separation (only past 18m, preserves foreground blacks)
-        float farDist = max(centerDepth - 18.0f, 0.0f);
-        float aerialFactor = saturate(1.0f - exp(-farDist * 0.005f)) * min(VolumetricGlow * 0.06f, 0.07f) * skyMask;
-        float3 sceneAmbient = max(ResolvedSceneLightBuf[0].rgb * 0.25f + volumetricScatter * 0.20f, 0.0f);
+        // Subtle Beer-Lambert distant atmospheric depth separation (only past 16m, preserves foreground blacks)
+        float farDist = max(centerDepth - 16.0f, 0.0f);
+        float aerialFactor = saturate(1.0f - exp(-farDist * 0.006f)) * min(VolumetricGlow * 0.08f, 0.09f) * skyMask;
+        float3 sceneAmbient = max(sh0 * 0.28f + volumetricScatter * 0.25f, 0.0f);
         litColor = lerp(litColor, max(litColor, sceneAmbient), aerialFactor);
     }
 

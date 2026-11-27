@@ -538,7 +538,7 @@ class NL_Common
         c.RayCount = (_activeTier == 0) ? 1 : 2;
         c.StepCount = (_activeTier >= 2) ? 6 : 4;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
-        c.SsrSteps = (_activeTier >= 2) ? 14 : 8;
+        c.SsrSteps = (_activeTier >= 2) ? 16 : 10;
         c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
         c.WorldHashEnabled = (worldHashEnabled && inConst.HasCameraBasis) ? 1 : 0;
 
@@ -548,9 +548,9 @@ class NL_Common
         ComputeTanFov(c.OutputWidth, c.OutputHeight, inConst, c.TanHalfFov, c.TanHalfFovAspect);
 
         const float minDim = (float) std::min(c.OutputWidth, c.OutputHeight);
-        c.GiRadius = std::clamp(minDim * 0.16f, 64.0f, 220.0f);
+        c.GiRadius = std::clamp(minDim * 0.18f, 72.0f, 256.0f);
         c.GiBias = 0.04f;
-        c.ContactShadowSteps = (_activeTier >= 2) ? 6.0f : ((_activeTier == 1) ? 4.0f : 3.0f);
+        c.ContactShadowSteps = (_activeTier >= 2) ? 8.0f : ((_activeTier == 1) ? 5.0f : 3.0f);
 
         CopyCameraBasis(inConst, c.CameraPos, c.CameraRight, c.CameraUp, c.CameraFwd);
     }
