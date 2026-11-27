@@ -8289,16 +8289,16 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
         }
         else // Ultra Cinematic
         {
-            config->NeuralLookGiIntensity = 1.60f;
-            config->NeuralLookAoIntensity = 1.35f;
-            config->NeuralLookSsrIntensity = 1.50f;
-            config->NeuralLookRelightIntensity = 1.30f;
-            config->NeuralLookVolumetricGlow = 0.70f;
-            config->NeuralLookDetail = 0.70f;
-            config->NeuralLookSpecularRelief = 0.65f;
-            config->NeuralLookToneContrast = 0.52f;
-            config->NeuralLookSssIntensity = 1.15f;
-            config->NeuralLookContactShadowIntensity = 1.10f;
+            config->NeuralLookGiIntensity = 1.75f;
+            config->NeuralLookAoIntensity = 1.50f;
+            config->NeuralLookSsrIntensity = 1.60f;
+            config->NeuralLookRelightIntensity = 1.50f;
+            config->NeuralLookVolumetricGlow = 0.85f;
+            config->NeuralLookDetail = 0.80f;
+            config->NeuralLookSpecularRelief = 0.75f;
+            config->NeuralLookToneContrast = 0.62f;
+            config->NeuralLookSssIntensity = 1.25f;
+            config->NeuralLookContactShadowIntensity = 1.25f;
         }
     }
 

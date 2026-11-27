@@ -302,10 +302,19 @@ float3 ApplySubtleFilmicCurve(float3 linearCol, float contrastStr)
     if (l <= 1e-5f)
         return float3(0.0f, 0.0f, 0.0f);
 
-    // Gentle shadow toe below 0.18 + soft highlight roll-off above 1.15
-    float toe = lerp(l, l * l / max(l + 0.06f * contrastStr, 1e-4f), (1.0f - smoothstep(0.02f, 0.24f, l)) * contrastStr * 0.55f);
-    float shoulder = toe / (1.0f + max(toe - 1.15f, 0.0f) * contrastStr * 0.16f);
-    float targetL = lerp(toe, shoulder, smoothstep(0.85f, 2.5f, toe));
+    // Deeper shadow toe + gentle midtone S-curve contrast + soft HDR highlight shoulder
+    float toe = l * l / max(l + 0.085f * contrastStr, 1e-4f);
+    float toeW = (1.0f - smoothstep(0.015f, 0.30f, l)) * contrastStr * 0.72f;
+    float l1 = lerp(l, toe, toeW);
+
+    float pivot = 0.28f;
+    float sPow = 1.0f + contrastStr * 0.24f;
+    float lS = pivot * pow(max(l1 / pivot, 1e-5f), sPow);
+    float sBlend = smoothstep(0.0f, 0.06f, l1) * (1.0f - smoothstep(0.85f, 2.0f, l1));
+    float l2 = lerp(l1, lS, sBlend * 0.65f);
+
+    float shoulder = l2 / (1.0f + max(l2 - 1.10f, 0.0f) * contrastStr * 0.20f);
+    float targetL = lerp(l2, shoulder, smoothstep(0.80f, 2.40f, l2));
 
     return max(linearCol * (targetL / l), 0.0f);
 }
@@ -627,10 +636,11 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float3 bentNormal = viewNormal;
     float3 giDir = viewNormal;
 
-    float effGi = min(GiIntensity, 1.35f);
-    float effAo = min(AoIntensity, 1.20f);
-    float effSsr = min(SsrIntensity, 1.15f);
-    float effRelight = min(RelightIntensity, 1.15f);
+    float effGi = clamp(GiIntensity, 0.0f, 2.0f);
+    float effAo = clamp(AoIntensity, 0.0f, 2.0f);
+    float effSsr = clamp(SsrIntensity, 0.0f, 2.0f);
+    float effRelight = clamp(RelightIntensity, 0.0f, 2.0f);
+    float effCs = clamp(ContactShadowIntensity, 0.0f, 2.0f);
 
     if (GiEnabled > 0)
     {
@@ -640,11 +650,16 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
                                  giSample, ssrSample, flickerSoft, viewNormal, bentNormal, giDir);
         giBounce = max(giSample.rgb, 0.0f);
         float giL = Luma(giBounce);
-        if (giL > 2.2f)
-            giBounce *= 2.2f / giL;
-        contactAo = lerp(1.0f, saturate(giSample.a), saturate(effAo) * skyMask * (1.0f - flickerSoft));
+        if (giL > 2.8f)
+            giBounce *= 2.8f / giL;
+        float aoPower = 0.45f + effAo * 1.10f;
+        float shapedAo = pow(max(saturate(giSample.a), 1e-4f), aoPower);
+        contactAo = lerp(1.0f, shapedAo, saturate(effAo * 2.5f) * skyMask * (1.0f - flickerSoft));
+
         float rawCs = saturate(DenoisedMetaTex.Load(int3(halfCoord, 0)).r);
-        contactShadow = lerp(1.0f, rawCs, saturate(ContactShadowIntensity) * skyMask * (1.0f - flickerSoft));
+        float csPower = 0.55f + effCs * 0.85f;
+        float shapedCs = pow(max(rawCs, 1e-4f), csPower);
+        contactShadow = lerp(1.0f, shapedCs, saturate(effCs * 2.5f) * skyMask * (1.0f - flickerSoft));
     }
     else
     {
@@ -704,9 +719,21 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     if (HasGBufferSubsurface > 0)
         skinProb = max(skinProb, saturate(GBufferSubsurfaceTex.Load(int3(gCoord, 0)).r));
 
+    float skinChromaGate = 1.0f;
+    if (HasGBufferSubsurface == 0)
+    {
+        float invL = rcp(max(centerLuma + 0.05f, 0.05f));
+        float rg = (centerColor.r - centerColor.g) * invL;
+        float rb = (centerColor.r - centerColor.b) * invL;
+        float warmSkin = smoothstep(0.015f, 0.12f, rb) * smoothstep(-0.03f, 0.06f, rg) *
+                         (1.0f - smoothstep(0.95f, 1.45f, rb));
+        float nearCharDist = 1.0f - smoothstep(14.0f, 32.0f, centerDepth);
+        skinChromaGate = warmSkin * nearCharDist;
+    }
+
     float maxSem = max(max(max(skinProb, fabricProb), max(sandProb, soilProb)), max(grassProb, hardProb));
     float confGate = smoothstep(0.28f, 0.65f, maxSem);
-    float skinW = smoothstep(0.32f, 0.72f, skinProb) * confGate;
+    float skinW = smoothstep(0.28f, 0.68f, skinProb) * confGate * skinChromaGate;
     float fabricW = smoothstep(0.32f, 0.72f, fabricProb) * confGate;
     float sandW = smoothstep(0.32f, 0.72f, sandProb) * confGate;
     float soilW = smoothstep(0.32f, 0.72f, soilProb) * confGate;
@@ -721,22 +748,14 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float3 shadedNormal = viewNormal;
     if (HasGBufferNormals == 0)
     {
-        float microStrength = (soilW * 0.22f + sandW * 0.16f + hardProb * 0.10f + fabricW * 0.08f) *
-                              (1.0f - skinW) * (1.0f - grassW) * edgeSafeMask * meshGuard;
+        float microStrength = (soilW * 0.22f + sandW * 0.16f + hardProb * 0.10f + fabricW * 0.08f + skinW * 0.055f) *
+                              (1.0f - grassW) * edgeSafeMask * meshGuard;
         if (microStrength > 1e-4f)
             shadedNormal = normalize(viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * microStrength);
     }
 
-    // Lean Depth-Guarded Skin Subsurface Scattering (LDS 4-tap + 1 mip tap, capped luma)
+    // Photorealistic Detail-Preserving Dermis SSS + Terminator Hemoglobin Warmth
     float3 litColor = centerColor;
-    float skinChromaGate = 1.0f;
-    if (HasGBufferSubsurface == 0)
-    {
-        float invL = rcp(max(centerLuma + 0.05f, 0.05f));
-        float rg = (centerColor.r - centerColor.g) * invL;
-        float rb = (centerColor.r - centerColor.b) * invL;
-        skinChromaGate = smoothstep(0.02f, 0.14f, rb) * smoothstep(-0.02f, 0.08f, rg);
-    }
     float effSkinSss = saturate(skinProb * SssIntensity * 0.85f) * skinChromaGate;
     if (effSkinSss > 0.03f && SssIntensity > 1e-4f && solidMask > 0.05f)
     {
@@ -756,6 +775,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             wSssSum += sw;
         }
         float3 ring1 = sumCol / max(wSssSum, 1e-4f);
+        float3 epiDetail = centerColor - ring1;
 
         float sssPyrSigma = rcp(max(centerDepth * 0.032f, 0.020f));
         float4 pyr0 = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, 0.0f);
@@ -763,18 +783,25 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float3 ring2 = lerp(ring1, max(pyr0.rgb, 0.0f), w2);
 
         float3 diffusedSkin = float3(
-            lerp(ring1.r, ring2.r, 0.65f),
-            lerp(ring1.g, ring2.g, 0.40f),
-            lerp(centerColor.b, ring1.b, 0.50f)
-        ) * float3(1.04f, 0.99f, 0.97f);
+            lerp(ring1.r, ring2.r, 0.70f),
+            lerp(ring1.g, ring2.g, 0.42f),
+            lerp(centerColor.b, ring1.b, 0.48f)
+        ) * float3(1.01f, 0.995f, 0.99f) + epiDetail * float3(0.45f, 0.78f, 0.88f);
 
-        float diffLuma = Luma(diffusedSkin);
-        if (diffLuma > centerLuma * 1.12f + 0.01f)
-            diffusedSkin *= (centerLuma * 1.12f + 0.01f) / max(diffLuma, 1e-4f);
+        float skinNdotK = dot(shadedNormal, keyDirView);
+        float termBand = exp(-pow((skinNdotK - 0.10f) / 0.34f, 2.0f)) * saturate(keyStrength * 1.15f + 0.15f);
+        float3 dermisTint = float3(1.00f, 0.34f, 0.16f);
+        float3 termScatter = dermisTint * max(ring2, centerColor) * termBand * effSkinSss *
+                             (0.16f + 0.12f * (1.0f - directMask)) * solidMask * (1.0f - silEdge * 0.85f);
 
-        float3 rgbFalloff = float3(0.75f, 0.38f, 0.16f) * effSkinSss *
-                            solidMask * (1.0f - silEdge * 0.85f);
-        litColor = lerp(litColor, max(diffusedSkin, 0.0f), rgbFalloff);
+        float3 blendedSkin = lerp(litColor, max(diffusedSkin, 0.0f),
+                                  float3(0.70f, 0.35f, 0.15f) * effSkinSss * solidMask * (1.0f - silEdge * 0.85f)) +
+                             termScatter;
+        float diffLuma = Luma(blendedSkin);
+        if (diffLuma > centerLuma * 1.14f + 0.01f)
+            blendedSkin *= (centerLuma * 1.14f + 0.01f) / max(diffLuma, 1e-4f);
+
+        litColor = max(blendedSkin, 0.0f);
     }
 
     // Subtle wet soil darkening (only strong when real GBuffer roughness confirms wet surface)
@@ -785,54 +812,55 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float specOcc = 1.0f;
     if (GiEnabled > 0)
     {
-        float indirectWeight = saturate(1.0f - directMask * 0.68f) * (1.0f - skinW * 0.55f);
+        float indirectWeight = saturate(1.0f - directMask * 0.48f) * (1.0f - skinW * 0.22f);
 
         // Texture-preserving scalar ambient de-lighting (no coarse 1/8-res albedo subtraction)
-        float delightFrac = saturate(Luma(sh0) * 0.22f) * indirectWeight * (1.0f - silEdge * 0.50f) *
-                            min(effGi * 0.22f + effAo * 0.14f, 0.24f);
+        float delightFrac = saturate(Luma(sh0) * 0.26f) * indirectWeight * (1.0f - silEdge * 0.50f) *
+                            min(effGi * 0.26f + effAo * 0.18f, 0.34f);
         litColor *= (1.0f - delightFrac * solidMask);
 
-        float aoFloor = lerp(0.18f, 0.32f, sandW);
+        float aoFloor = lerp(0.14f, 0.24f, sandW);
         float effectiveAo = lerp(1.0f, max(contactAo, aoFloor), indirectWeight);
-        float3 coloredAo = float3(MultiBounceAO(min16float(effectiveAo), min16float3(albedo)));
+        float3 aoAlbedo = lerp(albedo, Luma(albedo).xxx, skinW * 0.35f);
+        float3 coloredAo = float3(MultiBounceAO(min16float(effectiveAo), min16float3(aoAlbedo)));
         specOcc = ComputeSpecularOcclusion(bentNdotV, effectiveAo, effRoughness);
-        float csFactor = lerp(1.0f, max(contactShadow, 0.35f), 0.80f * solidMask);
+        float csFactor = lerp(1.0f, max(contactShadow, 0.24f), 0.90f * solidMask);
         litColor = litColor * lerp(float3(1, 1, 1), coloredAo, solidMask) * csFactor;
 
-        float dirGiShade = 0.58f + 0.42f * saturate(dot(shadedNormal, giDir));
-        float sunAtten = (1.0f - directMask * 0.72f) * rcp(1.0f + centerLuma * 1.35f);
+        float dirGiShade = 0.48f + 0.52f * saturate(dot(shadedNormal, giDir));
+        float sunAtten = (1.0f - directMask * 0.62f) * rcp(1.0f + centerLuma * 1.10f);
         float3 bounceAlbedo = max(clamp(albedo, 0.05f, 0.88f),
                                   float3(0.12f, 0.12f, 0.12f) * (1.0f - metallic * 0.50f));
 
         litColor += giBounce * bounceAlbedo * dirGiShade * (1.0f - metallic * 0.50f) *
-                    (effGi * (0.50f + 0.80f * sunAtten)) * solidMask;
+                    (effGi * (0.64f + 0.96f * sunAtten)) * solidMask;
 
         // Subtle Bent-Normal Sky Fill in shadows
         float3 bentWorld = (HasCameraBasis > 0) ? ViewToWorldDir(bentNormal, CameraRight, CameraUp, CameraFwd) : bentNormal;
         float3 skyFill = max(sh0 + shX * bentWorld.x + shY * bentWorld.y + shZ * bentWorld.z, 0.0f);
-        litColor += skyFill * albedo * effectiveAo * indirectWeight * (0.14f * effGi) * solidMask * (1.0f - silEdge * 0.4f);
+        litColor += skyFill * albedo * effectiveAo * indirectWeight * (0.18f * effGi) * solidMask * (1.0f - silEdge * 0.4f);
 
         // Indirect specular sheen (strictly interior-only via edgeSafeMask)
         float3 indSpecF0 = lerp(float3(0.04f, 0.04f, 0.04f), bounceAlbedo, metallic);
         float indFresnel = 0.25f + 0.75f * pow(1.0f - safeNdotV, 4.0f);
         litColor += giBounce * indSpecF0 * indFresnel * pow(smoothness, 1.5f) * specOcc *
-                    (1.0f - skinW * 0.80f) * (1.0f - fabricW * 0.75f) * (effGi * 0.38f) * edgeSafeMask;
+                    (1.0f - skinW * 0.80f) * (1.0f - fabricW * 0.75f) * (effGi * 0.48f) * edgeSafeMask;
     }
 
     // Ray-Traced Grazing & Metallic SSR (strictly restricted to glossy/metallic surfaces, zero sand/soil puddles)
-    if (GiEnabled > 0 && SsrEnabled > 0 && effSsr > 1e-4f && effRoughness < 0.56f)
+    if (GiEnabled > 0 && SsrEnabled > 0 && effSsr > 1e-4f && effRoughness < 0.62f)
     {
         float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
         f0 = lerp(f0, float3(0.028f, 0.028f, 0.028f), skinW);
         float fresnel = pow(1.0f - safeNdotV, 5.0f);
         float3 specF = f0 + (1.0f - f0) * fresnel;
-        float glossGate = pow(saturate(1.0f - effRoughness / 0.56f), 1.65f) * (1.0f - skinW * 0.90f) *
+        float glossGate = pow(saturate(1.0f - effRoughness / 0.62f), 1.65f) * (1.0f - skinW * 0.90f) *
                           (1.0f - fabricW * 0.85f) * (1.0f - sandW * 0.92f) * (1.0f - soilW * 0.85f) *
                           (1.0f - grassW * 0.95f);
         float ssrWetBoost = (HasGBufferRoughness > 0) ? (wetSoilW * 0.22f) : 0.0f;
         float reflWeight = min(saturate((max(specF.r, max(specF.g, specF.b)) * 1.25f + metallic * 0.24f + ssrWetBoost) *
-                                        glossGate * effSsr * 1.15f),
-                               0.58f) *
+                                        glossGate * effSsr * 1.30f),
+                               0.70f) *
                            edgeSafeMask * specOcc * saturate(ssrSample.a);
         float3 reflTint = lerp(float3(1, 1, 1), albedo, metallic * 0.70f);
         litColor = lerp(litColor, ssrSample.rgb * reflTint, reflWeight);
@@ -844,15 +872,35 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float3 shNormal = (HasCameraBasis > 0) ? ViewToWorldDir(bentNormal, CameraRight, CameraUp, CameraFwd) : bentNormal;
         float3 shDirRad = max(sh0 + shX * shNormal.x + shY * shNormal.y + shZ * shNormal.z, 0.0f);
         float shMeanL = max(Luma(sh0), 0.04f);
-        float3 shRatio = clamp(shDirRad / shMeanL, 0.55f, 1.50f) - 1.0f;
+        float3 shRatio = clamp(shDirRad / shMeanL, 0.48f, 1.62f) - 1.0f;
 
         float rawKeyDot = dot(shadedNormal, keyDirView);
-        float wrapKeyDot = (rawKeyDot + 0.20f * fabricW) / (1.0f + 0.20f * fabricW);
-        float macroKey = (wrapKeyDot - 0.10f) * 0.11f * keyStrength;
-        float hemiTerm = dot(shadedNormal, worldUpInView) * 0.12f;
-        float3 sculptTint = (macroKey + hemiTerm >= 0.0f) ? keyTint : float3(0.90f, 0.95f, 1.06f);
-        float3 sculptVec = (shRatio * 0.18f + (macroKey + hemiTerm) * sculptTint) * effRelight * solidMask;
-        litColor *= clamp(1.0f + sculptVec, 0.50f, 1.38f);
+        float skinFabricWrap = 0.28f * skinW + 0.20f * fabricW;
+        float wrapKeyDot = (rawKeyDot + skinFabricWrap) / (1.0f + skinFabricWrap);
+        float macroKey = (wrapKeyDot - 0.12f) * 0.19f * keyStrength;
+        float hemiTerm = dot(shadedNormal, worldUpInView) * 0.16f;
+        float bentContrast = (dot(bentNormal, worldUpInView) - dot(viewNormal, worldUpInView)) * 0.22f;
+        float3 sculptTint = (macroKey + hemiTerm >= 0.0f) ? keyTint : float3(0.87f, 0.93f, 1.08f);
+        float3 sculptVec = (shRatio * 0.26f + (macroKey + hemiTerm + bentContrast) * sculptTint) * effRelight * solidMask;
+        float brightDamp = rcp(1.0f + max(centerLuma - 0.65f, 0.0f) * 0.85f);
+        sculptVec = min(sculptVec, max(sculptVec * brightDamp, 0.0f));
+        litColor *= clamp(1.0f + sculptVec, 0.42f, 1.54f);
+
+        // 0) SKIN: Dual-lobe micro-sebum catchlight (neutral F0) + vellus peach-fuzz grazing rim
+        if (skinW > 0.04f)
+        {
+            float3 halfVec = normalize(keyDirView + toEye);
+            float nDotH = saturate(dot(shadedNormal, halfVec));
+            float sebumLobe = pow(nDotH, 26.0f) * 0.065f + pow(nDotH, 7.0f) * 0.020f;
+            float keyVis = saturate(dot(shadedNormal, keyDirView) + 0.25f);
+            float3 sebumSpec = lerp(float3(1.0f, 1.0f, 1.0f), keyTint, 0.45f) * sebumLobe * keyVis *
+                               specOcc * edgeSafeMask * skinW * (0.45f + 0.55f * saturate(SssIntensity)) *
+                               (centerLuma * 0.70f + 0.06f);
+            float vellus = pow(1.0f - safeNdotV, 3.6f) * 0.075f * edgeSafeMask * specOcc * skinW *
+                           saturate(SssIntensity * 0.75f + 0.25f);
+            float3 vellusRim = lerp(sh0, keyTint, 0.45f) * vellus * (centerLuma * 0.65f + 0.05f);
+            litColor += (sebumSpec + vellusRim) * saturate(effRelight * 0.85f + 0.25f);
+        }
 
         // 1) FABRIC: Charlie / Estevez-Kulla grazing velvet sheen + fold depth
         if (fabricW > 0.04f)
@@ -900,7 +948,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float grazing = pow(1.0f - safeNdotV, 3.2f) * smoothness;
         float specSignal = 0.50f * grazing + 0.50f * saturate(microMag * 1.15f) * smoothness;
         float matSpecGate = (1.0f - skinW * 0.55f) * (1.0f - fabricW * 0.80f) * (1.0f - grassW * 0.85f);
-        float specMod = SpecularRelief * edgeSafeMask * specOcc * specSignal * 0.22f * matSpecGate;
+        float specMod = SpecularRelief * edgeSafeMask * specOcc * specSignal * 0.34f * matSpecGate;
         litColor *= (1.0f + specMod);
     }
 
@@ -922,12 +970,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float4 bg1 = BilateralGrid1Tex.SampleLevel(LinearClampBg1, gridUv, 0.0f);
         float4 bg2 = BilateralGrid2Tex.SampleLevel(LinearClampBg2, gridUv, 0.0f);
 
-        float strength = saturate(NeuralDetail * 0.45f) * detailGuard;
-        float3 gain = 1.0f + clamp(bg0.rgb, -0.14f, 0.16f) * strength;
-        float shadowLift = clamp(bg0.a, -0.06f, 0.06f) * strength * rcp(1.0f + centerLuma * 2.5f);
-        float chromaBoost = clamp(bg2.x, -0.12f, 0.14f) * strength;
+        float strength = saturate(NeuralDetail * 0.68f) * detailGuard;
+        float3 gain = 1.0f + clamp(bg0.rgb, -0.22f, 0.24f) * strength;
+        float shadowLift = clamp(bg0.a, -0.08f, 0.08f) * strength * rcp(1.0f + centerLuma * 2.5f);
+        float chromaBoost = clamp(bg2.x, -0.16f, 0.18f) * strength;
 
-        finalColor = litColor * max(gain + shadowLift, 0.70f);
+        finalColor = litColor * max(gain + shadowLift, 0.62f);
         float finalLuma = Luma(finalColor);
         finalColor = finalLuma + (finalColor - finalLuma) * (1.0f + chromaBoost);
 

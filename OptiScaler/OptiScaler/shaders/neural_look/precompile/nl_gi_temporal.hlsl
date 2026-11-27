@@ -382,7 +382,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 if (any(sampleUv < 0.002f) || any(sampleUv > 0.998f))
                 {
                     float3 exitDir = normalize(lerp(viewNormal, float3(marchDirPx.x, -marchDirPx.y, -0.3f), 0.55f));
-                    float3 fb = QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f, float2(noiseA, noiseB)) * 0.06f;
+                    float3 fb = QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f, float2(noiseA, noiseB)) * 0.10f;
                     sliceGi += fb;
                     giDirAccum += exitDir * Luma(fb);
                     break;
@@ -479,16 +479,16 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                         sampleColor = clamp(sampleColor, 0.0f, 4.5f);
 
                         float hitLuma = Luma(sampleColor);
-                        float lightSignal = smoothstep(0.12f, 0.58f, hitLuma);
-                        float emitterBoost = 1.0f + smoothstep(0.55f, 1.80f, hitLuma) * 1.15f;
-                        // Slightly restrain bounce chroma (0.88) instead of amplifying it -> zero neon sand/grass
-                        float3 hitCol = max(lerp(hitLuma.xxx, sampleColor, 0.88f), 0.0f);
+                        float lightSignal = smoothstep(0.05f, 0.42f, hitLuma);
+                        float emitterBoost = 1.0f + smoothstep(0.48f, 1.75f, hitLuma) * 1.30f;
+                        // Slightly restrain bounce chroma (0.94) so shadows receive rich bounce without neon blowups
+                        float3 hitCol = max(lerp(hitLuma.xxx, sampleColor, 0.94f), 0.0f);
 
                         float normD = dist / max(giWorldRange * 0.38f, 0.5f);
                         float giAtten = rcp(1.0f + normD * normD) * pow(1.0f - saturate(dist / giWorldRange), 1.25f);
 
                         float3 hitContrib = hitCol * nDotL * emitterFace * lightSignal * emitterBoost * giAtten *
-                                            fgReject * (2.10f / float(steps));
+                                            fgReject * (2.75f / float(steps));
                         sliceGi += hitContrib;
                         giDirAccum += frontDir * Luma(hitContrib);
                     }
@@ -496,8 +496,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             }
         }
 
-        float sliceTightAo = saturate(1.0f - sliceTightOcc);
-        float sliceBroadAo = saturate(1.0f - sliceBroadOcc * 0.72f);
+        float sliceTightAo = saturate(1.0f - sliceTightOcc * 1.18f);
+        float sliceBroadAo = saturate(1.0f - sliceBroadOcc * 0.92f);
         float sliceVis = sliceTightAo * sliceBroadAo;
         accumAo += sliceVis;
         accumGi += sliceGi;
@@ -508,7 +508,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     }
 
     float3 currentGi = max(accumGi / float(slices), 0.0f);
-    float distAoFade = rcp(1.0f + centerDepth * 0.010f);
+    float distAoFade = rcp(1.0f + centerDepth * 0.006f);
     float currentAo = lerp(1.0f, saturate(accumAo / float(slices)), distAoFade);
 
     float3 bentNormal = (dot(bentNormalAccum, bentNormalAccum) > 1e-6f)
@@ -528,7 +528,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (nDotKey > 0.02f && keyStrength > 0.05f)
     {
         int cSteps = clamp(int(ContactShadowSteps), 2, 6);
-        float maxShadowDist = clamp(centerDepth * 0.065f, 0.08f, 1.80f);
+        float maxShadowDist = clamp(centerDepth * 0.085f, 0.10f, 2.40f);
         float occ = 0.0f;
         float invTanV = rcp(max(TanHalfFov, 1e-4f));
         float invTanH = rcp(max(TanHalfFovAspect, 1e-4f));
@@ -556,9 +556,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 occ = max(occ, win * (1.0f - fracS * 0.45f));
             }
         }
-        float csDistFade = rcp(1.0f + centerDepth * 0.022f);
+        float csDistFade = rcp(1.0f + centerDepth * 0.014f);
         float grassDamp = 1.0f - grassProb * 0.65f;
-        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * grassDamp * 0.80f);
+        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * grassDamp * 0.90f);
     }
 
     // 3. Anti-Stripe Stratified SSR + 2-Step Binary Refinement (exact half-res depth + normal self-hit rejection)
@@ -568,7 +568,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float2 ssrHitUv = uv;
     bool allowSsrMat = (sandProb <= 0.55f && soilProb <= 0.55f && grassProb <= 0.50f && fabricProb <= 0.55f);
 
-    if (SsrEnabled > 0 && allowSsrMat && effRoughness < 0.58f)
+    if (SsrEnabled > 0 && allowSsrMat && effRoughness < 0.62f)
     {
         float3 tUp = (abs(viewNormal.y) < 0.9f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
         float3 tU = normalize(cross(tUp, viewNormal));
@@ -753,7 +753,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float3 prevGiD = OctDecode(prevDir.zw);
         outGiDir = normalize(lerp(prevGiD, giDir, saturate(giAlpha)));
 
-        if (SsrEnabled > 0 && allowSsrMat && effRoughness < 0.58f)
+        if (SsrEnabled > 0 && allowSsrMat && effRoughness < 0.62f)
         {
             float2 ssrPrevUv = prevUv;
             if (currentSsr.a > 0.25f)
