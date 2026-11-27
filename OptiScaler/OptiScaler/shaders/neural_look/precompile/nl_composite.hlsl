@@ -623,14 +623,22 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float3 bentNormal = viewNormal;
     float3 giDir = viewNormal;
 
+    float effGi = min(GiIntensity, 1.35f);
+    float effAo = min(AoIntensity, 1.20f);
+    float effSsr = min(SsrIntensity, 1.15f);
+    float effRelight = min(RelightIntensity, 1.15f);
+
     if (GiEnabled > 0)
     {
         float4 giSample;
-        bool needSsr = (SsrEnabled > 0 && SsrIntensity > 1e-4f) || (DebugView == 5);
+        bool needSsr = (SsrEnabled > 0 && effSsr > 1e-4f) || (DebugView == 5);
         BilateralUpsampleHalfRes(ldsHalf, centerDepth, viewNormal, centerFlicker, needSsr,
                                  giSample, ssrSample, flickerSoft, viewNormal, bentNormal, giDir);
         giBounce = max(giSample.rgb, 0.0f);
-        contactAo = lerp(1.0f, saturate(giSample.a), saturate(AoIntensity) * skyMask * (1.0f - flickerSoft));
+        float giL = Luma(giBounce);
+        if (giL > 2.2f)
+            giBounce *= 2.2f / giL;
+        contactAo = lerp(1.0f, saturate(giSample.a), saturate(effAo) * skyMask * (1.0f - flickerSoft));
         float rawCs = saturate(DenoisedMetaTex.Load(int3(halfCoord, 0)).r);
         contactShadow = lerp(1.0f, rawCs, saturate(ContactShadowIntensity) * skyMask * (1.0f - flickerSoft));
     }
@@ -701,7 +709,9 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float grassW = smoothstep(0.32f, 0.72f, grassProb) * confGate;
     float wetSoilW = soilW * wetness;
 
-    float effRoughness = lerp(roughness, 0.14f, wetSoilW);
+    float effRoughness = (HasGBufferRoughness > 0)
+                             ? lerp(roughness, 0.14f, wetSoilW)
+                             : lerp(roughness, max(roughness * 0.85f, 0.36f), wetSoilW * 0.35f);
     float smoothness = saturate(1.0f - effRoughness);
 
     float3 shadedNormal = viewNormal;
@@ -754,20 +764,20 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         litColor = lerp(litColor, max(diffusedSkin, 0.0f), rgbFalloff);
     }
 
-    // Wet soil diffuse darkening before GI/AO
-    litColor *= lerp(1.0f, 0.74f, wetSoilW * solidMask);
+    // Subtle wet soil darkening (only strong when real GBuffer roughness confirms wet surface)
+    float wetDarken = (HasGBufferRoughness > 0) ? 0.74f : 0.94f;
+    litColor *= lerp(1.0f, wetDarken, wetSoilW * solidMask);
 
-    // Multi-Bounce AO + Contact Shadow + Sunlit-Equilibrium GI (zero desert orange wash)
+    // Multi-Bounce AO + Contact Shadow + Sunlit-Equilibrium GI (zero 1/8-res color blotches!)
     float specOcc = 1.0f;
     if (GiEnabled > 0)
     {
         float indirectWeight = saturate(1.0f - directMask * 0.68f) * (1.0f - skinW * 0.55f);
 
-        // Conservative energy-bounded ambient de-lighting in shadowed regions
-        float3 ambientFloor = min(litColor * 0.34f, albedo * max(Luma(sh0) * 0.28f, 0.030f)) *
-                              indirectWeight * (1.0f - silEdge * 0.50f) *
-                              saturate(GiIntensity * 0.45f + AoIntensity * 0.25f);
-        litColor = max(litColor - ambientFloor * solidMask, 0.0f);
+        // Texture-preserving scalar ambient de-lighting (no coarse 1/8-res albedo subtraction)
+        float delightFrac = saturate(Luma(sh0) * 0.22f) * indirectWeight * (1.0f - silEdge * 0.50f) *
+                            min(effGi * 0.22f + effAo * 0.14f, 0.24f);
+        litColor *= (1.0f - delightFrac * solidMask);
 
         float aoFloor = lerp(0.18f, 0.32f, sandW);
         float effectiveAo = lerp(1.0f, max(contactAo, aoFloor), indirectWeight);
@@ -782,37 +792,41 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
                                   float3(0.12f, 0.12f, 0.12f) * (1.0f - metallic * 0.50f));
 
         litColor += giBounce * bounceAlbedo * dirGiShade * (1.0f - metallic * 0.50f) *
-                    (GiIntensity * (0.55f + 0.85f * sunAtten)) * solidMask;
+                    (effGi * (0.50f + 0.80f * sunAtten)) * solidMask;
 
         // Subtle Bent-Normal Sky Fill in shadows
         float3 bentWorld = (HasCameraBasis > 0) ? ViewToWorldDir(bentNormal, CameraRight, CameraUp, CameraFwd) : bentNormal;
         float3 skyFill = max(sh0 + shX * bentWorld.x + shY * bentWorld.y + shZ * bentWorld.z, 0.0f);
-        litColor += skyFill * albedo * effectiveAo * indirectWeight * (0.14f * GiIntensity) * solidMask * (1.0f - silEdge * 0.4f);
+        litColor += skyFill * albedo * effectiveAo * indirectWeight * (0.14f * effGi) * solidMask * (1.0f - silEdge * 0.4f);
 
         // Indirect specular sheen (strictly interior-only via edgeSafeMask)
         float3 indSpecF0 = lerp(float3(0.04f, 0.04f, 0.04f), bounceAlbedo, metallic);
         float indFresnel = 0.25f + 0.75f * pow(1.0f - safeNdotV, 4.0f);
         litColor += giBounce * indSpecF0 * indFresnel * pow(smoothness, 1.5f) * specOcc *
-                    (1.0f - skinW * 0.80f) * (1.0f - fabricW * 0.75f) * (GiIntensity * 0.42f) * edgeSafeMask;
+                    (1.0f - skinW * 0.80f) * (1.0f - fabricW * 0.75f) * (effGi * 0.38f) * edgeSafeMask;
     }
 
-    // Ray-Traced Grazing & Metallic / Wet-Soil SSR (gated by edgeSafeMask)
-    if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && effRoughness < 0.80f)
+    // Ray-Traced Grazing & Metallic SSR (strictly restricted to glossy/metallic surfaces, zero sand/soil puddles)
+    if (GiEnabled > 0 && SsrEnabled > 0 && effSsr > 1e-4f && effRoughness < 0.56f)
     {
         float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
         f0 = lerp(f0, float3(0.028f, 0.028f, 0.028f), skinW);
         float fresnel = pow(1.0f - safeNdotV, 5.0f);
         float3 specF = f0 + (1.0f - f0) * fresnel;
-        float glossGate = pow(smoothness, 1.55f) * (1.0f - skinW * 0.85f) * (1.0f - fabricW * 0.78f);
-        float reflWeight = saturate((max(specF.r, max(specF.g, specF.b)) * 1.35f + metallic * 0.24f + wetSoilW * 0.28f) *
-                                    glossGate * SsrIntensity * 1.25f) *
+        float glossGate = pow(saturate(1.0f - effRoughness / 0.56f), 1.65f) * (1.0f - skinW * 0.90f) *
+                          (1.0f - fabricW * 0.85f) * (1.0f - sandW * 0.92f) * (1.0f - soilW * 0.85f) *
+                          (1.0f - grassW * 0.95f);
+        float ssrWetBoost = (HasGBufferRoughness > 0) ? (wetSoilW * 0.22f) : 0.0f;
+        float reflWeight = min(saturate((max(specF.r, max(specF.g, specF.b)) * 1.25f + metallic * 0.24f + ssrWetBoost) *
+                                        glossGate * effSsr * 1.15f),
+                               0.58f) *
                            edgeSafeMask * specOcc * saturate(ssrSample.a);
         float3 reflTint = lerp(float3(1, 1, 1), albedo, metallic * 0.70f);
         litColor = lerp(litColor, ssrSample.rgb * reflTint, reflWeight);
     }
 
     // Scene L1 SH 3D Sculptural Relighting + Material-Specific Micro-BRDFs (ZERO silhouette outline glow!)
-    if (RelightIntensity > 1e-4f)
+    if (effRelight > 1e-4f)
     {
         float3 shNormal = (HasCameraBasis > 0) ? ViewToWorldDir(bentNormal, CameraRight, CameraUp, CameraFwd) : bentNormal;
         float3 shDirRad = max(sh0 + shX * shNormal.x + shY * shNormal.y + shZ * shNormal.z, 0.0f);
@@ -824,7 +838,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float macroKey = (wrapKeyDot - 0.10f) * 0.11f * keyStrength;
         float hemiTerm = dot(shadedNormal, worldUpInView) * 0.12f;
         float3 sculptTint = (macroKey + hemiTerm >= 0.0f) ? keyTint : float3(0.90f, 0.95f, 1.06f);
-        float3 sculptVec = (shRatio * 0.18f + (macroKey + hemiTerm) * sculptTint) * RelightIntensity * solidMask;
+        float3 sculptVec = (shRatio * 0.18f + (macroKey + hemiTerm) * sculptTint) * effRelight * solidMask;
         litColor *= clamp(1.0f + sculptVec, 0.50f, 1.38f);
 
         // 1) FABRIC: Charlie / Estevez-Kulla grazing velvet sheen + fold depth
@@ -832,15 +846,15 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         {
             float invSin = rcp(max(sqrt(max(1.0f - safeNdotV * safeNdotV, 0.01f)), 0.15f));
             float charlie = saturate(pow(1.0f - safeNdotV, 3.2f) * (0.65f + 0.35f * invSin) * 0.42f);
-            float sheen = charlie * fabricW * RelightIntensity * edgeSafeMask * specOcc * 0.18f;
+            float sheen = charlie * fabricW * effRelight * edgeSafeMask * specOcc * 0.18f;
             litColor += lerp(albedo, keyTint, 0.35f) * sheen * (centerLuma * 0.80f + 0.04f);
         }
 
-        // 2) SAND: Oren-Nayar backscatter + sunlit sand chroma restraint + sparse quartz micro-glints
+        // 2) SAND: Oren-Nayar backscatter + sunlit sand chroma restraint (no synthetic sparkle dots)
         if (sandW > 0.04f)
         {
             float nDotK = saturate(dot(shadedNormal, keyDirView));
-            float orenNayarBoost = (0.12f * (1.0f - safeNdotV) * (0.4f + 0.6f * nDotK)) * sandW * RelightIntensity * edgeSafeMask;
+            float orenNayarBoost = (0.12f * (1.0f - safeNdotV) * (0.4f + 0.6f * nDotK)) * sandW * effRelight * edgeSafeMask;
             litColor *= (1.0f + orenNayarBoost);
 
             // Prevent sunlit desert sand from oversaturating into orange
@@ -848,21 +862,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             float curChroma = max(litColor.r, max(litColor.g, litColor.b)) - min(litColor.r, min(litColor.g, litColor.b));
             float excessChroma = saturate((curChroma - 0.18f) * 2.5f) * saturate((sandW - 0.10f) * directMask * 0.16f);
             litColor = lerp(litColor, curL.xxx, excessChroma);
-
-            if (HasCameraBasis > 0 && centerDepth < 14.0f)
-            {
-                float3 wPos = ViewToWorldPos(viewPos, CameraPos, CameraRight, CameraUp, CameraFwd);
-                int3 grainCell = int3(floor(wPos * 68.0f));
-                uint gh = Hash3UInt(grainCell);
-                float glintRand = float(gh & 0x3FFu) / 1023.0f;
-                if (glintRand > 0.968f)
-                {
-                    float3 halfVec = normalize(keyDirView + toEye);
-                    float glintAlign = pow(saturate(dot(shadedNormal, halfVec)), 30.0f);
-                    float distFade = 1.0f - smoothstep(4.0f, 14.0f, centerDepth);
-                    litColor += keyTint * glintAlign * distFade * sandW * edgeSafeMask * 0.45f * (glintRand - 0.968f) / 0.032f;
-                }
-            }
         }
 
         // 3) SOIL: Clumpy micro-cavity relief
@@ -876,7 +875,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         if (grassW > 0.04f)
         {
             float backLight = pow(saturate(dot(viewDir, -keyDirView)), 2.5f);
-            float trans = backLight * grassW * (RelightIntensity * 0.35f + SssIntensity * 0.30f) * solidMask * (1.0f - silEdge * 0.75f);
+            float trans = backLight * grassW * (effRelight * 0.35f + SssIntensity * 0.30f) * solidMask * (1.0f - silEdge * 0.75f);
             litColor += albedo * keyTint * float3(1.02f, 1.08f, 0.85f) * trans * (0.24f + Luma(giBounce));
         }
     }

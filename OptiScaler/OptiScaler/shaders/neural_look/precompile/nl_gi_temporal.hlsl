@@ -235,8 +235,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float4 mat1 = Material1Tex.SampleLevel(LinearClampMat1, uv, 0.0f);
     float4 mat2 = Material2Tex.SampleLevel(LinearClampMat2, uv, 0.0f);
     float roughness = saturate(mat1.r);
-    float wetness = saturate(mat1.b);
     float fabricProb = saturate(mat2.x);
+    float sandProb = saturate(mat2.y);
     float soilProb = saturate(mat2.z);
     float grassProb = saturate(mat2.w);
 
@@ -361,7 +361,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             [loop]
             for (int s = 1; s <= steps; ++s)
             {
-                float t = (float(s) - 0.30f + noiseB * 0.45f) / float(steps);
+                float t = (float(s) - 1.0f + noiseB) / float(steps);
                 float radiusPx = lerp(2.5f, maxRadiusPx, t * t);
                 float2 sampleUv = uv + marchDirPx * radiusPx * invOutSize;
 
@@ -515,12 +515,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float invTanV = rcp(max(TanHalfFov, 1e-4f));
         float invTanH = rcp(max(TanHalfFovAspect, 1e-4f));
         float maxThick = clamp(centerDepth * 0.032f, 0.035f, 0.42f);
-        float minThick = centerDepth * 0.0025f;
+        float minThick = max(centerDepth * 0.0045f, 0.012f);
 
         [loop]
         for (int cs = 1; cs <= cSteps; ++cs)
         {
-            float fracS = (float(cs) - 0.25f + noiseB * 0.5f) / float(cSteps);
+            float fracS = (float(cs) - 1.0f + noiseB) / float(cSteps);
             float3 rayPos = centerPos + keyDirView * (maxShadowDist * fracS);
             if (rayPos.z <= 1e-3f)
                 break;
@@ -543,19 +543,20 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * grassDamp * 0.80f);
     }
 
-    // 3. Warp-Coherent Fixed-Stride SSR + 2-Step Binary Refinement (zero divergent Hi-Z branching)
-    float effRoughness = lerp(roughness, 0.14f, soilProb * wetness);
+    // 3. Anti-Stripe Stratified SSR + 2-Step Binary Refinement (exact half-res depth + normal self-hit rejection)
+    float effRoughness = roughness;
     float4 currentSsr = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float ssrHitDist = centerDepth * 0.5f;
     float2 ssrHitUv = uv;
+    bool allowSsrMat = (sandProb <= 0.55f && soilProb <= 0.55f && grassProb <= 0.50f && fabricProb <= 0.55f);
 
-    if (SsrEnabled > 0 && effRoughness < 0.80f && !(fabricProb > 0.65f && effRoughness > 0.65f))
+    if (SsrEnabled > 0 && allowSsrMat && effRoughness < 0.58f)
     {
         float3 tUp = (abs(viewNormal.y) < 0.9f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
         float3 tU = normalize(cross(tUp, viewNormal));
         float3 tV = cross(viewNormal, tU);
         float phi = noiseA * 2.0f * kPi;
-        float ggxSpread = effRoughness * effRoughness * 0.32f * (1.0f - 0.50f * saturate(1.0f - dot(toEye, viewNormal)));
+        float ggxSpread = effRoughness * effRoughness * 0.28f * (1.0f - 0.50f * saturate(1.0f - dot(toEye, viewNormal)));
         float3 microNormal = normalize(viewNormal + (tU * cos(phi) + tV * sin(phi)) * ggxSpread);
         if (dot(microNormal, toEye) < 0.05f)
             microNormal = viewNormal;
@@ -565,54 +566,55 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         {
             float ssrMaxDist = max(centerDepth * 3.0f, 0.2f);
             float minZClip = max(centerPos.z * 0.05f, 1e-3f);
+            float3 rayOrigin = centerPos + viewNormal * max(centerDepth * 0.015f, 0.025f);
             float rayLen = ssrMaxDist;
             if (reflDir.z < 0.0f)
-                rayLen = min(rayLen, max((minZClip - centerPos.z) / reflDir.z, centerPos.z * 0.01f));
+                rayLen = min(rayLen, max((minZClip - rayOrigin.z) / reflDir.z, rayOrigin.z * 0.01f));
 
-            float3 endPos = centerPos + reflDir * rayLen;
+            float3 endPos = rayOrigin + reflDir * rayLen;
             float invTanV = rcp(max(TanHalfFov, 1e-4f));
             float invTanH = rcp(max(TanHalfFovAspect, 1e-4f));
+            float2 startUv = saturate(ProjectViewPosToUv(rayOrigin, invTanV, invTanH));
             float2 endUv = ProjectViewPosToUv(endPos, invTanV, invTanH);
 
-            float2 deltaUv = endUv - uv;
+            float2 deltaUv = endUv - startUv;
             float maxT = 1.0f;
             if (abs(deltaUv.x) > 1e-5f)
-                maxT = min(maxT, ((deltaUv.x > 0.0f ? 0.996f : 0.004f) - uv.x) / deltaUv.x);
+                maxT = min(maxT, ((deltaUv.x > 0.0f ? 0.996f : 0.004f) - startUv.x) / deltaUv.x);
             if (abs(deltaUv.y) > 1e-5f)
-                maxT = min(maxT, ((deltaUv.y > 0.0f ? 0.996f : 0.004f) - uv.y) / deltaUv.y);
+                maxT = min(maxT, ((deltaUv.y > 0.0f ? 0.996f : 0.004f) - startUv.y) / deltaUv.y);
             maxT = saturate(maxT);
 
             if (maxT > 0.02f && dot(deltaUv, deltaUv) > 1e-6f)
             {
-                float2 clippedEndUv = uv + deltaUv * maxT;
-                float invZ0 = rcp(centerPos.z);
+                float2 clippedEndUv = startUv + deltaUv * maxT;
+                float invZ0 = rcp(max(rayOrigin.z, minZClip));
                 float endZ = rcp(lerp(invZ0, rcp(max(endPos.z, minZClip)), maxT));
                 float invZ1 = rcp(endZ);
 
                 int ssrSteps = clamp(SsrSteps, 4, 12);
                 float invSteps = rcp(float(ssrSteps));
                 float prevKt = 0.0f;
-                float prevRayZ = centerPos.z;
+                float prevRayZ = max(rayOrigin.z, minZClip);
                 float hitKt = 0.0f;
-                float2 hitUv = uv;
+                float2 hitUv = startUv;
                 float hitThickness = 0.0f;
                 bool hit = false;
-                float mipBias = (effRoughness < 0.22f) ? 0.0f : 1.0f;
 
                 [loop]
                 for (int k = 1; k <= ssrSteps; ++k)
                 {
-                    float kt = (float(k) - 0.55f + noiseB * 0.45f) * invSteps;
+                    float kt = (float(k) - 1.0f + noiseB) * invSteps;
                     float kt2 = kt * kt;
-                    float2 rayUv = lerp(uv, clippedEndUv, kt2);
+                    float2 rayUv = lerp(startUv, clippedEndUv, kt2);
                     float rayZ = rcp(lerp(invZ0, invZ1, kt2));
-                    float rayDepth = ColorPyramidTex.SampleLevel(LinearClampPyr, rayUv, mipBias).a;
+                    float rayDepth = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rayUv * float2(GiWidth, GiHeight))), 0)).a;
 
-                    if (rayDepth < 64000.0f)
+                    if (rayDepth < 64000.0f && length((rayUv - uv) * float2(OutputWidth, OutputHeight)) >= 3.5f)
                     {
                         float diff = rayZ - rayDepth;
                         float stepThickness = max(rayDepth * 0.14f, abs(rayZ - prevRayZ) * 1.45f);
-                        if (diff > rayZ * 0.002f && diff < stepThickness)
+                        if (diff > max(rayZ * 0.008f, 0.030f) && diff < stepThickness)
                         {
                             hit = true;
                             hitKt = kt2;
@@ -634,11 +636,11 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     for (int b = 0; b < 2; ++b)
                     {
                         float midKt = 0.5f * (loKt + hiKt);
-                        float2 midUv = lerp(uv, clippedEndUv, midKt);
+                        float2 midUv = lerp(startUv, clippedEndUv, midKt);
                         float midZ = rcp(lerp(invZ0, invZ1, midKt));
                         float midDepth = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(midUv * float2(GiWidth, GiHeight))), 0)).a;
                         float midDiff = midZ - midDepth;
-                        if (midDepth < 64000.0f && midDiff > midZ * 0.002f && midDiff < hitThickness)
+                        if (midDepth < 64000.0f && midDiff > max(midZ * 0.008f, 0.030f) && midDiff < hitThickness)
                         {
                             hiKt = midKt;
                             hitUv = midUv;
@@ -650,23 +652,31 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     }
 
                     int2 hitCoord = ClampGiCoord(int2(hitUv * float2(GiWidth, GiHeight)));
-                    float4 hitCd = HalfColorDepthTex.Load(int3(hitCoord, 0));
-                    float hitPxDist = length((hitUv - uv) * float2(OutputWidth, OutputHeight));
-                    float coneMip = clamp(log2(max(hitPxDist * effRoughness * 0.40f, 1.0f)), 0.0f, 4.0f);
-                    float3 hitCol = hitCd.rgb;
-                    if (coneMip >= 0.35f)
+                    float2 hitNxy = clamp(HalfNormalTex.Load(int3(hitCoord, 0)).xy, -1.0f, 1.0f);
+                    float3 hitNorm = float3(hitNxy, -sqrt(max(0.0f, 1.0f - dot(hitNxy, hitNxy))));
+                    if (dot(hitNorm, reflDir) <= 0.30f && length((hitUv - uv) * float2(OutputWidth, OutputHeight)) >= 3.5f)
                     {
-                        float4 pyrHit = ColorPyramidTex.SampleLevel(LinearClampPyr, hitUv, coneMip);
-                        if (abs(pyrHit.a - hitCd.a) <= max(hitCd.a * 0.18f, 0.08f))
-                            hitCol = pyrHit.rgb;
-                    }
+                        float4 hitCd = HalfColorDepthTex.Load(int3(hitCoord, 0));
+                        float hitPxDist = length((hitUv - uv) * float2(OutputWidth, OutputHeight));
+                        float coneMip = clamp(log2(max(hitPxDist * effRoughness * 0.40f, 1.0f)), 0.0f, 4.0f);
+                        float3 hitCol = hitCd.rgb;
+                        if (coneMip >= 0.35f)
+                        {
+                            float4 pyrHit = ColorPyramidTex.SampleLevel(LinearClampPyr, hitUv, coneMip);
+                            if (abs(pyrHit.a - hitCd.a) <= max(hitCd.a * 0.18f, 0.08f))
+                                hitCol = pyrHit.rgb;
+                        }
+                        float hL = Luma(hitCol);
+                        if (hL > 2.5f)
+                            hitCol *= 2.5f / hL;
 
-                    float2 edgeDist = min(hitUv, 1.0f - hitUv);
-                    float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 9.0f);
-                    float distFade = 1.0f - saturate(hiKt * maxT * 0.70f);
-                    ssrHitDist = max(rayLen * maxT * hiKt, 0.05f);
-                    ssrHitUv = hitUv;
-                    currentSsr = float4(max(hitCol, 0.0f), edgeFade * lerp(0.55f, 1.0f, distFade));
+                        float2 edgeDist = min(hitUv, 1.0f - hitUv);
+                        float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 9.0f);
+                        float distFade = 1.0f - saturate(hiKt * maxT * 0.70f);
+                        ssrHitDist = max(rayLen * maxT * hiKt, 0.05f);
+                        ssrHitUv = hitUv;
+                        currentSsr = float4(max(hitCol, 0.0f), edgeFade * lerp(0.55f, 1.0f, distFade));
+                    }
                 }
             }
         }
@@ -680,6 +690,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 float3 pyrRefl = max(ColorPyramidTex.SampleLevel(LinearClampPyr, dirSampleUv, 3.0f).rgb, 0.0f);
                 envRefl = lerp(envRefl, pyrRefl, 0.55f);
             }
+            float envL = Luma(envRefl);
+            if (envL > 2.5f)
+                envRefl *= 2.5f / envL;
             currentSsr.rgb = lerp(envRefl, currentSsr.rgb, currentSsr.a);
             currentSsr.a = max(currentSsr.a, 0.22f * (1.0f - effRoughness));
         }
@@ -722,7 +735,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float3 prevGiD = OctDecode(prevDir.zw);
         outGiDir = normalize(lerp(prevGiD, giDir, saturate(giAlpha)));
 
-        if (SsrEnabled > 0)
+        if (SsrEnabled > 0 && allowSsrMat && effRoughness < 0.58f)
         {
             float2 ssrPrevUv = prevUv;
             if (currentSsr.a > 0.25f)
@@ -736,9 +749,11 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             }
             ssrPrevUv = clamp(ssrPrevUv, 0.002f, 0.998f);
             float4 prevSsr = PrevSsrTex.SampleLevel(LinearClampSsr, ssrPrevUv, 0.0f);
+            prevSsr.rgb = clamp(prevSsr.rgb, currentSsr.rgb * 0.35f, currentSsr.rgb * 2.20f + 0.15f);
             float3 ssrDiff = abs(prevSsr.rgb - currentSsr.rgb);
             float ssrMaxDiff = max(ssrDiff.r, max(ssrDiff.g, ssrDiff.b));
-            float ssrAlpha = max(lerp(0.16f, 0.55f, saturate(mvMag / 12.0f)), min(0.70f, saturate(ssrMaxDiff * 0.45f)));
+            float ssrAlpha = max(lerp(0.28f, 0.72f, saturate(mvMag / 10.0f)),
+                                 saturate(ssrMaxDiff / max(Luma(currentSsr.rgb) + 0.15f, 0.15f)));
             ssrResult = lerp(prevSsr, currentSsr, saturate(ssrAlpha));
         }
     }

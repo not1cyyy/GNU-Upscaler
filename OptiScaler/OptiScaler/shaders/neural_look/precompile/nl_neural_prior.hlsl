@@ -301,7 +301,10 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             }
             else
             {
-                const float alpha = 0.08f;
+                float curShL = Luma(sh0.rgb);
+                float prevShL = Luma(ResolvedSceneLightBuf[0].rgb);
+                float sceneCut = smoothstep(0.25f, 0.55f, abs(curShL - prevShL) / max(curShL + prevShL, 0.05f));
+                const float alpha = lerp(0.10f, 1.0f, sceneCut);
                 float4 prevKDir = ResolvedSceneLightBuf[4];
                 float3 smoothDir = (dot(prevKDir.xyz, prevKDir.xyz) < 0.1f)
                                        ? kDir.xyz
@@ -575,8 +578,8 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             float4 prevM2 = PrevMaterial2Tex.SampleLevel(LinearClamp2, prevUv, 0.0f);
             float mvPx = length((prevUv - uv) * float2(OutputWidth, OutputHeight));
             float diff = max(length(mat0.rgb - prevM0.rgb), max(abs(mat1.w - prevM1.w), length(mat2 - prevM2) * 0.5f));
-            float alphaCont = saturate(lerp(0.22f, 0.65f, saturate(mvPx / 12.0f)) + smoothstep(0.10f, 0.35f, diff) * 0.50f);
-            float alphaSem = saturate(lerp(0.10f, 0.45f, saturate(mvPx / 12.0f)) + smoothstep(0.12f, 0.40f, diff) * 0.55f);
+            float alphaCont = saturate(lerp(0.32f, 0.85f, saturate(mvPx / 10.0f)) + smoothstep(0.08f, 0.25f, diff) * 0.75f);
+            float alphaSem = saturate(lerp(0.18f, 0.65f, saturate(mvPx / 10.0f)) + smoothstep(0.10f, 0.28f, diff) * 0.80f);
 
             mat0 = lerp(prevM0, mat0, alphaCont);
             mat1.xyz = lerp(prevM1.xyz, mat1.xyz, alphaCont);
@@ -674,9 +677,11 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             float4 pBg0 = PrevBilateralGrid0Tex.Load(int4(gridCoord, 0));
             float4 pBg1 = PrevBilateralGrid1Tex.Load(int4(gridCoord, 0));
             float4 pBg2 = PrevBilateralGrid2Tex.Load(int4(gridCoord, 0));
-            bgOut[0] = lerp(pBg0, bgOut[0], 0.14f);
-            bgOut[1] = lerp(pBg1, bgOut[1], 0.14f);
-            bgOut[2] = lerp(pBg2, bgOut[2], 0.14f);
+            float bgDiff = length(bgOut[0].rgb - pBg0.rgb) + abs(bgOut[2].x - pBg2.x);
+            float bgAlpha = saturate(0.18f + smoothstep(0.06f, 0.22f, bgDiff) * 0.82f);
+            bgOut[0] = lerp(pBg0, bgOut[0], bgAlpha);
+            bgOut[1] = lerp(pBg1, bgOut[1], bgAlpha);
+            bgOut[2] = lerp(pBg2, bgOut[2], bgAlpha);
         }
 
         OutBilateralGrid0[gridCoord] = bgOut[0];
