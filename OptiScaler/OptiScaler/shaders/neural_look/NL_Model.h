@@ -15,9 +15,9 @@
 namespace NLModel
 {
 inline constexpr uint32_t kMagic = 0x4D4C4E47u; // "GNLM"
-inline constexpr uint32_t kVersion = 1u;
-inline constexpr uint32_t kFloat4Count = kNLDefaultModelFloat4Count; // 3013
-inline constexpr uint32_t kFloatCount = kFloat4Count * 4u;          // 12052
+inline constexpr uint32_t kVersion = 2u;
+inline constexpr uint32_t kFloat4Count = kNLDefaultModelFloat4Count; // 3143
+inline constexpr uint32_t kFloatCount = kFloat4Count * 4u;          // 12572
 
 struct alignas(4) Header
 {

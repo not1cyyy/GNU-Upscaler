@@ -28,6 +28,7 @@ class NL_Vk : public Shader_Vk, public NL_Common
     VkPassObjects _passPrior {};
     VkPassObjects _passGi {};
     VkPassObjects _passDenoise {};
+    VkPassObjects _passDenoise2 {};
 
     struct Image2DRes
     {
@@ -50,9 +51,17 @@ class NL_Vk : public Shader_Vk, public NL_Common
     Image2DRes _gi[2] {};
     Image2DRes _ssr[2] {};
     Image2DRes _giMeta[2] {};
+    Image2DRes _giDir[2] {};
+
+    Image2DRes _denoisedGiScratch {};
+    Image2DRes _denoisedSsrScratch {};
+    Image2DRes _denoisedMetaScratch {};
+    Image2DRes _denoisedGiDirScratch {};
+
     Image2DRes _denoisedGi {};
     Image2DRes _denoisedSsr {};
     Image2DRes _denoisedMeta {};
+    Image2DRes _denoisedGiDir {};
 
     VkImage _colorPyramidImage = VK_NULL_HANDLE;
     VkImageView _colorPyramidView = VK_NULL_HANDLE;
@@ -61,14 +70,18 @@ class NL_Vk : public Shader_Vk, public NL_Common
     bool _colorPyramidInit = false;
 
     Image2DRes _eighthNormal {};
+    Image2DRes _eighthFeatures {};
     Image2DRes _material0[2] {};
     Image2DRes _material1[2] {};
-    Image2DRes _bilateralGrid[3] {};
+    Image2DRes _material2[2] {};
+    Image2DRes _bilateralGrid[2][3] {};
 
     BufferRes _sceneLightBuf {};
     BufferRes _resolvedSceneLightBuf {};
     BufferRes _worldHashBuf {};
+    BufferRes _modelWeightsStaging {};
     BufferRes _modelWeightsBuf {};
+    bool _modelWeightsDirty = false;
     std::string _loadedModelPack;
 
     uint32_t _giWidth = 0;

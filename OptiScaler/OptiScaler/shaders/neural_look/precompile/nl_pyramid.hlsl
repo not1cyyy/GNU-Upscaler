@@ -80,14 +80,20 @@ RWTexture2D<float4> OutPyramidMip4 : register(u4);
 RWTexture2D<float4> OutEighthNormal : register(u5);
 
 #ifdef VK_MODE
-[[vk::binding(9, 0)]]
+[[vk::binding(9, 0)]] [[vk::image_format("rgba16f")]]
 #endif
-RWStructuredBuffer<uint> SceneLightBuf : register(u6);
+RWTexture2D<float4> OutEighthFeatures : register(u6);
+
+#ifdef VK_MODE
+[[vk::binding(10, 0)]]
+#endif
+RWStructuredBuffer<uint> SceneLightBuf : register(u7);
 
 groupshared float4 s_mip[16][16];
 groupshared float4 s_norm[16][16];
+groupshared float4 s_feat8[16][16];
 
-// Reused 3 x float4[256] reduction buffers (total LDS = 20 KB < 32 KB limit)
+// Reused 3 x float4[256] reduction buffers (total LDS = 24 KB < 32 KB limit)
 groupshared float4 s_red0[256];
 groupshared float4 s_red1[256];
 groupshared float4 s_red2[256];
@@ -95,10 +101,8 @@ groupshared float4 s_red2[256];
 float4 DepthWeightedDownsample(float4 a, float4 b, float4 c, float4 d)
 {
     float minD = min(min(a.a, b.a), min(c.a, d.a));
-    float maxD = max(max(a.a, b.a), max(c.a, d.a));
     float invScale = rcp(max(minD * 0.25f, 0.05f));
 
-    // Prefer matching depth cluster so sky pixels do not bleed onto foreground geometry
     float wa = (a.a >= 64000.0f && minD < 64000.0f) ? 0.01f : exp2(-abs(a.a - minD) * invScale);
     float wb = (b.a >= 64000.0f && minD < 64000.0f) ? 0.01f : exp2(-abs(b.a - minD) * invScale);
     float wc = (c.a >= 64000.0f && minD < 64000.0f) ? 0.01f : exp2(-abs(c.a - minD) * invScale);
@@ -145,10 +149,23 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float lMean = (l0 + l1 + l2 + l3) * 0.25f;
     float lVar = (abs(l0 - lMean) + abs(l1 - lMean) + abs(l2 - lMean) + abs(l3 - lMean)) * 0.25f / max(lMean + 0.1f, 0.1f);
 
+    // Phase C: Multi-cue Fabric vs Terrain features (anisoVH, normCurv, lumaSkew, depthIsland)
+    float eV = abs(l0 - l1) + abs(l2 - l3);
+    float eH = abs(l0 - l2) + abs(l1 - l3);
+    float anisoVH = clamp((eV - eH) / (eV + eH + 0.025f), -1.0f, 1.0f);
+    float normCurv = saturate((length(n00.xy - nAvg) + length(n10.xy - nAvg) +
+                               length(n01.xy - nAvg) + length(n11.xy - nAvg)) * 1.25f);
+    float lMax = max(max(l0, l1), max(l2, l3));
+    float lMin = min(min(l0, l1), min(l2, l3));
+    float lumaSkew = clamp(((lMax - lMean) - (lMean - lMin)) / max(lMean + 0.08f, 0.08f), -1.0f, 1.0f);
+    float dMin = min(min(cd00.a, cd10.a), min(cd01.a, cd11.a));
+    float dMax = max(max(cd00.a, cd10.a), max(cd01.a, cd11.a));
+    float depthIsland = (dMax >= 64000.0f) ? 0.0f : saturate((dMax - dMin) / max(dMin * 0.12f, 0.04f));
+
     s_mip[gtid.y][gtid.x] = m0;
     s_norm[gtid.y][gtid.x] = float4(nAvg, fMax, lVar);
+    s_feat8[gtid.y][gtid.x] = float4(anisoVH, normCurv, lumaSkew, depthIsland);
 
-    // Accumulate Scene L1 SH & Dominant Key Light candidate per mip-0 pixel
     float4 sh0 = float4(0, 0, 0, 0);
     float4 shX = float4(0, 0, 0, 0);
     float4 shY = float4(0, 0, 0, 0);
@@ -178,7 +195,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         {
             float2 nxy = clamp(nAvg, -1.0f, 1.0f);
             dirView = normalize(float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy)))));
-            // Avoid front-facing surface normals turning dominant key light into a (0,0,-1) camera flash
             keyCandView = normalize(float3(nxy.x * 0.85f + viewRay.x * 0.35f, max(nxy.y * 0.75f + 0.30f, 0.15f), -0.25f));
         }
 
@@ -190,7 +206,6 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         shY = float4(col * (dir.y * sampleW), 0.0f);
         shZ = float4(col * (dir.z * sampleW), 0.0f);
 
-        // Dominant key light weighted toward bright directional highlights & bright sky regions
         float brightW = max(lum - 0.12f, 0.0f) * (isSky ? 1.8f : 1.0f);
         brightW = min(brightW * brightW, 12.0f);
         kdW = float4(keyCandDir * brightW, brightW);
@@ -203,7 +218,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
 
     GroupMemoryBarrierWithGroupSync();
 
-    // Mip 1 (1/8-res) + EighthNormalTex
+    // Mip 1 (1/8-res) + EighthNormalTex + EighthFeaturesTex
     if ((gtid.x & 1) == 0 && (gtid.y & 1) == 0)
     {
         float4 a = s_mip[gtid.y][gtid.x];
@@ -226,6 +241,17 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             float f1 = max(max(na.z, nb.z), max(nc.z, nd.z));
             float v1 = (na.w + nb.w + nc.w + nd.w) * 0.25f;
             OutEighthNormal[m1Coord] = float4(n1, f1, v1);
+
+            float4 fa = s_feat8[gtid.y][gtid.x];
+            float4 fb = s_feat8[gtid.y][gtid.x + 1];
+            float4 fc = s_feat8[gtid.y + 1][gtid.x];
+            float4 fd = s_feat8[gtid.y + 1][gtid.x + 1];
+            float4 fAgg = (fa + fb + fc + fd) * 0.25f;
+            float dMin1 = min(min(a.a, b.a), min(c.a, d.a));
+            float dMax1 = max(max(a.a, b.a), max(c.a, d.a));
+            float isl1 = (dMax1 >= 64000.0f) ? 0.0f : saturate((dMax1 - dMin1) / max(dMin1 * 0.14f, 0.05f));
+            fAgg.w = max(fAgg.w, isl1);
+            OutEighthFeatures[m1Coord] = fAgg;
         }
     }
     GroupMemoryBarrierWithGroupSync();

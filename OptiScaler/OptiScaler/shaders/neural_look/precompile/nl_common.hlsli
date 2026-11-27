@@ -188,37 +188,137 @@ float3 UnpackRadiance101010(uint packed)
     return max((exp2(enc * 6.0f) - 1.0f) * 0.5f, 0.0f);
 }
 
+float2 R2Sequence(uint frameIdx)
+{
+    return frac(float2(0.7548776662f, 0.5698402910f) * float(frameIdx & 255u));
+}
+
+uint2 PackFloat4Half(float4 v)
+{
+    return uint2(f32tof16(v.x) | (f32tof16(v.y) << 16), f32tof16(v.z) | (f32tof16(v.w) << 16));
+}
+
+float4 UnpackFloat4Half(uint2 p)
+{
+    return float4(f16tof32(p.x & 0xFFFFu), f16tof32(p.x >> 16), f16tof32(p.y & 0xFFFFu), f16tof32(p.y >> 16));
+}
+
+float2 OctEncode(float3 n)
+{
+    n /= max(abs(n.x) + abs(n.y) + abs(n.z), 1e-6f);
+    if (n.z < 0.0f)
+    {
+        float2 s = float2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f);
+        n.xy = (1.0f - abs(n.yx)) * s;
+    }
+    return n.xy;
+}
+
+float3 OctDecode(float2 f)
+{
+    float3 n = float3(f.x, f.y, 1.0f - abs(f.x) - abs(f.y));
+    if (n.z < 0.0f)
+    {
+        float2 s = float2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f);
+        n.xy = (1.0f - abs(n.yx)) * s;
+    }
+    return normalize(n);
+}
+
 bool LookupWorldHash(StructuredBuffer<uint> worldHashBuf, float3 worldPos, float3 worldNormal,
                      float viewDist, int frameIndex, out float3 outRadiance)
 {
     uint idx, sig22;
     ComputeWorldHashAddr(worldPos, worldNormal, viewDist, idx, sig22);
 
-    uint meta = worldHashBuf[idx * 2u];
-    uint cellSig = meta & 0x3FFFFFu;
-    if (cellSig == 0u || cellSig != sig22)
+    [unroll]
+    for (uint p = 0u; p < 4u; ++p)
     {
-        outRadiance = float3(0.0f, 0.0f, 0.0f);
-        return false;
+        uint slot = (idx + p) & kWorldHashMask;
+        uint meta = worldHashBuf[slot * 2u];
+        uint cellSig = meta & 0x3FFFFFu;
+        if (cellSig == 0u)
+            break;
+
+        if (cellSig == sig22)
+        {
+            uint stamp = (meta >> 22) & 0x3FFu;
+            uint age = (uint(frameIndex) - stamp) & 0x3FFu;
+            if (age <= 90u)
+            {
+                uint packedCol = worldHashBuf[slot * 2u + 1u];
+                if ((packedCol >> 30) != 0u)
+                {
+                    outRadiance = UnpackRadiance101010(packedCol);
+                    return true;
+                }
+            }
+            break;
+        }
     }
 
-    uint stamp = (meta >> 22) & 0x3FFu;
-    uint age = (uint(frameIndex) - stamp) & 0x3FFu;
-    if (age > 90u)
+    outRadiance = float3(0.0f, 0.0f, 0.0f);
+    return false;
+}
+
+bool LookupWorldHashJittered(StructuredBuffer<uint> worldHashBuf, float3 worldPos, float3 worldNormal,
+                             float viewDist, int frameIndex, float2 jitter2, float3 tangentU, float3 tangentV,
+                             out float3 outRadiance)
+{
+    float voxelSize = clamp(max(viewDist * 0.045f, 0.25f), 0.25f, 8.0f);
+    float2 centered = jitter2 - 0.5f;
+    float3 jitterPos = worldPos + (tangentU * centered.x + tangentV * centered.y) * (voxelSize * 0.45f);
+    if (LookupWorldHash(worldHashBuf, jitterPos, worldNormal, viewDist, frameIndex, outRadiance))
+        return true;
+    return LookupWorldHash(worldHashBuf, worldPos, worldNormal, viewDist, frameIndex, outRadiance);
+}
+
+void InjectWorldHash(RWStructuredBuffer<uint> worldHashBuf, float3 worldPos, float3 worldNormal,
+                     float viewDist, int frameIndex, float3 rad)
+{
+    uint idx, sig22;
+    ComputeWorldHashAddr(worldPos, worldNormal, viewDist, idx, sig22);
+
+    uint targetSlot = idx;
+    bool foundMatch = false;
+    bool foundFree = false;
+
+    [unroll]
+    for (uint p = 0u; p < 4u; ++p)
     {
-        outRadiance = float3(0.0f, 0.0f, 0.0f);
-        return false;
+        uint slot = (idx + p) & kWorldHashMask;
+        uint existingMeta = worldHashBuf[slot * 2u];
+        uint existingSig = existingMeta & 0x3FFFFFu;
+        uint existingAge = (uint(frameIndex) - ((existingMeta >> 22) & 0x3FFu)) & 0x3FFu;
+
+        if (existingSig == sig22)
+        {
+            targetSlot = slot;
+            foundMatch = true;
+            break;
+        }
+        if (!foundFree && (existingSig == 0u || existingAge > 90u))
+        {
+            targetSlot = slot;
+            foundFree = true;
+        }
     }
 
-    uint packedCol = worldHashBuf[idx * 2u + 1u];
-    if ((packedCol >> 30) == 0u)
+    float3 totalRad = rad;
+    if (foundMatch)
     {
-        outRadiance = float3(0.0f, 0.0f, 0.0f);
-        return false;
+        uint existingMeta = worldHashBuf[targetSlot * 2u];
+        uint existingAge = (uint(frameIndex) - ((existingMeta >> 22) & 0x3FFu)) & 0x3FFu;
+        if (existingAge <= 60u)
+        {
+            float3 oldRad = UnpackRadiance101010(worldHashBuf[targetSlot * 2u + 1u]);
+            totalRad = lerp(oldRad, totalRad, 0.25f);
+        }
     }
 
-    outRadiance = UnpackRadiance101010(packedCol);
-    return true;
+    uint newMeta = (sig22 & 0x3FFFFFu) | ((uint(frameIndex) & 0x3FFu) << 22);
+    worldHashBuf[targetSlot * 2u] = newMeta;
+    worldHashBuf[targetSlot * 2u + 1u] = PackRadiance101010(totalRad);
 }
 
 #endif

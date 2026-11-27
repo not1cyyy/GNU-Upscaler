@@ -67,7 +67,7 @@ Texture2D<float4> HalfColorDepthTex : register(t1);
 Texture2D<float4> HalfNormalTex : register(t2);
 
 #ifdef VK_MODE
-[[vk::combinedImageSampler]] [[vk::binding(4, 0)]]
+[[vk::binding(4, 0)]]
 #endif
 Texture2D<float4> PrevHalfNormalTex : register(t3);
 
@@ -77,7 +77,7 @@ Texture2D<float4> PrevHalfNormalTex : register(t3);
 Texture2D<float2> MotionTex : register(t4);
 
 #ifdef VK_MODE
-[[vk::combinedImageSampler]] [[vk::binding(6, 0)]]
+[[vk::binding(6, 0)]]
 #endif
 Texture2D<float4> PrevGiTex : register(t5);
 
@@ -87,54 +87,71 @@ Texture2D<float4> PrevGiTex : register(t5);
 Texture2D<float4> PrevSsrTex : register(t6);
 
 #ifdef VK_MODE
-[[vk::combinedImageSampler]] [[vk::binding(8, 0)]]
+[[vk::binding(8, 0)]]
 #endif
-Texture2D<float4> Material1Tex : register(t7);
-
-#ifdef VK_MODE
-[[vk::combinedImageSampler]] [[vk::binding(1, 0)]]
-SamplerState LinearClampPyr : register(s0);
-[[vk::combinedImageSampler]] [[vk::binding(4, 0)]]
-SamplerState LinearClampNorm : register(s1);
-[[vk::combinedImageSampler]] [[vk::binding(6, 0)]]
-SamplerState LinearClampGi : register(s2);
-[[vk::combinedImageSampler]] [[vk::binding(7, 0)]]
-SamplerState LinearClampSsr : register(s3);
-[[vk::combinedImageSampler]] [[vk::binding(8, 0)]]
-SamplerState LinearClampMat : register(s4);
-#else
-SamplerState LinearClamp : register(s0);
-#define LinearClampPyr LinearClamp
-#define LinearClampNorm LinearClamp
-#define LinearClampGi LinearClamp
-#define LinearClampSsr LinearClamp
-#define LinearClampMat LinearClamp
-#endif
+Texture2D<float4> PrevGiMetaTex : register(t7);
 
 #ifdef VK_MODE
 [[vk::binding(9, 0)]]
 #endif
-StructuredBuffer<float4> ResolvedSceneLightBuf : register(t8);
+Texture2D<float4> PrevGiDirTex : register(t8);
 
 #ifdef VK_MODE
-[[vk::binding(10, 0)]]
+[[vk::combinedImageSampler]] [[vk::binding(10, 0)]]
 #endif
-StructuredBuffer<uint> WorldHashBuf : register(t9);
+Texture2D<float4> Material1Tex : register(t9);
 
 #ifdef VK_MODE
-[[vk::binding(11, 0)]] [[vk::image_format("rgba16f")]]
+[[vk::combinedImageSampler]] [[vk::binding(11, 0)]]
+#endif
+Texture2D<float4> Material2Tex : register(t10);
+
+#ifdef VK_MODE
+[[vk::combinedImageSampler]] [[vk::binding(1, 0)]]
+SamplerState LinearClampPyr : register(s0);
+[[vk::combinedImageSampler]] [[vk::binding(7, 0)]]
+SamplerState LinearClampSsr : register(s1);
+[[vk::combinedImageSampler]] [[vk::binding(10, 0)]]
+SamplerState LinearClampMat1 : register(s2);
+[[vk::combinedImageSampler]] [[vk::binding(11, 0)]]
+SamplerState LinearClampMat2 : register(s3);
+#else
+SamplerState LinearClamp : register(s0);
+#define LinearClampPyr LinearClamp
+#define LinearClampSsr LinearClamp
+#define LinearClampMat1 LinearClamp
+#define LinearClampMat2 LinearClamp
+#endif
+
+#ifdef VK_MODE
+[[vk::binding(12, 0)]]
+#endif
+StructuredBuffer<float4> ResolvedSceneLightBuf : register(t11);
+
+#ifdef VK_MODE
+[[vk::binding(13, 0)]]
+#endif
+StructuredBuffer<uint> WorldHashBuf : register(t12);
+
+#ifdef VK_MODE
+[[vk::binding(14, 0)]] [[vk::image_format("rgba16f")]]
 #endif
 RWTexture2D<float4> OutGiTex : register(u0);
 
 #ifdef VK_MODE
-[[vk::binding(12, 0)]] [[vk::image_format("rgba16f")]]
+[[vk::binding(15, 0)]] [[vk::image_format("rgba16f")]]
 #endif
 RWTexture2D<float4> OutSsrTex : register(u1);
 
 #ifdef VK_MODE
-[[vk::binding(13, 0)]] [[vk::image_format("rgba16f")]]
+[[vk::binding(16, 0)]] [[vk::image_format("rgba16f")]]
 #endif
 RWTexture2D<float4> OutGiMetaTex : register(u2);
+
+#ifdef VK_MODE
+[[vk::binding(17, 0)]] [[vk::image_format("rgba16f")]]
+#endif
+RWTexture2D<float4> OutGiDirTex : register(u3);
 
 int2 ClampGiCoord(int2 p)
 {
@@ -166,15 +183,19 @@ float3 EvalSceneSH(float3 dir)
     return max(sh0 + shX * dir.x + shY * dir.y + shZ * dir.z, 0.0f) * 0.22f;
 }
 
-float3 QueryFallbackRadiance(float3 viewPos, float3 rayDirView, float rayDist)
+float3 QueryFallbackRadiance(float3 viewPos, float3 rayDirView, float rayDist, float2 jitter2)
 {
     float3 rayDir = (HasCameraBasis > 0) ? ViewToWorldDir(rayDirView, CameraRight, CameraUp, CameraFwd) : rayDirView;
     if (WorldHashEnabled > 0 && HasCameraBasis > 0)
     {
         float3 probeView = viewPos + rayDirView * rayDist;
         float3 probeWorld = ViewToWorldPos(probeView, CameraPos, CameraRight, CameraUp, CameraFwd);
+        float3 upRef = (abs(rayDir.y) < 0.9f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+        float3 tU = normalize(cross(upRef, rayDir));
+        float3 tV = cross(rayDir, tU);
         float3 hashRad;
-        if (LookupWorldHash(WorldHashBuf, probeWorld, -rayDir, max(viewPos.z, 1.0f), FrameIndex, hashRad))
+        if (LookupWorldHashJittered(WorldHashBuf, probeWorld, -rayDir, max(viewPos.z, 1.0f), FrameIndex,
+                                    jitter2, tU, tV, hashRad))
             return hashRad;
     }
     return EvalSceneSH(rayDir);
@@ -196,7 +217,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     {
         OutGiTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
         OutSsrTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
-        OutGiMetaTex[giCoord] = float4(1.0f, 0.0f, 0.0f, 0.0f);
+        OutGiMetaTex[giCoord] = float4(1.0f, 0.0f, 0.0f, 1.0f);
+        OutGiDirTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
         return;
     }
 
@@ -209,9 +231,18 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     {
         OutGiTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 1.0f);
         OutSsrTex[giCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
-        OutGiMetaTex[giCoord] = float4(1.0f, 0.0f, 0.0f, 0.0f);
+        OutGiMetaTex[giCoord] = float4(1.0f, 0.0f, 0.0f, 1.0f);
+        OutGiDirTex[giCoord] = float4(viewNormal.xy, OctEncode(viewNormal));
         return;
     }
+
+    float4 mat1 = Material1Tex.SampleLevel(LinearClampMat1, uv, 0.0f);
+    float4 mat2 = Material2Tex.SampleLevel(LinearClampMat2, uv, 0.0f);
+    float roughness = saturate(mat1.r);
+    float wetness = saturate(mat1.b);
+    float fabricProb = saturate(mat2.x);
+    float soilProb = saturate(mat2.z);
+    float grassProb = saturate(mat2.w);
 
     // Fixed MV coordinate & scaling (handles LowResMV + subrect)
     int activeW = (DisplaySizeMV > 0) ? OutputWidth : RenderWidth;
@@ -224,26 +255,65 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     bool inBounds = (ResetHistory == 0 && FrameIndex > 3 && all(prevUv >= 0.002f) && all(prevUv <= 0.998f));
 
-    // Strict nearest-texel Depth + Normal Disocclusion Rejection (no bilinear silhouette smear, no checkerboard skip)
+    // 2x2 Depth + Normal Bilateral Temporal Reprojection (zero bilinear silhouette smear!)
     bool validHistory = false;
+    float4 prevGi = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    float4 prevMeta = float4(1.0f, 0.25f, 0.0f, 1.0f);
+    float4 prevDir = float4(viewNormal.xy, OctEncode(viewNormal));
     if (inBounds)
     {
-        int2 prevGiCoord = ClampGiCoord(int2(prevUv * float2(GiWidth, GiHeight)));
-        float4 prevNormData = PrevHalfNormalTex.Load(int3(prevGiCoord, 0));
-        float relDepthErr = abs(centerDepth - prevNormData.w) / max(min(centerDepth, prevNormData.w), 0.05f);
-        float2 pnxy = clamp(prevNormData.xy, -1.0f, 1.0f);
-        float3 prevNorm = float3(pnxy, -sqrt(max(0.0f, 1.0f - dot(pnxy, pnxy))));
-        if (relDepthErr < 0.045f && dot(viewNormal, prevNorm) > 0.72f)
+        float2 fCoord = prevUv * float2(GiWidth, GiHeight) - 0.5f;
+        int2 baseC = int2(floor(fCoord));
+        float2 f = frac(fCoord);
+        float wBilin[4] = {
+            (1.0f - f.x) * (1.0f - f.y),
+            f.x * (1.0f - f.y),
+            (1.0f - f.x) * f.y,
+            f.x * f.y
+        };
+        int2 off[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+
+        float4 giAcc = float4(0, 0, 0, 0);
+        float4 metaAcc = float4(0, 0, 0, 0);
+        float4 dirAcc = float4(0, 0, 0, 0);
+        float wSum = 0.0f;
+
+        [unroll]
+        for (int ti = 0; ti < 4; ++ti)
+        {
+            int2 pc = ClampGiCoord(baseC + off[ti]);
+            float4 pNormData = PrevHalfNormalTex.Load(int3(pc, 0));
+            float relDepthErr = abs(centerDepth - pNormData.w) / max(min(centerDepth, pNormData.w), 0.05f);
+            float2 pnxy = clamp(pNormData.xy, -1.0f, 1.0f);
+            float3 pN = float3(pnxy, -sqrt(max(0.0f, 1.0f - dot(pnxy, pnxy))));
+            if (relDepthErr < 0.040f && dot(viewNormal, pN) > 0.78f)
+            {
+                float w = wBilin[ti] + 1e-4f;
+                giAcc += PrevGiTex.Load(int3(pc, 0)) * w;
+                metaAcc += PrevGiMetaTex.Load(int3(pc, 0)) * w;
+                dirAcc += PrevGiDirTex.Load(int3(pc, 0)) * w;
+                wSum += w;
+            }
+        }
+
+        if (wSum > 1e-4f)
+        {
+            float invW = rcp(wSum);
+            prevGi = giAcc * invW;
+            prevMeta = metaAcc * invW;
+            prevDir = dirAcc * invW;
             validHistory = true;
+        }
     }
 
     float3 centerPos = ReconstructViewPos(uv, centerDepth, TanHalfFov, TanHalfFovAspect);
     float3 viewDir = normalize(centerPos);
     float3 toEye = -viewDir;
 
-    float noiseA = InterleavedGradientNoise(
-        float2(giCoord) + float2((FrameIndex & 15) * 5.588238f, (FrameIndex & 15) * 3.1732f));
-    float noiseB = frac(noiseA * 1.6180339f + 0.371f);
+    // R2 quasirandom spatiotemporal blue-noise sequence (no 16-frame periodic crawl)
+    float2 r2 = R2Sequence(uint(FrameIndex));
+    float noiseA = frac(InterleavedGradientNoise(float2(giCoord)) + r2.x);
+    float noiseB = frac(InterleavedGradientNoise(float2(giCoord) * 1.37f + float2(13.0f, 29.0f)) + r2.y);
 
     float maxRadiusPx = max(GiRadius, 24.0f);
     float2 invOutSize = 1.0f / float2(OutputWidth, OutputHeight);
@@ -259,28 +329,32 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     float3 accumGi = float3(0.0f, 0.0f, 0.0f);
     float accumAo = 0.0f;
+    float3 bentNormalAccum = float3(0.0f, 0.0f, 0.0f);
+    float3 giDirAccum = float3(0.0f, 0.0f, 0.0f);
 
-    // 1. Dual-Scale Multi-Bounce GTAO + Strict Front-Hemisphere Chromatic SSGI
+    // 1. Dual-Scale Multi-Bounce GTAO + Bent Normal + Directional Chromatic SSGI
     [loop]
     for (int r = 0; r < slices; ++r)
     {
         float angle = (kPi * (float(r) + noiseA)) / float(slices);
         float2 dirPx = float2(cos(angle), sin(angle));
 
-        // Project normal onto slice plane using exact atan2 signed angles
         float3 sliceDirView = normalize(float3(dirPx.x * TanHalfFovAspect, -dirPx.y * TanHalfFov, 0.0f));
         float3 planeNormal = normalize(cross(sliceDirView, toEye));
         float3 orthoTangent = cross(toEye, planeNormal);
         float3 projNormal = viewNormal - planeNormal * dot(viewNormal, planeNormal);
         float projNLen = length(projNormal);
-        float cosN = (projNLen > 1e-4f) ? clamp(dot(projNormal / projNLen, toEye), -1.0f, 1.0f) : 1.0f;
-        float sinN = (projNLen > 1e-4f) ? dot(projNormal / projNLen, orthoTangent) : 0.0f;
+        float3 projNDir = (projNLen > 1e-4f) ? (projNormal / projNLen) : toEye;
+        float cosN = (projNLen > 1e-4f) ? clamp(dot(projNDir, toEye), -1.0f, 1.0f) : 1.0f;
+        float sinN = (projNLen > 1e-4f) ? dot(projNDir, orthoTangent) : 0.0f;
         float nAngle = (projNLen > 1e-4f) ? atan2(sinN, cosN) : 0.0f;
 
         uint bitmaskTight = 0u;
         uint bitmaskBroad = 0u;
         float sliceTightOcc = 0.0f;
         float sliceBroadOcc = 0.0f;
+        float occNeg = 0.0f;
+        float occPos = 0.0f;
         float3 sliceGi = float3(0.0f, 0.0f, 0.0f);
 
         [loop]
@@ -298,11 +372,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 if (any(sampleUv < 0.002f) || any(sampleUv > 0.998f))
                 {
                     float3 exitDir = normalize(lerp(viewNormal, float3(marchDirPx.x, -marchDirPx.y, -0.3f), 0.55f));
-                    sliceGi += QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f) * 0.08f;
+                    float3 fb = QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f, float2(noiseA, noiseB)) * 0.08f;
+                    sliceGi += fb;
+                    giDirAccum += exitDir * Luma(fb);
                     break;
                 }
 
-                // Crisp half-res depth prevents Hi-Z minDepth 16x16 block outlines
                 int2 sGiCoord = ClampGiCoord(int2(sampleUv * float2(GiWidth, GiHeight)));
                 float sampleDepth = HalfColorDepthTex.Load(int3(sGiCoord, 0)).a;
                 if (sampleDepth >= 64000.0f || sampleDepth >= SkyDepthThreshold)
@@ -317,7 +392,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 float dist = sqrt(distSq);
                 float3 frontDir = deltaFront / dist;
 
-                // Band 1: Dual-Scale Visibility-Bitmask AO (tight crevice contact + broad cavity depth)
+                // Band 1: Dual-Scale Visibility-Bitmask AO + Directional Occlusion for Bent Normals
                 float fgGap = centerDepth - sampleDepth;
                 if (fgGap <= maxBroadGap && dist < broadRange)
                 {
@@ -353,17 +428,23 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                             uint newlyTight = sectorMask & ~bitmaskTight;
                             bitmaskTight |= sectorMask;
                             float tightFade = pow(1.0f - saturate(dist / tightRange), 1.35f);
-                            sliceTightOcc += (float(countbits(newlyTight)) / 32.0f) * tightFade;
+                            float tOcc = (float(countbits(newlyTight)) / 32.0f) * tightFade;
+                            sliceTightOcc += tOcc;
+                            if (dirSign < 0) occNeg += tOcc * 0.65f;
+                            else occPos += tOcc * 0.65f;
                         }
 
                         uint newlyBroad = sectorMask & ~bitmaskBroad;
                         bitmaskBroad |= sectorMask;
                         float broadFade = pow(1.0f - saturate(dist / broadRange), 2.1f);
-                        sliceBroadOcc += (float(countbits(newlyBroad)) / 32.0f) * broadFade;
+                        float bOcc = (float(countbits(newlyBroad)) / 32.0f) * broadFade;
+                        sliceBroadOcc += bOcc;
+                        if (dirSign < 0) occNeg += bOcc * 0.55f;
+                        else occPos += bOcc * 0.55f;
                     }
                 }
 
-                // Band 2: Strict Front-Hemisphere Chromatic Bounce GI (zero backside bleed onto dark backdrops!)
+                // Band 2: Strict Front-Hemisphere Chromatic Bounce GI with Depth-Validated Mip Lookup
                 float fgStep = max(centerDepth - sampleDepth, 0.0f);
                 float fgReject = 1.0f - smoothstep(clamp(centerDepth * 0.12f, 0.22f, 1.2f),
                                                    clamp(centerDepth * 0.30f, 0.55f, 3.0f), fgStep);
@@ -378,7 +459,12 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     if (nDotL > 0.0f && emitterFace > 0.01f)
                     {
                         float mipLvl = clamp(log2(max(radiusPx * 0.22f, 1.0f)), 0.0f, 4.0f);
-                        float3 sampleColor = clamp(ColorPyramidTex.SampleLevel(LinearClampPyr, sampleUv, mipLvl).rgb, 0.0f, 6.0f);
+                        float4 pyrSample = ColorPyramidTex.SampleLevel(LinearClampPyr, sampleUv, mipLvl);
+                        float3 sampleColor = (abs(pyrSample.a - sampleDepth) <= max(sampleDepth * 0.20f, 0.10f))
+                                                 ? pyrSample.rgb
+                                                 : HalfColorDepthTex.Load(int3(sGiCoord, 0)).rgb;
+                        sampleColor = clamp(sampleColor, 0.0f, 6.0f);
+
                         float hitLuma = Luma(sampleColor);
                         float hitChroma = max(sampleColor.r, max(sampleColor.g, sampleColor.b)) -
                                           min(sampleColor.r, min(sampleColor.g, sampleColor.b));
@@ -390,8 +476,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                         float normD = dist / max(giWorldRange * 0.38f, 0.5f);
                         float giAtten = rcp(1.0f + normD * normD) * pow(1.0f - saturate(dist / giWorldRange), 1.25f);
 
-                        sliceGi += hitCol * nDotL * emitterFace * lightSignal * emitterBoost * giAtten * fgReject *
-                                   (2.60f / float(steps));
+                        float3 hitContrib = hitCol * nDotL * emitterFace * lightSignal * emitterBoost * giAtten *
+                                            fgReject * (2.60f / float(steps));
+                        sliceGi += hitContrib;
+                        giDirAccum += frontDir * Luma(hitContrib);
                     }
                 }
             }
@@ -399,15 +487,28 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
         float sliceTightAo = saturate(1.0f - sliceTightOcc);
         float sliceBroadAo = saturate(1.0f - sliceBroadOcc * 0.72f);
-        accumAo += sliceTightAo * sliceBroadAo;
+        float sliceVis = sliceTightAo * sliceBroadAo;
+        accumAo += sliceVis;
         accumGi += sliceGi;
+
+        float bentShift = clamp(occNeg - occPos, -0.90f, 0.90f);
+        float3 sliceBent = normalize(projNDir + orthoTangent * bentShift);
+        bentNormalAccum += sliceBent * (0.25f + 0.75f * sliceVis);
     }
 
     float3 currentGi = max(accumGi / float(slices), 0.0f);
     float distAoFade = rcp(1.0f + centerDepth * 0.010f);
     float currentAo = lerp(1.0f, saturate(accumAo / float(slices)), distAoFade);
 
-    // 2. Long-Range Soft Ray-Marched Contact Shadows toward Dominant Key Light (0.08m -> 1.80m)
+    float3 bentNormal = (dot(bentNormalAccum, bentNormalAccum) > 1e-6f)
+                            ? normalize(lerp(viewNormal, normalize(bentNormalAccum), 0.75f))
+                            : viewNormal;
+    bentNormal.z = min(bentNormal.z, -0.05f);
+    bentNormal = normalize(bentNormal);
+
+    float3 giDir = (dot(giDirAccum, giDirAccum) > 1e-6f) ? normalize(giDirAccum) : bentNormal;
+
+    // 2. Soft-Penumbra Ray-Marched Contact Shadows toward Dominant Key Light (suppressed on grass)
     float contactShadow = 1.0f;
     float4 keyDirData = ResolvedSceneLightBuf[4];
     float3 keyDirView = normalize(keyDirData.xyz);
@@ -420,6 +521,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float occ = 0.0f;
         float invTanV = rcp(max(TanHalfFov, 1e-4f));
         float invTanH = rcp(max(TanHalfFovAspect, 1e-4f));
+        float maxThick = clamp(centerDepth * 0.032f, 0.035f, 0.42f);
+        float minThick = centerDepth * 0.0025f;
 
         [loop]
         for (int cs = 1; cs <= cSteps; ++cs)
@@ -435,26 +538,36 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
             float sampleD = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rUv * float2(GiWidth, GiHeight))), 0)).a;
             float diff = rayPos.z - sampleD;
-            float maxThick = clamp(centerDepth * 0.028f, 0.03f, 0.38f);
-            if (diff > centerDepth * 0.002f && diff < maxThick)
+            if (diff > minThick && diff < maxThick)
             {
-                occ = max(occ, 1.0f - fracS * 0.55f);
+                float win = smoothstep(minThick, minThick * 2.5f, diff) *
+                            (1.0f - smoothstep(maxThick * 0.65f, maxThick, diff));
+                occ = max(occ, win * (1.0f - fracS * 0.45f));
             }
         }
         float csDistFade = rcp(1.0f + centerDepth * 0.022f);
-        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * 0.82f);
+        float grassDamp = 1.0f - grassProb * 0.65f;
+        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * grassDamp * 0.82f);
     }
 
-    // 3. Hi-Z Roughness-Cone SSR (skip diffuse surfaces roughness > 0.85) + Virtual Hit Distance
-    float4 mat1 = Material1Tex.SampleLevel(LinearClampMat, uv, 0.0f);
-    float roughness = saturate(mat1.r);
+    // 3. True Hi-Z Mip-Skipping + Stochastic GGX Roughness-Cone SSR
+    float effRoughness = lerp(roughness, 0.14f, soilProb * wetness);
     float4 currentSsr = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float ssrHitDist = centerDepth * 0.5f;
     float2 ssrHitUv = uv;
 
-    if (SsrEnabled > 0 && roughness < 0.85f)
+    if (SsrEnabled > 0 && effRoughness < 0.85f && !(fabricProb > 0.72f && effRoughness > 0.72f))
     {
-        float3 reflDir = normalize(reflect(viewDir, viewNormal));
+        float3 tUp = (abs(viewNormal.y) < 0.9f) ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+        float3 tU = normalize(cross(tUp, viewNormal));
+        float3 tV = cross(viewNormal, tU);
+        float phi = noiseA * 2.0f * kPi;
+        float ggxSpread = effRoughness * effRoughness * 0.35f * (1.0f - 0.50f * saturate(1.0f - dot(toEye, viewNormal)));
+        float3 microNormal = normalize(viewNormal + (tU * cos(phi) + tV * sin(phi)) * ggxSpread);
+        if (dot(microNormal, toEye) < 0.05f)
+            microNormal = viewNormal;
+
+        float3 reflDir = normalize(reflect(viewDir, microNormal));
         if (reflDir.z > -0.65f)
         {
             float ssrMaxDist = max(centerDepth * 3.5f, 0.2f);
@@ -483,7 +596,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 float endZ = rcp(lerp(invZ0, rcp(max(endPos.z, minZClip)), maxT));
                 float invZ1 = rcp(endZ);
 
-                int ssrSteps = clamp(SsrSteps, 4, 12);
+                int ssrSteps = clamp(SsrSteps, 4, 16);
                 float invSteps = rcp(float(ssrSteps));
                 float prevKt = 0.0f;
                 float prevRayZ = centerPos.z;
@@ -491,22 +604,39 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 float2 hitUv = uv;
                 float hitThickness = 0.0f;
                 bool hit = false;
+                int hiZMip = (effRoughness < 0.25f) ? 1 : 2;
+                float kt = (0.35f + noiseB * 0.45f) * invSteps;
 
                 [loop]
-                for (int k = 1; k <= ssrSteps; ++k)
+                for (int k = 1; k <= ssrSteps + 2; ++k)
                 {
-                    float kt = (float(k) + noiseB * 0.35f) * invSteps;
+                    if (kt > 1.0f)
+                        break;
                     float kt2 = kt * kt;
                     float2 rayUv = lerp(uv, clippedEndUv, kt2);
                     float rayZ = rcp(lerp(invZ0, invZ1, kt2));
 
-                    // Sample crisp half-res depth to avoid 1/4-res min-depth silhouette bloat on reflections
-                    float rayDepth = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rayUv * float2(GiWidth, GiHeight))), 0)).a;
+                    if (hiZMip > 0)
+                    {
+                        float hiZDepth = ColorPyramidTex.SampleLevel(LinearClampPyr, rayUv, float(hiZMip)).a;
+                        if (rayZ < hiZDepth - max(hiZDepth * 0.01f, 0.02f))
+                        {
+                            prevKt = kt2;
+                            prevRayZ = rayZ;
+                            kt += invSteps * (hiZMip == 2 ? 1.5f : 1.15f);
+                        }
+                        else
+                        {
+                            hiZMip--;
+                        }
+                        continue;
+                    }
 
+                    float rayDepth = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rayUv * float2(GiWidth, GiHeight))), 0)).a;
                     if (rayDepth < 64000.0f)
                     {
                         float diff = rayZ - rayDepth;
-                        float stepThickness = max(rayDepth * 0.12f, abs(rayZ - prevRayZ) * 1.35f);
+                        float stepThickness = max(rayDepth * 0.12f, abs(rayZ - prevRayZ) * 1.45f);
                         if (diff > rayZ * 0.002f && diff < stepThickness)
                         {
                             hit = true;
@@ -519,6 +649,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
                     prevKt = kt2;
                     prevRayZ = rayZ;
+                    kt += invSteps;
                 }
 
                 if (hit)
@@ -544,11 +675,17 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                         }
                     }
 
+                    int2 hitCoord = ClampGiCoord(int2(hitUv * float2(GiWidth, GiHeight)));
+                    float4 hitCd = HalfColorDepthTex.Load(int3(hitCoord, 0));
                     float hitPxDist = length((hitUv - uv) * float2(OutputWidth, OutputHeight));
-                    float coneMip = clamp(log2(max(hitPxDist * roughness * 0.40f, 1.0f)), 0.0f, 4.0f);
-                    float3 hitCol = (coneMip < 0.35f)
-                                        ? HalfColorDepthTex.Load(int3(ClampGiCoord(int2(hitUv * float2(GiWidth, GiHeight))), 0)).rgb
-                                        : ColorPyramidTex.SampleLevel(LinearClampPyr, hitUv, coneMip).rgb;
+                    float coneMip = clamp(log2(max(hitPxDist * effRoughness * 0.40f, 1.0f)), 0.0f, 4.0f);
+                    float3 hitCol = hitCd.rgb;
+                    if (coneMip >= 0.35f)
+                    {
+                        float4 pyrHit = ColorPyramidTex.SampleLevel(LinearClampPyr, hitUv, coneMip);
+                        if (abs(pyrHit.a - hitCd.a) <= max(hitCd.a * 0.18f, 0.08f))
+                            hitCol = pyrHit.rgb;
+                    }
 
                     float2 edgeDist = min(hitUv, 1.0f - hitUv);
                     float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 9.0f);
@@ -560,10 +697,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             }
         }
 
-        // High-impact off-screen reflection fallback: directional pyramid + World Hash / Scene SH
         if (currentSsr.a < 0.95f)
         {
-            float3 envRefl = QueryFallbackRadiance(centerPos, reflDir, clamp(centerDepth * 1.2f, 1.5f, 24.0f));
+            float3 envRefl = QueryFallbackRadiance(centerPos, reflDir, clamp(centerDepth * 1.2f, 1.5f, 24.0f), float2(noiseA, noiseB));
             if (reflDir.z > -0.60f)
             {
                 float2 dirSampleUv = saturate(uv + reflDir.xy * 0.25f);
@@ -571,7 +707,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 envRefl = lerp(envRefl, pyrRefl, 0.55f);
             }
             currentSsr.rgb = lerp(envRefl, currentSsr.rgb, currentSsr.a);
-            currentSsr.a = max(currentSsr.a, 0.24f * (1.0f - roughness));
+            currentSsr.a = max(currentSsr.a, 0.24f * (1.0f - effRoughness));
         }
     }
 
@@ -586,11 +722,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float curLuma = Luma(currentGi);
     float variance = 0.25f;
     float histLen = 1.0f;
+    float3 outBent = bentNormal;
+    float3 outGiDir = giDir;
 
     if (validHistory)
     {
-        float baseAlpha = lerp(0.12f, 0.42f, saturate(mvMag / 16.0f));
-        float4 prevGi = PrevGiTex.SampleLevel(LinearClampGi, prevUv, 0.0f);
+        histLen = min(max(prevMeta.a, 1.0f) + 1.0f, 32.0f);
+        float baseAlpha = max(rcp(histLen), lerp(0.08f, 0.35f, saturate(mvMag / 16.0f)));
 
         float aoDiff = abs(prevGi.a - currentAo);
         float3 giDiff = abs(prevGi.rgb - currentGi);
@@ -598,13 +736,20 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float giAlpha = max(baseAlpha, min(0.65f, max(saturate(aoDiff * 1.15f), saturate(giMaxDiff * 0.50f))));
         giResult = lerp(prevGi, giResult, saturate(giAlpha));
 
+        contactShadow = lerp(prevMeta.r, contactShadow, max(baseAlpha, 0.35f));
+
         float prevLuma = Luma(prevGi.rgb);
-        variance = clamp(abs(curLuma - prevLuma) / max(curLuma + prevLuma + 0.05f, 0.05f), 0.02f, 1.0f);
-        histLen = 8.0f;
+        float instVar = abs(curLuma - prevLuma) / max(curLuma + prevLuma + 0.05f, 0.05f);
+        variance = clamp(lerp(prevMeta.g, instVar, 0.35f), 0.02f, 1.0f);
+
+        float2 pbxy = clamp(prevDir.xy, -1.0f, 1.0f);
+        float3 prevBent = float3(pbxy, -sqrt(max(0.0f, 1.0f - dot(pbxy, pbxy))));
+        outBent = normalize(lerp(prevBent, bentNormal, saturate(giAlpha)));
+        float3 prevGiD = OctDecode(prevDir.zw);
+        outGiDir = normalize(lerp(prevGiD, giDir, saturate(giAlpha)));
 
         if (SsrEnabled > 0)
         {
-            // Virtual-hit MV blending for SSR: blend surface MV with reflected-hit pixel MV to reduce floor smear
             float2 ssrPrevUv = prevUv;
             if (currentSsr.a > 0.25f)
             {
@@ -612,7 +757,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                 int2 hitMvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(hitApproxUv * float2(activeW, activeH)));
                 float2 hitMv = MotionTex.Load(int3(hitMvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
                 float2 hitPrevUv = uv + hitMv / float2(max(activeW, 1), max(activeH, 1));
-                float virtBlend = saturate(ssrHitDist / max(centerDepth * 1.5f, 0.5f)) * (1.0f - roughness) * 0.55f;
+                float virtBlend = saturate(ssrHitDist / max(centerDepth * 1.5f, 0.5f)) * (1.0f - effRoughness) * 0.55f;
                 ssrPrevUv = lerp(prevUv, hitPrevUv, virtBlend);
             }
             ssrPrevUv = clamp(ssrPrevUv, 0.002f, 0.998f);
@@ -627,4 +772,5 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     OutGiTex[giCoord] = float4(max(giResult.rgb, 0.0f), saturate(giResult.a));
     OutSsrTex[giCoord] = float4(max(ssrResult.rgb, 0.0f), saturate(ssrResult.a));
     OutGiMetaTex[giCoord] = float4(contactShadow, variance, ssrHitDist, histLen);
+    OutGiDirTex[giCoord] = float4(outBent.xy, OctEncode(outGiDir));
 }

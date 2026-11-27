@@ -8222,19 +8222,18 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
     if (GnuUi::Checkbox("Enable 3D Neural Look", &nlEnabled))
         config->NeuralLookEnabled = nlEnabled;
     ShowTooltip("Real-time 3D-Guided Neural Rendering pipeline (DX12 & Vulkan, pre-HUD):\n"
-                "- 5-Mip Hi-Z Depth + Color Pyramid & Scene L1 SH Light Field\n"
-                "- Trained 1/8-res ConvNeXt-Micro Material Priors + 3D Bilateral Grid\n"
-                "- Visibility-Bitmask SSGI, Contact Shadows & Hi-Z Roughness-Cone SSR\n"
-                "- World-Space Spatial Hash Radiance Cache (off-screen & multi-bounce GI)\n"
-                "- Skin Subsurface Scattering (SSSSS), AgX Filmic Roll-Off & Fused RCAS");
+                "- 5-Mip Hi-Z Depth + Color Pyramid, Multi-Cue Surface Features & Scene L1 SH\n"
+                "- Trained 1/8-res ConvNeXt-Micro v2 (Fabric/Sand/Soil/Grass/Skin/Hard) + 3D Bilateral Grid\n"
+                "- Visibility-Bitmask SSGI + Bent Normals + Directional GI + Hi-Z Stochastic GGX SSR\n"
+                "- Decoupled 2-Pass À-Trous Denoiser, 2-Ring Anti-Halo Guards, Per-Channel AgX & Fused RCAS");
 
     if (currentFeature != nullptr)
     {
         const int tier = currentFeature->NeuralLookActiveTier();
         const auto gpuMs = currentFeature->LastNeuralLookTime();
-        const char* tierName = (tier == 2) ? "Full (3-slice VisBitmask SSGI + 12-step Hi-Z SSR + Neural Grid)"
-                               : (tier == 1) ? "Medium (2-slice VisBitmask SSGI + 8-step Hi-Z SSR + Neural Grid)"
-                               : (tier == 0) ? "Light (Neural Grid + SSS + Relight + AgX only)"
+        const char* tierName = (tier == 2) ? "Full (2-slice VisBitmask SSGI + 16-step Hi-Z GGX SSR + 2-pass Denoise)"
+                               : (tier == 1) ? "Medium (2-slice VisBitmask SSGI + 10-step Hi-Z GGX SSR + 2-pass Denoise)"
+                               : (tier == 0) ? "Light (1-slice SSGI + 1-pass Denoise + Neural Grid + AgX)"
                                              : "Inactive / DX11 unsupported";
         if (nlEnabled && gpuMs.has_value())
             ImGui::TextDisabled("Active Tier: %s | GPU Pass: %.2f ms", tierName, gpuMs.value());
@@ -8414,7 +8413,8 @@ void MenuCommon::RenderNeuralLookTab(RenderMenuContext& ctx)
         "SSR Reflections",
         "Material Priors (Rough/Metal/Skin)",
         "Skin SSS & Contact Shadows",
-        "World Radiance Cache"
+        "World Radiance Cache",
+        "Semantic Materials (Fabric/Sand/Soil/Grass)"
     };
     if (ImGui::Combo("Debug View##NL", &debugView, debugViews, IM_ARRAYSIZE(debugViews)))
         config->NeuralLookDebugView = debugView;

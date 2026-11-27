@@ -145,6 +145,8 @@ RWStructuredBuffer<uint> SceneLightBuf : register(u2);
 #endif
 RWStructuredBuffer<uint> WorldHashBuf : register(u3);
 
+groupshared float s_depth[10][10];
+
 int2 ClampOutputCoord(int2 p)
 {
     return int2(clamp(p.x, 0, OutputWidth - 1), clamp(p.y, 0, OutputHeight - 1));
@@ -195,17 +197,15 @@ float LoadLinearDepth(int2 coord)
                                DepthLinearA, DepthLinearB, DepthLinearC, SkyDepthThreshold);
 }
 
-float3 ReconstructViewNormalFromDepths(int2 dCoord, float dC, float dL, float dR, float dU, float dD)
+float3 ReconstructViewNormalFromHalfDepths(float2 uv, float dC, float dL, float dR, float dU, float dD)
 {
-    float2 renderSize = float2(max(RenderWidth, 1), max(RenderHeight, 1));
-    float2 dUv = (float2(dCoord - int2(DepthSubrectBaseX, DepthSubrectBaseY)) + 0.5f) / renderSize;
-    float2 invDepth = 1.0f / renderSize;
+    float2 invHalf = 1.0f / float2(max(HalfWidth, 1), max(HalfHeight, 1));
 
-    float3 pC = ReconstructViewPos(dUv, dC, TanHalfFov, TanHalfFovAspect);
-    float3 pL = ReconstructViewPos(dUv + float2(-invDepth.x, 0.0f), dL, TanHalfFov, TanHalfFovAspect);
-    float3 pR = ReconstructViewPos(dUv + float2(invDepth.x, 0.0f), dR, TanHalfFov, TanHalfFovAspect);
-    float3 pU = ReconstructViewPos(dUv + float2(0.0f, -invDepth.y), dU, TanHalfFov, TanHalfFovAspect);
-    float3 pD = ReconstructViewPos(dUv + float2(0.0f, invDepth.y), dD, TanHalfFov, TanHalfFovAspect);
+    float3 pC = ReconstructViewPos(uv, dC, TanHalfFov, TanHalfFovAspect);
+    float3 pL = ReconstructViewPos(uv + float2(-invHalf.x, 0.0f), dL, TanHalfFov, TanHalfFovAspect);
+    float3 pR = ReconstructViewPos(uv + float2(invHalf.x, 0.0f), dR, TanHalfFov, TanHalfFovAspect);
+    float3 pU = ReconstructViewPos(uv + float2(0.0f, -invHalf.y), dU, TanHalfFov, TanHalfFovAspect);
+    float3 pD = ReconstructViewPos(uv + float2(0.0f, invHalf.y), dD, TanHalfFov, TanHalfFovAspect);
 
     float3 dx = (abs(dR - dC) < abs(dC - dL)) ? (pR - pC) : (pC - pL);
     float3 dy = (abs(dD - dC) < abs(dC - dU)) ? (pC - pD) : (pU - pC);
@@ -229,7 +229,8 @@ float SignedSpike(float c, float a, float b)
 }
 
 [numthreads(8, 8, 1)]
-void CSMain(uint3 dtid : SV_DispatchThreadID)
+void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID,
+            uint tid : SV_GroupIndex)
 {
     // Clear SceneLightBuf (32 uints) for Pass 1 atomic reduction
     if (dtid.x == 0 && dtid.y == 0)
@@ -238,6 +239,24 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         for (uint si = 0u; si < 32u; ++si)
             SceneLightBuf[si] = 0u;
     }
+
+    // Populate 10x10 LDS half-res depth tile (100 loads across 64 threads vs 9/pixel)
+    int2 tileOrigin = int2(gid.xy) * 8 - 1;
+    float2 invHalf = 1.0f / float2(max(HalfWidth, 1), max(HalfHeight, 1));
+    [unroll]
+    for (uint passIdx = 0u; passIdx < 2u; ++passIdx)
+    {
+        uint idx = tid + passIdx * 64u;
+        if (idx < 100u)
+        {
+            int ly = int(idx / 10u);
+            int lx = int(idx % 10u);
+            int2 hc = ClampHalfCoord(tileOrigin + int2(lx, ly));
+            float2 hUv = (float2(hc) + 0.5f) * invHalf;
+            s_depth[ly][lx] = LoadLinearDepth(UvToDepthCoord(hUv));
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
 
     if ((int) dtid.x >= HalfWidth || (int) dtid.y >= HalfHeight)
         return;
@@ -254,26 +273,27 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     }
 
     int2 halfCoord = int2(dtid.xy);
-    float2 uv = (float2(halfCoord) + 0.5f) / float2(HalfWidth, HalfHeight);
-
+    int lx = int(gtid.x) + 1;
+    int ly = int(gtid.y) + 1;
+    float2 uv = (float2(halfCoord) + 0.5f) * invHalf;
     float exposureNorm = rcp(max(PreExposure, 1e-4f));
 
     int2 dCoord = UvToDepthCoord(uv);
-    float dC  = LoadLinearDepth(dCoord);
-    float dL  = LoadLinearDepth(dCoord + int2(-1, 0));
-    float dR  = LoadLinearDepth(dCoord + int2(1, 0));
-    float dU  = LoadLinearDepth(dCoord + int2(0, -1));
-    float dD  = LoadLinearDepth(dCoord + int2(0, 1));
-    float dUL = LoadLinearDepth(dCoord + int2(-1, -1));
-    float dUR = LoadLinearDepth(dCoord + int2(1, -1));
-    float dDL = LoadLinearDepth(dCoord + int2(-1, 1));
-    float dDR = LoadLinearDepth(dCoord + int2(1, 1));
+    float dC  = s_depth[ly][lx];
+    float dL  = s_depth[ly][lx - 1];
+    float dR  = s_depth[ly][lx + 1];
+    float dU  = s_depth[ly - 1][lx];
+    float dD  = s_depth[ly + 1][lx];
+    float dUL = s_depth[ly - 1][lx - 1];
+    float dUR = s_depth[ly - 1][lx + 1];
+    float dDL = s_depth[ly + 1][lx - 1];
+    float dDR = s_depth[ly + 1][lx + 1];
 
     float minD = min(dC, min(min(min(dL, dR), min(dU, dD)), min(min(dUL, dUR), min(dDL, dDR))));
 
     // Depth-guided 2x2 color downsample (prevents sky/background bleeding into foreground edges)
     int2 baseOut = halfCoord * 2;
-    float2 invOut = 1.0f / float2(OutputWidth, OutputHeight);
+    float2 invOut = 1.0f / float2(max(OutputWidth, 1), max(OutputHeight, 1));
     float3 linColor = float3(0.0f, 0.0f, 0.0f);
     float wColSum = 0.0f;
 
@@ -287,14 +307,13 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             float3 cTap = ToLinearColor(SourceColor.Load(int3(pOut, 0)).rgb, InColorEncodeMode) * exposureNorm;
             float2 pUv = (float2(pOut) + 0.5f) * invOut;
             float pDepth = LoadLinearDepth(UvToDepthCoord(pUv));
-            float w = exp2(-abs(pDepth - dC) / max(dC * 0.08f, 0.02f)) + 1e-3f;
+            float w = exp2(-abs(pDepth - dC) / max(dC * 0.06f, 0.02f)) + 1e-3f;
             linColor += cTap * w;
             wColSum += w;
         }
     }
     linColor /= max(wColSum, 1e-4f);
     float luma = Luma(linColor);
-    // Soft knee highlight compression above 12.0 to prevent extreme HDR fireflies
     if (luma > 12.0f)
         linColor *= (12.0f + log2(1.0f + (luma - 12.0f))) / max(luma, 1e-4f);
 
@@ -305,7 +324,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         return;
     }
 
-    // Strict 2D collinear-triple stipple/dither detector
+    // Strict 2D collinear-triple stipple/dither detector (threshold tuned so dense grass is not killed)
     float spH     = SignedSpike(dC, dL,  dR);
     float spV     = SignedSpike(dC, dU,  dD);
     float spD1    = SignedSpike(dC, dUL, dDR);
@@ -318,9 +337,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float orthoSpike = max(min(spH, spV), min(spD1, spD2));
     float ringSpike = min(min(spTop, spBot), min(spLeft, spRight));
     float relSpike = max(orthoSpike, ringSpike) / max(minD, 0.05f);
-    float spatialDither = smoothstep(0.005f, 0.020f, relSpike);
+    float spatialDither = smoothstep(0.018f, 0.065f, relSpike);
 
-    // Fixed motion vector scaling (handles both LowResMV and DisplaySizeMV + subrects)
     int2 mvCoord = UvToMotionCoord(uv);
     float2 mv = MotionTex.Load(int3(mvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
     float2 mvRefSize = (DisplaySizeMV > 0) ? float2(OutputWidth, OutputHeight)
@@ -340,7 +358,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float depthDiff = min(abs(dC - prevRawD), abs(dC - prevSample.w));
     float relTempDiff = depthDiff / max(min(dC, min(prevRawD, prevSample.w)), 0.05f);
     float motionTrust = rcp(1.0f + mvMagPx * 0.15f);
-    float temporalFlip = validHistory ? (smoothstep(0.006f, 0.028f, relTempDiff) * motionTrust) : 0.0f;
+    float temporalFlip = validHistory ? (smoothstep(0.012f, 0.050f, relTempDiff) * motionTrust) : 0.0f;
 
     float reactiveMask = 0.0f;
     if (HasReactiveMask > 0)
@@ -358,8 +376,8 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         flickerEma = lerp(prevEma, instantFlicker, alpha);
     }
 
-    float safeDC = (dC >= 64000.0f && flickerEma > 0.15f) ? minD : dC;
-    float outDepth = lerp(safeDC, minD, smoothstep(0.15f, 0.55f, flickerEma));
+    float safeDC = (dC >= 64000.0f && flickerEma > 0.25f) ? minD : dC;
+    float outDepth = lerp(safeDC, minD, smoothstep(0.25f, 0.65f, flickerEma));
     OutHalfColorDepth[halfCoord] = float4(linColor, min(outDepth, 65000.0f));
 
     if (outDepth >= 64000.0f)
@@ -368,10 +386,9 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         return;
     }
 
-    float3 viewNormal = ReconstructViewNormalFromDepths(dCoord, dC, dL, dR, dU, dD);
+    float3 viewNormal = ReconstructViewNormalFromHalfDepths(uv, dC, dL, dR, dU, dD);
     if (HasGBufferNormals > 0)
     {
-        // Sample G-Buffer Normals in render-res coordinates and transform world->view when camera basis is known
         float3 gN = GBufferNormalsTex.Load(int3(dCoord, 0)).xyz;
         if (all(gN >= 0.0f) && all(gN <= 1.0f))
             gN = gN * 2.0f - 1.0f;
@@ -386,7 +403,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
                     gNorm = gView;
             }
             if (dot(gNorm, viewNormal) > 0.15f)
-                viewNormal = normalize(lerp(viewNormal, gNorm, 0.65f));
+                viewNormal = normalize(lerp(viewNormal, gNorm, 0.90f));
         }
     }
 
@@ -406,7 +423,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     OutHalfNormal[halfCoord] = float4(viewNormal.xy, saturate(flickerEma), min(dC, 65000.0f));
 
-    // Phase 4: World-Space Spatial Hash Radiance Cache injection (1-in-4 staggered pixels per frame)
+    // Phase 4: World-Space Spatial Hash Radiance Cache injection (4-slot probing, 1-in-4 staggered pixels)
     if (WorldHashEnabled > 0 && HasCameraBasis > 0 && ResetHistory == 0 && flickerEma < 0.45f &&
         (((halfCoord.x & 1) + (halfCoord.y & 1) * 2) == (FrameIndex & 3)))
     {
@@ -414,26 +431,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float3 worldPos = ViewToWorldPos(viewPos, CameraPos, CameraRight, CameraUp, CameraFwd);
         float3 worldNorm = ViewToWorldDir(viewNormal, CameraRight, CameraUp, CameraFwd);
 
-        // Infinite multi-bounce: combine direct radiance with previous frame's indirect GI bounce
         float3 prevGi = validHistory ? max(PrevGiTex.SampleLevel(LinearClampGi, prevUv, 0.0f).rgb, 0.0f)
                                      : float3(0.0f, 0.0f, 0.0f);
         float3 totalRad = linColor + prevGi * 0.55f;
 
-        uint cellIdx, sig22;
-        ComputeWorldHashAddr(worldPos, worldNorm, outDepth, cellIdx, sig22);
-
-        uint newMeta = (sig22 & 0x3FFFFFu) | ((uint(FrameIndex) & 0x3FFu) << 22);
-        uint existingMeta = WorldHashBuf[cellIdx * 2u];
-        uint existingSig = existingMeta & 0x3FFFFFu;
-        uint existingAge = (uint(FrameIndex) - ((existingMeta >> 22) & 0x3FFu)) & 0x3FFu;
-
-        if (existingSig == sig22 && existingAge <= 60u)
-        {
-            float3 oldRad = UnpackRadiance101010(WorldHashBuf[cellIdx * 2u + 1u]);
-            totalRad = lerp(oldRad, totalRad, 0.25f);
-        }
-
-        WorldHashBuf[cellIdx * 2u] = newMeta;
-        WorldHashBuf[cellIdx * 2u + 1u] = PackRadiance101010(totalRad);
+        InjectWorldHash(WorldHashBuf, worldPos, worldNorm, outDepth, FrameIndex, totalRad);
     }
 }

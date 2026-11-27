@@ -46,9 +46,9 @@ class NL_Common
   public:
     enum class BudgetTier : int
     {
-        Light = 0,  // All passes except SSR: 1-slice SSGI + 3-step Contact Shadows + Denoise + Composite
-        Medium = 1, // All 6 passes: 2-slice Visibility-Bitmask SSGI + 4-step Contact Shadows + 8-step Hi-Z SSR + Denoise
-        Full = 2    // All 6 passes: 2-slice Visibility-Bitmask SSGI + 6-step Contact Shadows + 14-step Hi-Z SSR + Denoise
+        Light = 0,  // 1-slice SSGI + 3-step Contact Shadows + 1-pass Denoise + Composite (no SSR)
+        Medium = 1, // 2-slice VisBitmask SSGI + 5-step Contact Shadows + 10-step Hi-Z GGX SSR + 2-pass Denoise
+        Full = 2    // 2-slice VisBitmask SSGI + 8-step Contact Shadows + 16-step Hi-Z GGX SSR + 2-pass Denoise
     };
 
     void UpdateBudget(double gpuMs)
@@ -292,9 +292,14 @@ class NL_Common
         int32_t SsrEnabled = 1;
 
         float SkyDepthThreshold = 500.0f;
-        float PhiDepth = 0.045f;
+        float PhiDepth = 0.028f;
         float PhiNormal = 32.0f;
         float PhiLuma = 1.25f;
+
+        int32_t PassIndex = 0;
+        int32_t _pad0 = 0;
+        int32_t _pad1 = 0;
+        int32_t _pad2 = 0;
     };
 
     struct alignas(256) NLCompositeInternalConstants
@@ -368,6 +373,11 @@ class NL_Common
         float FusedRcasSharpness = 0.0f;
         float PreExposure = 1.0f;
         float _pad1 = 0.0f;
+
+        int32_t EighthWidth = 0;
+        int32_t EighthHeight = 0;
+        int32_t _pad2 = 0;
+        int32_t _pad3 = 0;
 
         float CameraPos[3] = { 0.0f, 0.0f, 0.0f };
         float _padCam0 = 0.0f;
@@ -556,16 +566,17 @@ class NL_Common
     }
 
     void FillDenoiseConstants(NLDenoiseInternalConstants& c, const NeuralLookConstants& inConst, int32_t giW,
-                              int32_t giH, bool ssrEnabled) const
+                              int32_t giH, bool ssrEnabled, int32_t stepSize = 1, int32_t passIndex = 0) const
     {
         c.GiWidth = giW;
         c.GiHeight = giH;
-        c.StepSize = 1;
+        c.StepSize = stepSize;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
         c.SkyDepthThreshold = ComputeScaledSkyThreshold(inConst);
-        c.PhiDepth = 0.045f;
+        c.PhiDepth = 0.028f;
         c.PhiNormal = 32.0f;
         c.PhiLuma = 1.25f;
+        c.PassIndex = passIndex;
     }
 
     void FillCompositeConstants(NLCompositeInternalConstants& c, const NeuralLookConstants& inConst, bool giEnabled,

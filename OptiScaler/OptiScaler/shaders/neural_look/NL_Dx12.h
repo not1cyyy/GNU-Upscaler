@@ -20,12 +20,13 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
     FrameDescriptorHeap _frameHeapsPrior[NL_NUM_OF_HEAPS];
     FrameDescriptorHeap _frameHeapsGi[NL_NUM_OF_HEAPS];
     FrameDescriptorHeap _frameHeapsDenoise[NL_NUM_OF_HEAPS];
+    FrameDescriptorHeap _frameHeapsDenoise2[NL_NUM_OF_HEAPS];
     FrameDescriptorHeap _frameHeapsComposite[NL_NUM_OF_HEAPS];
 
     ID3D12Resource* _buffer = nullptr;
     D3D12_RESOURCE_STATES _bufferState = D3D12_RESOURCE_STATE_COMMON;
 
-    // Half-res Temporal G-Proxy & GI/SSR/Meta + Denoised targets
+    // Half-res Temporal G-Proxy & GI/SSR/Meta/Dir + 2-Pass Denoised targets
     ID3D12Resource* _halfColorDepthBuffer = nullptr;
     D3D12_RESOURCE_STATES _halfColorDepthState = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* _halfNormalBuffers[2] = { nullptr, nullptr };
@@ -37,6 +38,17 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
     D3D12_RESOURCE_STATES _ssrBufferStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
     ID3D12Resource* _giMetaBuffers[2] = { nullptr, nullptr };
     D3D12_RESOURCE_STATES _giMetaStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
+    ID3D12Resource* _giDirBuffers[2] = { nullptr, nullptr };
+    D3D12_RESOURCE_STATES _giDirStates[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
+
+    ID3D12Resource* _denoisedGiScratch = nullptr;
+    D3D12_RESOURCE_STATES _denoisedGiScratchState = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* _denoisedSsrScratch = nullptr;
+    D3D12_RESOURCE_STATES _denoisedSsrScratchState = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* _denoisedMetaScratch = nullptr;
+    D3D12_RESOURCE_STATES _denoisedMetaScratchState = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* _denoisedGiDirScratch = nullptr;
+    D3D12_RESOURCE_STATES _denoisedGiDirScratchState = D3D12_RESOURCE_STATE_COMMON;
 
     ID3D12Resource* _denoisedGiBuffer = nullptr;
     D3D12_RESOURCE_STATES _denoisedGiState = D3D12_RESOURCE_STATE_COMMON;
@@ -44,28 +56,39 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
     D3D12_RESOURCE_STATES _denoisedSsrState = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* _denoisedMetaBuffer = nullptr;
     D3D12_RESOURCE_STATES _denoisedMetaState = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* _denoisedGiDirBuffer = nullptr;
+    D3D12_RESOURCE_STATES _denoisedGiDirState = D3D12_RESOURCE_STATE_COMMON;
 
-    // 5-mip Color + Hi-Z MinDepth pyramid (1/4 through 1/64 res) & 1/8-res Material/Bilateral Grid
+    // 5-mip Color + Hi-Z MinDepth pyramid (1/4 through 1/64 res) & 1/8-res Material/Features/Bilateral Grid
     ID3D12Resource* _colorPyramidBuffer = nullptr;
     D3D12_RESOURCE_STATES _colorPyramidState = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* _eighthNormalBuffer = nullptr;
     D3D12_RESOURCE_STATES _eighthNormalState = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* _eighthFeaturesBuffer = nullptr;
+    D3D12_RESOURCE_STATES _eighthFeaturesState = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* _material0Buffers[2] = { nullptr, nullptr };
     D3D12_RESOURCE_STATES _material0States[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
     ID3D12Resource* _material1Buffers[2] = { nullptr, nullptr };
     D3D12_RESOURCE_STATES _material1States[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
-    ID3D12Resource* _bilateralGridBuffers[3] = { nullptr, nullptr, nullptr };
-    D3D12_RESOURCE_STATES _bilateralGridStates[3] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
-                                                      D3D12_RESOURCE_STATE_COMMON };
+    ID3D12Resource* _material2Buffers[2] = { nullptr, nullptr };
+    D3D12_RESOURCE_STATES _material2States[2] = { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
+    ID3D12Resource* _bilateralGridBuffers[2][3] = {};
+    D3D12_RESOURCE_STATES _bilateralGridStates[2][3] = {
+        { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON },
+        { D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON }
+    };
 
-    // Scene light field, World-Space Spatial Hash Radiance Cache, and Neural Look model weights
+    // Scene light field, World-Space Spatial Hash Radiance Cache, and VRAM Neural Look model weights
     ID3D12Resource* _sceneLightBuffer = nullptr;
     D3D12_RESOURCE_STATES _sceneLightState = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* _resolvedSceneLightBuffer = nullptr;
     D3D12_RESOURCE_STATES _resolvedSceneLightState = D3D12_RESOURCE_STATE_COMMON;
     ID3D12Resource* _worldHashBuffer = nullptr;
     D3D12_RESOURCE_STATES _worldHashState = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource* _modelWeightsUploadBuffer = nullptr;
     ID3D12Resource* _modelWeightsBuffer = nullptr;
+    D3D12_RESOURCE_STATES _modelWeightsState = D3D12_RESOURCE_STATE_COMMON;
+    bool _modelWeightsDirty = false;
     std::string _loadedModelPack;
 
     uint32_t _giWidth = 0;
@@ -97,7 +120,7 @@ class NL_Dx12 : public Shader_Dx12, public NL_Common
     bool SetupPassRootSigAndPso(ID3D12Device* device, uint32_t numSrv, uint32_t numUav, uint32_t numCbv,
                                 uint32_t numStaticSamplers, const void* bytecode, size_t bytecodeSize,
                                 ID3D12RootSignature** outRootSig, ID3D12PipelineState** outPso,
-                                FrameDescriptorHeap* heaps);
+                                FrameDescriptorHeap* heaps, FrameDescriptorHeap* extraHeaps = nullptr);
 
   public:
     bool CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InSource, D3D12_RESOURCE_STATES InState);

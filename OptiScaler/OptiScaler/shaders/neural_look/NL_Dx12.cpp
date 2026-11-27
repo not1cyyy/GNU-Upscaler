@@ -154,12 +154,27 @@ void NL_Dx12::UpdateModelWeightsIfNeeded(ID3D12Device* InDevice)
     if (_modelWeightsBuffer != nullptr && _loadedModelPack == desired)
         return;
 
-    if (_modelWeightsBuffer == nullptr)
+    if (_modelWeightsUploadBuffer == nullptr)
     {
         const auto uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
         const auto desc = CD3DX12_RESOURCE_DESC::Buffer(NLModel::kFloatCount * sizeof(float));
         if (FAILED(InDevice->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &desc,
                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                     IID_PPV_ARGS(&_modelWeightsUploadBuffer))) ||
+            _modelWeightsUploadBuffer == nullptr)
+        {
+            LOG_ERROR("[{0}] Failed to create ModelWeightsUploadBuf", _name);
+            return;
+        }
+        _modelWeightsUploadBuffer->SetName(L"NL_ModelWeightsUploadBuf");
+    }
+
+    if (_modelWeightsBuffer == nullptr)
+    {
+        const auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+        const auto desc = CD3DX12_RESOURCE_DESC::Buffer(NLModel::kFloatCount * sizeof(float));
+        if (FAILED(InDevice->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                      IID_PPV_ARGS(&_modelWeightsBuffer))) ||
             _modelWeightsBuffer == nullptr)
         {
@@ -167,6 +182,7 @@ void NL_Dx12::UpdateModelWeightsIfNeeded(ID3D12Device* InDevice)
             return;
         }
         _modelWeightsBuffer->SetName(L"NL_ModelWeightsBuf");
+        _modelWeightsState = D3D12_RESOURCE_STATE_COPY_DEST;
     }
 
     std::vector<float> weights;
@@ -174,12 +190,13 @@ void NL_Dx12::UpdateModelWeightsIfNeeded(ID3D12Device* InDevice)
 
     void* mapped = nullptr;
     CD3DX12_RANGE readRange(0, 0);
-    if (SUCCEEDED(_modelWeightsBuffer->Map(0, &readRange, &mapped)) && mapped != nullptr)
+    if (SUCCEEDED(_modelWeightsUploadBuffer->Map(0, &readRange, &mapped)) && mapped != nullptr)
     {
         std::memcpy(mapped, weights.data(), NLModel::kFloatCount * sizeof(float));
-        _modelWeightsBuffer->Unmap(0, nullptr);
+        _modelWeightsUploadBuffer->Unmap(0, nullptr);
         _loadedModelPack = desired;
-        LOG_INFO("[{0}] Loaded Neural Look model pack '{1}'", _name, desired);
+        _modelWeightsDirty = true;
+        LOG_INFO("[{0}] Staged Neural Look v2 model pack '{1}' for VRAM upload", _name, desired);
     }
 }
 
@@ -188,7 +205,7 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
     const uint32_t targetW = std::max(1u, width / 2u);
     const uint32_t targetH = std::max(1u, height / 2u);
 
-    if (_halfColorDepthBuffer != nullptr && _colorPyramidBuffer != nullptr && _bilateralGridBuffers[0] != nullptr &&
+    if (_halfColorDepthBuffer != nullptr && _colorPyramidBuffer != nullptr && _bilateralGridBuffers[0][0] != nullptr &&
         _denoisedGiBuffer != nullptr && _giWidth == targetW && _giHeight == targetH)
     {
         return CreateStaticBuffers(InDevice);
@@ -226,9 +243,14 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
     };
 
     if (!createTex2D(targetW, targetH, 1, _halfColorDepthBuffer, _halfColorDepthState, L"NL_HalfColorDepth") ||
+        !createTex2D(targetW, targetH, 1, _denoisedGiScratch, _denoisedGiScratchState, L"NL_DenoisedGI_Scratch") ||
+        !createTex2D(targetW, targetH, 1, _denoisedSsrScratch, _denoisedSsrScratchState, L"NL_DenoisedSSR_Scratch") ||
+        !createTex2D(targetW, targetH, 1, _denoisedMetaScratch, _denoisedMetaScratchState, L"NL_DenoisedMeta_Scratch") ||
+        !createTex2D(targetW, targetH, 1, _denoisedGiDirScratch, _denoisedGiDirScratchState, L"NL_DenoisedGIDir_Scratch") ||
         !createTex2D(targetW, targetH, 1, _denoisedGiBuffer, _denoisedGiState, L"NL_DenoisedGI") ||
         !createTex2D(targetW, targetH, 1, _denoisedSsrBuffer, _denoisedSsrState, L"NL_DenoisedSSR") ||
-        !createTex2D(targetW, targetH, 1, _denoisedMetaBuffer, _denoisedMetaState, L"NL_DenoisedMeta"))
+        !createTex2D(targetW, targetH, 1, _denoisedMetaBuffer, _denoisedMetaState, L"NL_DenoisedMeta") ||
+        !createTex2D(targetW, targetH, 1, _denoisedGiDirBuffer, _denoisedGiDirState, L"NL_DenoisedGIDir"))
     {
         ReleaseGiBuffers();
         return false;
@@ -243,7 +265,9 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
             !createTex2D(targetW, targetH, 1, _ssrBuffers[i], _ssrBufferStates[i],
                          i == 0 ? L"NL_SSR_0" : L"NL_SSR_1") ||
             !createTex2D(targetW, targetH, 1, _giMetaBuffers[i], _giMetaStates[i],
-                         i == 0 ? L"NL_GIMeta_0" : L"NL_GIMeta_1"))
+                         i == 0 ? L"NL_GIMeta_0" : L"NL_GIMeta_1") ||
+            !createTex2D(targetW, targetH, 1, _giDirBuffers[i], _giDirStates[i],
+                         i == 0 ? L"NL_GIDir_0" : L"NL_GIDir_1"))
         {
             ReleaseGiBuffers();
             return false;
@@ -271,39 +295,45 @@ bool NL_Dx12::CreateGiBuffers(ID3D12Device* InDevice, uint32_t width, uint32_t h
     _gridHeight = std::max(1u, (_eighthHeight + 7u) / 8u);
 
     if (!createTex2D(_eighthWidth, _eighthHeight, 1, _eighthNormalBuffer, _eighthNormalState, L"NL_EighthNormal") ||
+        !createTex2D(_eighthWidth, _eighthHeight, 1, _eighthFeaturesBuffer, _eighthFeaturesState, L"NL_EighthFeatures") ||
         !createTex2D(_eighthWidth, _eighthHeight, 1, _material0Buffers[0], _material0States[0], L"NL_Mat0_0") ||
         !createTex2D(_eighthWidth, _eighthHeight, 1, _material0Buffers[1], _material0States[1], L"NL_Mat0_1") ||
         !createTex2D(_eighthWidth, _eighthHeight, 1, _material1Buffers[0], _material1States[0], L"NL_Mat1_0") ||
-        !createTex2D(_eighthWidth, _eighthHeight, 1, _material1Buffers[1], _material1States[1], L"NL_Mat1_1"))
+        !createTex2D(_eighthWidth, _eighthHeight, 1, _material1Buffers[1], _material1States[1], L"NL_Mat1_1") ||
+        !createTex2D(_eighthWidth, _eighthHeight, 1, _material2Buffers[0], _material2States[0], L"NL_Mat2_0") ||
+        !createTex2D(_eighthWidth, _eighthHeight, 1, _material2Buffers[1], _material2States[1], L"NL_Mat2_1"))
     {
         ReleaseGiBuffers();
         return false;
     }
 
-    // 3 x 3D Bilateral Grid textures (GridW x GridH x 8)
-    for (int g = 0; g < 3; ++g)
+    // Double-buffered 3 x 3D Bilateral Grid textures (GridW x GridH x 8)
+    for (int b = 0; b < 2; ++b)
     {
-        D3D12_RESOURCE_DESC d3 {};
-        d3.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        d3.Width = _gridWidth;
-        d3.Height = _gridHeight;
-        d3.DepthOrArraySize = static_cast<UINT16>(kBilateralLumaBins);
-        d3.MipLevels = 1;
-        d3.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        d3.SampleDesc.Count = 1;
-        d3.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-
-        if (FAILED(InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &d3,
-                                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                                                     IID_PPV_ARGS(&_bilateralGridBuffers[g]))) ||
-            _bilateralGridBuffers[g] == nullptr)
+        for (int g = 0; g < 3; ++g)
         {
-            ReleaseGiBuffers();
-            return false;
+            D3D12_RESOURCE_DESC d3 {};
+            d3.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            d3.Width = _gridWidth;
+            d3.Height = _gridHeight;
+            d3.DepthOrArraySize = static_cast<UINT16>(kBilateralLumaBins);
+            d3.MipLevels = 1;
+            d3.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            d3.SampleDesc.Count = 1;
+            d3.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+            if (FAILED(InDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &d3,
+                                                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                                         IID_PPV_ARGS(&_bilateralGridBuffers[b][g]))) ||
+                _bilateralGridBuffers[b][g] == nullptr)
+            {
+                ReleaseGiBuffers();
+                return false;
+            }
+            _bilateralGridBuffers[b][g]->SetName(g == 0 ? L"NL_BilateralGrid0"
+                                                        : (g == 1 ? L"NL_BilateralGrid1" : L"NL_BilateralGrid2"));
+            _bilateralGridStates[b][g] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         }
-        _bilateralGridBuffers[g]->SetName(g == 0 ? L"NL_BilateralGrid0"
-                                                 : (g == 1 ? L"NL_BilateralGrid1" : L"NL_BilateralGrid2"));
-        _bilateralGridStates[g] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     }
 
     _giWidth = targetW;
@@ -325,11 +355,17 @@ void NL_Dx12::ReleaseGiBuffers()
     };
 
     rel(_halfColorDepthBuffer, _halfColorDepthState);
+    rel(_denoisedGiScratch, _denoisedGiScratchState);
+    rel(_denoisedSsrScratch, _denoisedSsrScratchState);
+    rel(_denoisedMetaScratch, _denoisedMetaScratchState);
+    rel(_denoisedGiDirScratch, _denoisedGiDirScratchState);
     rel(_denoisedGiBuffer, _denoisedGiState);
     rel(_denoisedSsrBuffer, _denoisedSsrState);
     rel(_denoisedMetaBuffer, _denoisedMetaState);
+    rel(_denoisedGiDirBuffer, _denoisedGiDirState);
     rel(_colorPyramidBuffer, _colorPyramidState);
     rel(_eighthNormalBuffer, _eighthNormalState);
+    rel(_eighthFeaturesBuffer, _eighthFeaturesState);
 
     for (int i = 0; i < 2; ++i)
     {
@@ -337,12 +373,13 @@ void NL_Dx12::ReleaseGiBuffers()
         rel(_giBuffers[i], _giBufferStates[i]);
         rel(_ssrBuffers[i], _ssrBufferStates[i]);
         rel(_giMetaBuffers[i], _giMetaStates[i]);
+        rel(_giDirBuffers[i], _giDirStates[i]);
         rel(_material0Buffers[i], _material0States[i]);
         rel(_material1Buffers[i], _material1States[i]);
+        rel(_material2Buffers[i], _material2States[i]);
+        for (int g = 0; g < 3; ++g)
+            rel(_bilateralGridBuffers[i][g], _bilateralGridStates[i][g]);
     }
-
-    for (int g = 0; g < 3; ++g)
-        rel(_bilateralGridBuffers[g], _bilateralGridStates[g]);
 
     _giWidth = 0;
     _giHeight = 0;
@@ -384,7 +421,7 @@ void NL_Dx12::SetBufferState(ID3D12GraphicsCommandList* InCommandList, D3D12_RES
 bool NL_Dx12::SetupPassRootSigAndPso(ID3D12Device* device, uint32_t numSrv, uint32_t numUav, uint32_t numCbv,
                                       uint32_t numStaticSamplers, const void* bytecode, size_t bytecodeSize,
                                       ID3D12RootSignature** outRootSig, ID3D12PipelineState** outPso,
-                                      FrameDescriptorHeap* heaps)
+                                      FrameDescriptorHeap* heaps, FrameDescriptorHeap* extraHeaps)
 {
     CD3DX12_DESCRIPTOR_RANGE1 ranges[3] {};
     ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, numSrv, 0);
@@ -419,6 +456,8 @@ bool NL_Dx12::SetupPassRootSigAndPso(ID3D12Device* device, uint32_t numSrv, uint
         for (int i = 0; i < NL_NUM_OF_HEAPS; ++i)
         {
             if (!heaps[i].Initialize(device, numSrv, numUav, numCbv, 0))
+                return false;
+            if (extraHeaps != nullptr && !extraHeaps[i].Initialize(device, numSrv, numUav, numCbv, 0))
                 return false;
         }
     }
@@ -496,7 +535,17 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
 
     BarrierBatch barriers;
 
-    // --- Pass 0: Prep (Temporal G-Proxy + World Hash Radiance Injection + SceneLightBuf Clear) ---
+    // Upload Neural Look weights into VRAM DEFAULT heap when dirty
+    if (_modelWeightsDirty && _modelWeightsUploadBuffer != nullptr)
+    {
+        barriers.Transition(_modelWeightsBuffer, _modelWeightsState, D3D12_RESOURCE_STATE_COPY_DEST);
+        barriers.Flush(InCmdList);
+        InCmdList->CopyBufferRegion(_modelWeightsBuffer, 0, _modelWeightsUploadBuffer, 0,
+                                    NLModel::kFloatCount * sizeof(float));
+        _modelWeightsDirty = false;
+    }
+
+    // --- Pass 0: Prep (LDS Depth Cache + Temporal G-Proxy + World Hash v2 Injection) ---
     {
         barriers.Transition(_halfColorDepthBuffer, _halfColorDepthState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Transition(_halfNormalBuffers[_giWriteIdx], _halfNormalStates[_giWriteIdx],
@@ -547,7 +596,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
     }
 
-    // --- Pass 1: SPD 5-Mip Hi-Z Depth + Color Pyramid + Scene L1 SH Accumulation ---
+    // --- Pass 1: SPD 5-Mip Hi-Z Depth + Color Pyramid + EighthFeatures + Scene L1 SH ---
     {
         barriers.Transition(_halfColorDepthBuffer, _halfColorDepthState,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -555,6 +604,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_colorPyramidBuffer, _colorPyramidState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Transition(_eighthNormalBuffer, _eighthNormalState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barriers.Transition(_eighthFeaturesBuffer, _eighthFeaturesState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Flush(InCmdList);
 
         FrameDescriptorHeap& pyrHeap = _frameHeapsPyramid[_counter];
@@ -563,7 +613,8 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         for (uint32_t m = 0; m < 5; ++m)
             CreateUnorderedAccessView(_device, _colorPyramidBuffer, pyrHeap.GetUavCPU(m), m);
         CreateUnorderedAccessView(_device, _eighthNormalBuffer, pyrHeap.GetUavCPU(5), 0);
-        CreateBufferUAV(_device, _sceneLightBuffer, kSceneLightUints, sizeof(uint32_t), pyrHeap.GetUavCPU(6));
+        CreateUnorderedAccessView(_device, _eighthFeaturesBuffer, pyrHeap.GetUavCPU(6), 0);
+        CreateBufferUAV(_device, _sceneLightBuffer, kSceneLightUints, sizeof(uint32_t), pyrHeap.GetUavCPU(7));
 
         NLPyramidInternalConstants pyrConst {};
         pyrConst.HalfWidth = static_cast<int32_t>(_giWidth);
@@ -592,21 +643,32 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         InCmdList->Dispatch((_mipDims[0][0] + 15u) / 16u, (_mipDims[0][1] + 15u) / 16u, 1);
     }
 
-    // --- Pass 2: Real Trained Neural Material/Intrinsic Prior + 3D Bilateral Grid ---
+    // --- Pass 2: v2 Neural Material/Semantic Prior + Temporally Smoothed 3D Bilateral Grid ---
     {
         barriers.Transition(_colorPyramidBuffer, _colorPyramidState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_eighthNormalBuffer, _eighthNormalState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers.Transition(_eighthFeaturesBuffer, _eighthFeaturesState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_sceneLightBuffer, _sceneLightState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers.Transition(_modelWeightsBuffer, _modelWeightsState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_material0Buffers[prevIdx], _material0States[prevIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_material1Buffers[prevIdx], _material1States[prevIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers.Transition(_material2Buffers[prevIdx], _material2States[prevIdx],
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        for (int g = 0; g < 3; ++g)
+            barriers.Transition(_bilateralGridBuffers[prevIdx][g], _bilateralGridStates[prevIdx][g],
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
         barriers.Transition(_material0Buffers[_giWriteIdx], _material0States[_giWriteIdx],
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Transition(_material1Buffers[_giWriteIdx], _material1States[_giWriteIdx],
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barriers.Transition(_material2Buffers[_giWriteIdx], _material2States[_giWriteIdx],
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         for (int g = 0; g < 3; ++g)
-            barriers.Transition(_bilateralGridBuffers[g], _bilateralGridStates[g], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_bilateralGridBuffers[_giWriteIdx][g], _bilateralGridStates[_giWriteIdx][g],
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Transition(_resolvedSceneLightBuffer, _resolvedSceneLightState,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Flush(InCmdList);
@@ -615,18 +677,23 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         CreateTexture2DMipSRV(_device, _colorPyramidBuffer, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, priorHeap.GetSrvCPU(0));
         CreateTexture2DMipSRV(_device, _colorPyramidBuffer, DXGI_FORMAT_R16G16B16A16_FLOAT, 3, priorHeap.GetSrvCPU(1));
         CreateShaderResourceView(_device, _eighthNormalBuffer, priorHeap.GetSrvCPU(2));
-        CreateShaderResourceView(_device, InMotionVectors, priorHeap.GetSrvCPU(3));
-        CreateShaderResourceView(_device, _material0Buffers[prevIdx], priorHeap.GetSrvCPU(4));
-        CreateShaderResourceView(_device, _material1Buffers[prevIdx], priorHeap.GetSrvCPU(5));
-        CreateBufferSRV(_device, _sceneLightBuffer, kSceneLightUints, sizeof(uint32_t), priorHeap.GetSrvCPU(6));
-        CreateBufferSRV(_device, _modelWeightsBuffer, NLModel::kFloat4Count, 16u, priorHeap.GetSrvCPU(7));
+        CreateShaderResourceView(_device, _eighthFeaturesBuffer, priorHeap.GetSrvCPU(3));
+        CreateShaderResourceView(_device, InMotionVectors, priorHeap.GetSrvCPU(4));
+        CreateShaderResourceView(_device, _material0Buffers[prevIdx], priorHeap.GetSrvCPU(5));
+        CreateShaderResourceView(_device, _material1Buffers[prevIdx], priorHeap.GetSrvCPU(6));
+        CreateShaderResourceView(_device, _material2Buffers[prevIdx], priorHeap.GetSrvCPU(7));
+        for (int g = 0; g < 3; ++g)
+            CreateShaderResourceView(_device, _bilateralGridBuffers[prevIdx][g], priorHeap.GetSrvCPU(8 + g));
+        CreateBufferSRV(_device, _sceneLightBuffer, kSceneLightUints, sizeof(uint32_t), priorHeap.GetSrvCPU(11));
+        CreateBufferSRV(_device, _modelWeightsBuffer, NLModel::kFloat4Count, 16u, priorHeap.GetSrvCPU(12));
 
         CreateUnorderedAccessView(_device, _material0Buffers[_giWriteIdx], priorHeap.GetUavCPU(0), 0);
         CreateUnorderedAccessView(_device, _material1Buffers[_giWriteIdx], priorHeap.GetUavCPU(1), 0);
+        CreateUnorderedAccessView(_device, _material2Buffers[_giWriteIdx], priorHeap.GetUavCPU(2), 0);
         for (int g = 0; g < 3; ++g)
-            CreateTexture3DUAV(_device, _bilateralGridBuffers[g], DXGI_FORMAT_R16G16B16A16_FLOAT, kBilateralLumaBins,
-                               priorHeap.GetUavCPU(2 + g));
-        CreateBufferUAV(_device, _resolvedSceneLightBuffer, kResolvedSceneLightFloat4s, 16u, priorHeap.GetUavCPU(5));
+            CreateTexture3DUAV(_device, _bilateralGridBuffers[_giWriteIdx][g], DXGI_FORMAT_R16G16B16A16_FLOAT,
+                               kBilateralLumaBins, priorHeap.GetUavCPU(3 + g));
+        CreateBufferUAV(_device, _resolvedSceneLightBuffer, kResolvedSceneLightFloat4s, 16u, priorHeap.GetUavCPU(6));
 
         NLNeuralPriorInternalConstants priorConst {};
         priorConst.EighthWidth = static_cast<int32_t>(_eighthWidth);
@@ -652,21 +719,30 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         InCmdList->Dispatch(_gridWidth, _gridHeight, 1);
     }
 
-    // --- Pass 3 & Pass 4: Visibility-Bitmask SSGI + Contact Shadows + Hi-Z SSR + À-Trous Denoise ---
+    // --- Pass 3 & Pass 4 (2-Pass Decoupled À-Trous Denoiser) ---
     if (runGiPass)
     {
         barriers.Transition(_material1Buffers[_giWriteIdx], _material1States[_giWriteIdx],
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers.Transition(_material2Buffers[_giWriteIdx], _material2States[_giWriteIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_resolvedSceneLightBuffer, _resolvedSceneLightState,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_worldHashBuffer, _worldHashState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_ssrBuffers[prevIdx], _ssrBufferStates[prevIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers.Transition(_giMetaBuffers[prevIdx], _giMetaStates[prevIdx],
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers.Transition(_giDirBuffers[prevIdx], _giDirStates[prevIdx],
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
         barriers.Transition(_giBuffers[_giWriteIdx], _giBufferStates[_giWriteIdx],
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Transition(_ssrBuffers[_giWriteIdx], _ssrBufferStates[_giWriteIdx],
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Transition(_giMetaBuffers[_giWriteIdx], _giMetaStates[_giWriteIdx],
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barriers.Transition(_giDirBuffers[_giWriteIdx], _giDirStates[_giWriteIdx],
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barriers.Flush(InCmdList);
 
@@ -678,13 +754,17 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         CreateShaderResourceView(_device, InMotionVectors, giHeap.GetSrvCPU(4));
         CreateShaderResourceView(_device, _giBuffers[prevIdx], giHeap.GetSrvCPU(5));
         CreateShaderResourceView(_device, _ssrBuffers[prevIdx], giHeap.GetSrvCPU(6));
-        CreateShaderResourceView(_device, _material1Buffers[_giWriteIdx], giHeap.GetSrvCPU(7));
-        CreateBufferSRV(_device, _resolvedSceneLightBuffer, kResolvedSceneLightFloat4s, 16u, giHeap.GetSrvCPU(8));
-        CreateBufferSRV(_device, _worldHashBuffer, kWorldHashCapacity * 2u, sizeof(uint32_t), giHeap.GetSrvCPU(9));
+        CreateShaderResourceView(_device, _giMetaBuffers[prevIdx], giHeap.GetSrvCPU(7));
+        CreateShaderResourceView(_device, _giDirBuffers[prevIdx], giHeap.GetSrvCPU(8));
+        CreateShaderResourceView(_device, _material1Buffers[_giWriteIdx], giHeap.GetSrvCPU(9));
+        CreateShaderResourceView(_device, _material2Buffers[_giWriteIdx], giHeap.GetSrvCPU(10));
+        CreateBufferSRV(_device, _resolvedSceneLightBuffer, kResolvedSceneLightFloat4s, 16u, giHeap.GetSrvCPU(11));
+        CreateBufferSRV(_device, _worldHashBuffer, kWorldHashCapacity * 2u, sizeof(uint32_t), giHeap.GetSrvCPU(12));
 
         CreateUnorderedAccessView(_device, _giBuffers[_giWriteIdx], giHeap.GetUavCPU(0), 0);
         CreateUnorderedAccessView(_device, _ssrBuffers[_giWriteIdx], giHeap.GetUavCPU(1), 0);
         CreateUnorderedAccessView(_device, _giMetaBuffers[_giWriteIdx], giHeap.GetUavCPU(2), 0);
+        CreateUnorderedAccessView(_device, _giDirBuffers[_giWriteIdx], giHeap.GetUavCPU(3), 0);
 
         NLGiInternalConstants giConst {};
         giConst.OutputWidth = static_cast<int32_t>(outDesc.Width);
@@ -705,50 +785,122 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         InCmdList->SetComputeRootDescriptorTable(0, giHeap.GetTableGPUStart());
         InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
 
-        // Pass 4: À-Trous Variance-Guided Denoiser
+        const bool twoPassDenoise = (_activeTier >= 1);
+
+        // Pass 4a: À-Trous Variance-Guided Denoiser (step = 1)
         barriers.Transition(_giBuffers[_giWriteIdx], _giBufferStates[_giWriteIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_ssrBuffers[_giWriteIdx], _ssrBufferStates[_giWriteIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_giMetaBuffers[_giWriteIdx], _giMetaStates[_giWriteIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        barriers.Transition(_denoisedGiBuffer, _denoisedGiState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        barriers.Transition(_denoisedSsrBuffer, _denoisedSsrState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        barriers.Transition(_denoisedMetaBuffer, _denoisedMetaState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barriers.Transition(_giDirBuffers[_giWriteIdx], _giDirStates[_giWriteIdx],
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        ID3D12Resource* dn1OutGi = twoPassDenoise ? _denoisedGiScratch : _denoisedGiBuffer;
+        ID3D12Resource* dn1OutSsr = twoPassDenoise ? _denoisedSsrScratch : _denoisedSsrBuffer;
+        ID3D12Resource* dn1OutMeta = twoPassDenoise ? _denoisedMetaScratch : _denoisedMetaBuffer;
+        ID3D12Resource* dn1OutDir = twoPassDenoise ? _denoisedGiDirScratch : _denoisedGiDirBuffer;
+
+        if (twoPassDenoise)
+        {
+            barriers.Transition(_denoisedGiScratch, _denoisedGiScratchState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_denoisedSsrScratch, _denoisedSsrScratchState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_denoisedMetaScratch, _denoisedMetaScratchState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_denoisedGiDirScratch, _denoisedGiDirScratchState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        else
+        {
+            barriers.Transition(_denoisedGiBuffer, _denoisedGiState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_denoisedSsrBuffer, _denoisedSsrState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_denoisedMetaBuffer, _denoisedMetaState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_denoisedGiDirBuffer, _denoisedGiDirState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         barriers.Flush(InCmdList);
 
-        FrameDescriptorHeap& dnHeap = _frameHeapsDenoise[_counter];
-        CreateShaderResourceView(_device, _halfColorDepthBuffer, dnHeap.GetSrvCPU(0));
-        CreateShaderResourceView(_device, _halfNormalBuffers[_giWriteIdx], dnHeap.GetSrvCPU(1));
-        CreateShaderResourceView(_device, _giBuffers[_giWriteIdx], dnHeap.GetSrvCPU(2));
-        CreateShaderResourceView(_device, _ssrBuffers[_giWriteIdx], dnHeap.GetSrvCPU(3));
-        CreateShaderResourceView(_device, _giMetaBuffers[_giWriteIdx], dnHeap.GetSrvCPU(4));
-        CreateUnorderedAccessView(_device, _denoisedGiBuffer, dnHeap.GetUavCPU(0), 0);
-        CreateUnorderedAccessView(_device, _denoisedSsrBuffer, dnHeap.GetUavCPU(1), 0);
-        CreateUnorderedAccessView(_device, _denoisedMetaBuffer, dnHeap.GetUavCPU(2), 0);
+        {
+            FrameDescriptorHeap& dnHeap = _frameHeapsDenoise[_counter];
+            CreateShaderResourceView(_device, _halfColorDepthBuffer, dnHeap.GetSrvCPU(0));
+            CreateShaderResourceView(_device, _halfNormalBuffers[_giWriteIdx], dnHeap.GetSrvCPU(1));
+            CreateShaderResourceView(_device, _giBuffers[_giWriteIdx], dnHeap.GetSrvCPU(2));
+            CreateShaderResourceView(_device, _ssrBuffers[_giWriteIdx], dnHeap.GetSrvCPU(3));
+            CreateShaderResourceView(_device, _giMetaBuffers[_giWriteIdx], dnHeap.GetSrvCPU(4));
+            CreateShaderResourceView(_device, _giDirBuffers[_giWriteIdx], dnHeap.GetSrvCPU(5));
+            CreateShaderResourceView(_device, _material1Buffers[_giWriteIdx], dnHeap.GetSrvCPU(6));
+            CreateUnorderedAccessView(_device, dn1OutGi, dnHeap.GetUavCPU(0), 0);
+            CreateUnorderedAccessView(_device, dn1OutSsr, dnHeap.GetUavCPU(1), 0);
+            CreateUnorderedAccessView(_device, dn1OutMeta, dnHeap.GetUavCPU(2), 0);
+            CreateUnorderedAccessView(_device, dn1OutDir, dnHeap.GetUavCPU(3), 0);
 
-        NLDenoiseInternalConstants dnConst {};
-        FillDenoiseConstants(dnConst, temporalConstIn, static_cast<int32_t>(_giWidth),
-                             static_cast<int32_t>(_giHeight), ssrEnabled);
-        if (!CreateConstantsBuffer(_device, dnHeap, dnConst, dnHeap.GetCbvCPU(0)))
-            return false;
+            NLDenoiseInternalConstants dnConst {};
+            FillDenoiseConstants(dnConst, temporalConstIn, static_cast<int32_t>(_giWidth),
+                                 static_cast<int32_t>(_giHeight), ssrEnabled, 1, 0);
+            if (!CreateConstantsBuffer(_device, dnHeap, dnConst, dnHeap.GetCbvCPU(0)))
+                return false;
 
-        ID3D12DescriptorHeap* dnHeaps[] = { dnHeap.GetHeapCSU() };
-        InCmdList->SetDescriptorHeaps(1, dnHeaps);
-        InCmdList->SetComputeRootSignature(_rootSignatureDenoise);
-        InCmdList->SetPipelineState(_pipelineStateDenoise);
-        InCmdList->SetComputeRootDescriptorTable(0, dnHeap.GetTableGPUStart());
-        InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
+            ID3D12DescriptorHeap* dnHeaps[] = { dnHeap.GetHeapCSU() };
+            InCmdList->SetDescriptorHeaps(1, dnHeaps);
+            InCmdList->SetComputeRootSignature(_rootSignatureDenoise);
+            InCmdList->SetPipelineState(_pipelineStateDenoise);
+            InCmdList->SetComputeRootDescriptorTable(0, dnHeap.GetTableGPUStart());
+            InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
+        }
+
+        // Pass 4b: À-Trous Wide Pass (step = 3, Medium/Full tier)
+        if (twoPassDenoise)
+        {
+            barriers.Transition(_denoisedGiScratch, _denoisedGiScratchState,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barriers.Transition(_denoisedSsrScratch, _denoisedSsrScratchState,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barriers.Transition(_denoisedMetaScratch, _denoisedMetaScratchState,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barriers.Transition(_denoisedGiDirScratch, _denoisedGiDirScratchState,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            barriers.Transition(_denoisedGiBuffer, _denoisedGiState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_denoisedSsrBuffer, _denoisedSsrState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_denoisedMetaBuffer, _denoisedMetaState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Transition(_denoisedGiDirBuffer, _denoisedGiDirState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            barriers.Flush(InCmdList);
+
+            FrameDescriptorHeap& dnHeap2 = _frameHeapsDenoise2[_counter];
+            CreateShaderResourceView(_device, _halfColorDepthBuffer, dnHeap2.GetSrvCPU(0));
+            CreateShaderResourceView(_device, _halfNormalBuffers[_giWriteIdx], dnHeap2.GetSrvCPU(1));
+            CreateShaderResourceView(_device, _denoisedGiScratch, dnHeap2.GetSrvCPU(2));
+            CreateShaderResourceView(_device, _denoisedSsrScratch, dnHeap2.GetSrvCPU(3));
+            CreateShaderResourceView(_device, _denoisedMetaScratch, dnHeap2.GetSrvCPU(4));
+            CreateShaderResourceView(_device, _denoisedGiDirScratch, dnHeap2.GetSrvCPU(5));
+            CreateShaderResourceView(_device, _material1Buffers[_giWriteIdx], dnHeap2.GetSrvCPU(6));
+            CreateUnorderedAccessView(_device, _denoisedGiBuffer, dnHeap2.GetUavCPU(0), 0);
+            CreateUnorderedAccessView(_device, _denoisedSsrBuffer, dnHeap2.GetUavCPU(1), 0);
+            CreateUnorderedAccessView(_device, _denoisedMetaBuffer, dnHeap2.GetUavCPU(2), 0);
+            CreateUnorderedAccessView(_device, _denoisedGiDirBuffer, dnHeap2.GetUavCPU(3), 0);
+
+            NLDenoiseInternalConstants dnConst2 {};
+            FillDenoiseConstants(dnConst2, temporalConstIn, static_cast<int32_t>(_giWidth),
+                                 static_cast<int32_t>(_giHeight), ssrEnabled, 3, 1);
+            if (!CreateConstantsBuffer(_device, dnHeap2, dnConst2, dnHeap2.GetCbvCPU(0)))
+                return false;
+
+            ID3D12DescriptorHeap* dnHeaps2[] = { dnHeap2.GetHeapCSU() };
+            InCmdList->SetDescriptorHeaps(1, dnHeaps2);
+            InCmdList->SetComputeRootSignature(_rootSignatureDenoise);
+            InCmdList->SetPipelineState(_pipelineStateDenoise);
+            InCmdList->SetComputeRootDescriptorTable(0, dnHeap2.GetTableGPUStart());
+            InCmdList->Dispatch((_giWidth + 7u) / 8u, (_giHeight + 7u) / 8u, 1);
+        }
     }
 
-    // --- Pass 5: Full-Res PBR Composite + Skin SSS + Bilateral Grid + AgX + Fused RCAS ---
+    // --- Pass 5: Full-Res PBR Composite + Semantic Material Micro-BRDFs + AgX + Fused RCAS ---
     {
         barriers.Transition(_material0Buffers[_giWriteIdx], _material0States[_giWriteIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_material1Buffers[_giWriteIdx], _material1States[_giWriteIdx],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers.Transition(_material2Buffers[_giWriteIdx], _material2States[_giWriteIdx],
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for (int g = 0; g < 3; ++g)
-            barriers.Transition(_bilateralGridBuffers[g], _bilateralGridStates[g],
+            barriers.Transition(_bilateralGridBuffers[_giWriteIdx][g], _bilateralGridStates[_giWriteIdx][g],
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_resolvedSceneLightBuffer, _resolvedSceneLightState,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -756,6 +908,7 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         barriers.Transition(_denoisedGiBuffer, _denoisedGiState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_denoisedSsrBuffer, _denoisedSsrState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Transition(_denoisedMetaBuffer, _denoisedMetaState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barriers.Transition(_denoisedGiDirBuffer, _denoisedGiDirState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barriers.Flush(InCmdList);
 
         FrameDescriptorHeap& compHeap = _frameHeapsComposite[_counter];
@@ -766,17 +919,19 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         CreateShaderResourceView(_device, _halfNormalBuffers[_giWriteIdx], compHeap.GetSrvCPU(4));
         CreateShaderResourceView(_device, _denoisedSsrBuffer, compHeap.GetSrvCPU(5));
         CreateShaderResourceView(_device, _denoisedMetaBuffer, compHeap.GetSrvCPU(6));
-        CreateShaderResourceView(_device, _colorPyramidBuffer, compHeap.GetSrvCPU(7));
-        CreateShaderResourceView(_device, _material0Buffers[_giWriteIdx], compHeap.GetSrvCPU(8));
-        CreateShaderResourceView(_device, _material1Buffers[_giWriteIdx], compHeap.GetSrvCPU(9));
+        CreateShaderResourceView(_device, _denoisedGiDirBuffer, compHeap.GetSrvCPU(7));
+        CreateShaderResourceView(_device, _colorPyramidBuffer, compHeap.GetSrvCPU(8));
+        CreateShaderResourceView(_device, _material0Buffers[_giWriteIdx], compHeap.GetSrvCPU(9));
+        CreateShaderResourceView(_device, _material1Buffers[_giWriteIdx], compHeap.GetSrvCPU(10));
+        CreateShaderResourceView(_device, _material2Buffers[_giWriteIdx], compHeap.GetSrvCPU(11));
         for (int g = 0; g < 3; ++g)
-            CreateShaderResourceView(_device, _bilateralGridBuffers[g], compHeap.GetSrvCPU(10 + g));
-        CreateShaderResourceView(_device, hasAlbedo ? InGBufferAlbedo : InResource, compHeap.GetSrvCPU(13));
-        CreateShaderResourceView(_device, hasRoughness ? InGBufferRoughness : InResource, compHeap.GetSrvCPU(14));
-        CreateShaderResourceView(_device, hasMetallic ? InGBufferMetallic : InResource, compHeap.GetSrvCPU(15));
-        CreateShaderResourceView(_device, hasSubsurface ? InGBufferSubsurface : InResource, compHeap.GetSrvCPU(16));
-        CreateBufferSRV(_device, _resolvedSceneLightBuffer, kResolvedSceneLightFloat4s, 16u, compHeap.GetSrvCPU(17));
-        CreateBufferSRV(_device, _worldHashBuffer, kWorldHashCapacity * 2u, sizeof(uint32_t), compHeap.GetSrvCPU(18));
+            CreateShaderResourceView(_device, _bilateralGridBuffers[_giWriteIdx][g], compHeap.GetSrvCPU(12 + g));
+        CreateShaderResourceView(_device, hasAlbedo ? InGBufferAlbedo : InResource, compHeap.GetSrvCPU(15));
+        CreateShaderResourceView(_device, hasRoughness ? InGBufferRoughness : InResource, compHeap.GetSrvCPU(16));
+        CreateShaderResourceView(_device, hasMetallic ? InGBufferMetallic : InResource, compHeap.GetSrvCPU(17));
+        CreateShaderResourceView(_device, hasSubsurface ? InGBufferSubsurface : InResource, compHeap.GetSrvCPU(18));
+        CreateBufferSRV(_device, _resolvedSceneLightBuffer, kResolvedSceneLightFloat4s, 16u, compHeap.GetSrvCPU(19));
+        CreateBufferSRV(_device, _worldHashBuffer, kWorldHashCapacity * 2u, sizeof(uint32_t), compHeap.GetSrvCPU(20));
         CreateUnorderedAccessView(_device, OutResource, compHeap.GetUavCPU(0), 0);
 
         NLCompositeInternalConstants compConst {};
@@ -788,6 +943,8 @@ bool NL_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
         compConst.DepthHeight = static_cast<int32_t>(depthDesc.Height);
         compConst.MotionWidth = static_cast<int32_t>(mvsDesc.Width);
         compConst.MotionHeight = static_cast<int32_t>(mvsDesc.Height);
+        compConst.EighthWidth = static_cast<int32_t>(_eighthWidth);
+        compConst.EighthHeight = static_cast<int32_t>(_eighthHeight);
 
         FillCompositeConstants(compConst, temporalConstIn, runGiPass, ssrEnabled, hasNormals, hasAlbedo, hasRoughness,
                                hasMetallic, hasSubsurface, worldHashEnabled, inEncodeMode, outEncodeMode);
@@ -816,15 +973,15 @@ NL_Dx12::NL_Dx12(std::string InName, ID3D12Device* InDevice) : Shader_Dx12(InNam
 
     if (!SetupPassRootSigAndPso(InDevice, 9, 4, 1, 1, nl_prep_cso, sizeof(nl_prep_cso), &_rootSignaturePrep,
                                 &_pipelineStatePrep, _frameHeapsPrep) ||
-        !SetupPassRootSigAndPso(InDevice, 2, 7, 1, 0, nl_pyramid_cso, sizeof(nl_pyramid_cso), &_rootSignaturePyramid,
+        !SetupPassRootSigAndPso(InDevice, 2, 8, 1, 0, nl_pyramid_cso, sizeof(nl_pyramid_cso), &_rootSignaturePyramid,
                                 &_pipelineStatePyramid, _frameHeapsPyramid) ||
-        !SetupPassRootSigAndPso(InDevice, 8, 6, 1, 1, nl_neural_prior_cso, sizeof(nl_neural_prior_cso),
+        !SetupPassRootSigAndPso(InDevice, 13, 7, 1, 1, nl_neural_prior_cso, sizeof(nl_neural_prior_cso),
                                 &_rootSignaturePrior, &_pipelineStatePrior, _frameHeapsPrior) ||
-        !SetupPassRootSigAndPso(InDevice, 10, 3, 1, 1, nl_gi_temporal_cso, sizeof(nl_gi_temporal_cso), &_rootSignatureGi,
+        !SetupPassRootSigAndPso(InDevice, 13, 4, 1, 1, nl_gi_temporal_cso, sizeof(nl_gi_temporal_cso), &_rootSignatureGi,
                                 &_pipelineStateGi, _frameHeapsGi) ||
-        !SetupPassRootSigAndPso(InDevice, 5, 3, 1, 0, nl_denoise_cso, sizeof(nl_denoise_cso), &_rootSignatureDenoise,
-                                &_pipelineStateDenoise, _frameHeapsDenoise) ||
-        !SetupPassRootSigAndPso(InDevice, 19, 1, 1, 1, nl_composite_cso, sizeof(nl_composite_cso), &_rootSignature,
+        !SetupPassRootSigAndPso(InDevice, 7, 4, 1, 1, nl_denoise_cso, sizeof(nl_denoise_cso), &_rootSignatureDenoise,
+                                &_pipelineStateDenoise, _frameHeapsDenoise, _frameHeapsDenoise2) ||
+        !SetupPassRootSigAndPso(InDevice, 21, 1, 1, 1, nl_composite_cso, sizeof(nl_composite_cso), &_rootSignature,
                                 &_pipelineState, _frameHeapsComposite))
     {
         LOG_ERROR("[{0}] Failed to setup Neural Look DX12 pipelines", _name);
@@ -857,6 +1014,7 @@ NL_Dx12::~NL_Dx12()
         _frameHeapsPrior[i].ReleaseHeaps();
         _frameHeapsGi[i].ReleaseHeaps();
         _frameHeapsDenoise[i].ReleaseHeaps();
+        _frameHeapsDenoise2[i].ReleaseHeaps();
         _frameHeapsComposite[i].ReleaseHeaps();
     }
 
@@ -864,6 +1022,7 @@ NL_Dx12::~NL_Dx12()
     DeferredRelease::Release(_sceneLightBuffer);
     DeferredRelease::Release(_resolvedSceneLightBuffer);
     DeferredRelease::Release(_worldHashBuffer);
+    DeferredRelease::Release(_modelWeightsUploadBuffer);
     DeferredRelease::Release(_modelWeightsBuffer);
     DeferredRelease::Release(_buffer);
 }

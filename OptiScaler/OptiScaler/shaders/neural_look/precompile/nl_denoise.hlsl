@@ -15,6 +15,11 @@ cbuffer Params : register(b0)
     float PhiDepth;
     float PhiNormal;
     float PhiLuma;
+
+    int PassIndex;
+    int _pad0;
+    int _pad1;
+    int _pad2;
 };
 
 #ifdef VK_MODE
@@ -43,19 +48,41 @@ Texture2D<float4> InSsrTex : register(t3);
 Texture2D<float4> InGiMetaTex : register(t4);
 
 #ifdef VK_MODE
-[[vk::binding(6, 0)]] [[vk::image_format("rgba16f")]]
+[[vk::binding(6, 0)]]
 #endif
-RWTexture2D<float4> OutDenoisedGiTex : register(u0);
+Texture2D<float4> InGiDirTex : register(t5);
 
 #ifdef VK_MODE
-[[vk::binding(7, 0)]] [[vk::image_format("rgba16f")]]
+[[vk::combinedImageSampler]] [[vk::binding(7, 0)]]
 #endif
-RWTexture2D<float4> OutDenoisedSsrTex : register(u1);
+Texture2D<float4> Material1Tex : register(t6);
+
+#ifdef VK_MODE
+[[vk::combinedImageSampler]] [[vk::binding(7, 0)]]
+SamplerState LinearClampMat : register(s0);
+#else
+SamplerState LinearClampMat : register(s0);
+#endif
 
 #ifdef VK_MODE
 [[vk::binding(8, 0)]] [[vk::image_format("rgba16f")]]
 #endif
+RWTexture2D<float4> OutDenoisedGiTex : register(u0);
+
+#ifdef VK_MODE
+[[vk::binding(9, 0)]] [[vk::image_format("rgba16f")]]
+#endif
+RWTexture2D<float4> OutDenoisedSsrTex : register(u1);
+
+#ifdef VK_MODE
+[[vk::binding(10, 0)]] [[vk::image_format("rgba16f")]]
+#endif
 RWTexture2D<float4> OutDenoisedMetaTex : register(u2);
+
+#ifdef VK_MODE
+[[vk::binding(11, 0)]] [[vk::image_format("rgba16f")]]
+#endif
+RWTexture2D<float4> OutDenoisedGiDirTex : register(u3);
 
 int2 ClampGi(int2 p)
 {
@@ -79,19 +106,43 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float4 centerGi = InGiTex.Load(int3(p, 0));
     float4 centerSsr = (SsrEnabled > 0) ? InSsrTex.Load(int3(p, 0)) : float4(0, 0, 0, 0);
     float4 centerMeta = InGiMetaTex.Load(int3(p, 0));
+    float4 centerDir = InGiDirTex.Load(int3(p, 0));
 
     if (centerDepth >= 64000.0f || centerDepth >= SkyDepthThreshold)
     {
         OutDenoisedGiTex[p] = centerGi;
         OutDenoisedSsrTex[p] = centerSsr;
         OutDenoisedMetaTex[p] = centerMeta;
+        OutDenoisedGiDirTex[p] = centerDir;
         return;
     }
 
+    float2 uv = (float2(p) + 0.5f) / float2(max(GiWidth, 1), max(GiHeight, 1));
+    float4 mat1 = Material1Tex.SampleLevel(LinearClampMat, uv, 0.0f);
+    float effRoughness = saturate(mat1.r * (1.0f - 0.60f * mat1.b));
+
     float3 centerN = UnpackNormal(HalfNormalTex.Load(int3(p, 0)).xy);
     float centerLuma = Luma(centerGi.rgb);
-    float invSigmaZ = rcp(max(centerDepth * PhiDepth, 0.02f));
-    float invSigmaL = rcp(max(centerMeta.g * PhiLuma + 0.08f, 0.08f));
+    float centerSsrLuma = Luma(centerSsr.rgb);
+
+    // 3x3 local variance pre-estimation + disocclusion kernel boost
+    float varAcc = centerMeta.g * 0.40f;
+    static const int2 vOff[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+    [unroll]
+    for (int vi = 0; vi < 4; ++vi)
+        varAcc += InGiMetaTex.Load(int3(ClampGi(p + vOff[vi]), 0)).g * 0.15f;
+
+    float histLen = max(centerMeta.a, 1.0f);
+    float disoccBoost = lerp(2.2f, 1.0f, saturate((histLen - 1.0f) / 3.0f));
+    float invSigmaZ = rcp(max(centerDepth * PhiDepth, 0.015f));
+    float invSigmaL = rcp(max((varAcc * PhiLuma * disoccBoost) + 0.06f, 0.06f));
+    float invSigmaSsr = rcp(max(centerSsrLuma * 0.65f + 0.12f, 0.12f));
+
+    // Roughness + Hit-Distance guided SSR blur gate (mirror/contact stays crisp, rough glossy smooths)
+    float ssrHitDist = max(centerMeta.b, 0.05f);
+    float ssrBlur = saturate(effRoughness * 1.45f * saturate(ssrHitDist / max(centerDepth * 0.25f, 0.20f)));
+    if (PassIndex > 0)
+        ssrBlur *= saturate(effRoughness * 1.25f);
 
     static const int2 kOffsets[13] = {
         int2(0, 0),
@@ -107,18 +158,21 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     };
 
     float4 giSum = centerGi * kKernel[0];
+    float4 dirSum = centerDir * kKernel[0];
     float4 ssrSum = centerSsr * kKernel[0];
     float csSum = centerMeta.r * kKernel[0];
-    float wSum = kKernel[0];
+    float wGiSum = kKernel[0];
+    float wSsrSum = kKernel[0];
 
     int step = max(StepSize, 1);
+    float maxDepthCliff = max(centerDepth * 0.08f, 0.04f);
 
     [unroll]
     for (int i = 1; i < 13; ++i)
     {
         int2 q = ClampGi(p + kOffsets[i] * step);
         float tapDepth = HalfColorDepthTex.Load(int3(q, 0)).a;
-        if (tapDepth >= 64000.0f)
+        if (tapDepth >= 64000.0f || abs(centerDepth - tapDepth) > maxDepthCliff)
             continue;
 
         float3 tapN = UnpackNormal(HalfNormalTex.Load(int3(q, 0)).xy);
@@ -127,17 +181,30 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
         float wZ = exp(-abs(centerDepth - tapDepth) * invSigmaZ);
         float wN = pow(max(0.0f, dot(centerN, tapN)), PhiNormal);
         float wL = exp(-abs(centerLuma - Luma(tapGi.rgb)) * invSigmaL);
-        float w = kKernel[i] * wZ * wN * wL;
+        float wGi = kKernel[i] * wZ * wN * wL;
 
-        giSum += tapGi * w;
-        csSum += InGiMetaTex.Load(int3(q, 0)).r * w;
-        if (SsrEnabled > 0)
-            ssrSum += InSsrTex.Load(int3(q, 0)) * w;
-        wSum += w;
+        giSum += tapGi * wGi;
+        dirSum += InGiDirTex.Load(int3(q, 0)) * wGi;
+        csSum += InGiMetaTex.Load(int3(q, 0)).r * wGi;
+        wGiSum += wGi;
+
+        if (SsrEnabled > 0 && ssrBlur > 0.02f)
+        {
+            float4 tapSsr = InSsrTex.Load(int3(q, 0));
+            float wLs = exp(-abs(centerSsrLuma - Luma(tapSsr.rgb)) * invSigmaSsr);
+            float wSsr = kKernel[i] * wZ * wN * wLs * ssrBlur;
+            ssrSum += tapSsr * wSsr;
+            wSsrSum += wSsr;
+        }
     }
 
-    float invW = rcp(max(wSum, 1e-5f));
-    OutDenoisedGiTex[p] = giSum * invW;
-    OutDenoisedSsrTex[p] = (SsrEnabled > 0) ? (ssrSum * invW) : float4(0, 0, 0, 0);
-    OutDenoisedMetaTex[p] = float4(csSum * invW, centerMeta.g, centerMeta.b, centerMeta.a);
+    float invWGi = rcp(max(wGiSum, 1e-5f));
+    float4 outDir = dirSum * invWGi;
+    if (dot(outDir.xy, outDir.xy) > 1.0f)
+        outDir.xy = normalize(outDir.xy);
+
+    OutDenoisedGiTex[p] = giSum * invWGi;
+    OutDenoisedSsrTex[p] = (SsrEnabled > 0) ? (ssrSum * rcp(max(wSsrSum, 1e-5f))) : float4(0, 0, 0, 0);
+    OutDenoisedMetaTex[p] = float4(csSum * invWGi, centerMeta.g, centerMeta.b, centerMeta.a);
+    OutDenoisedGiDirTex[p] = outDir;
 }
