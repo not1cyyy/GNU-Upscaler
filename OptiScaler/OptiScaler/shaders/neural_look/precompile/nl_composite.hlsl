@@ -239,6 +239,7 @@ groupshared uint2 s_halfGi[11][11];
 groupshared uint2 s_halfNorm[11][11];
 groupshared uint2 s_halfSsr[11][11];
 groupshared uint2 s_halfDir[11][11];
+groupshared float s_halfCs[11][11];
 
 int2 ClampOutputCoord(int2 p)
 {
@@ -319,78 +320,192 @@ float3 ApplySubtleFilmicCurve(float3 linearCol, float contrastStr)
     return max(linearCol * (targetL / l), 0.0f);
 }
 
-// LDS-cached Strict Depth+Normal Joint-Bilateral Upsample (zero silhouette bleed)
-void BilateralUpsampleHalfRes(int2 ldsHalf, float centerDepth, float3 centerNormRef, float centerFlicker, bool sampleSsr,
-                              out float4 outGi, out float4 outSsr,
-                              out float outFlicker, out float3 outViewNormal, out float3 outBentNormal, out float3 outGiDir)
+// Full-res silhouette-safe normal reconstruction directly from LDS depth (zero 2x2 staircasing)
+float3 ReconstructFullResViewNormal(int2 outCoord, float2 uv, float2 invOut,
+                                    float dC, float dL, float dR, float dU, float dD,
+                                    float dUL, float dUR, float dDL, float dDR)
 {
-    float invSigmaLog2 = 1.442695f / max(centerDepth * 0.028f, 0.015f);
-    float maxDepthCliff = max(centerDepth * 0.08f, 0.04f);
+    float invDC = rcp(max(dC, 1e-4f));
+    float3 qC  = ReconstructViewPos(uv,                                1.0f,        TanHalfFov, TanHalfFovAspect);
+    float3 qL  = ReconstructViewPos(uv + float2(-invOut.x, 0.0f),      dL  * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qR  = ReconstructViewPos(uv + float2( invOut.x, 0.0f),      dR  * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qU  = ReconstructViewPos(uv + float2(0.0f, -invOut.y),      dU  * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qD  = ReconstructViewPos(uv + float2(0.0f,  invOut.y),      dD  * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qUL = ReconstructViewPos(uv + float2(-invOut.x, -invOut.y), dUL * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qUR = ReconstructViewPos(uv + float2( invOut.x, -invOut.y), dUR * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qDL = ReconstructViewPos(uv + float2(-invOut.x,  invOut.y), dDL * invDC, TanHalfFov, TanHalfFovAspect);
+    float3 qDR = ReconstructViewPos(uv + float2( invOut.x,  invOut.y), dDR * invDC, TanHalfFov, TanHalfFovAspect);
 
-    static const int2 offsets[5] = { int2(0, 0), int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
-    static const float weights[5] = { 0.36f, 0.16f, 0.16f, 0.16f, 0.16f };
+    float iC = invDC;
+    float iL = rcp(max(dL, 1e-4f));
+    float iR = rcp(max(dR, 1e-4f));
+    float iU = rcp(max(dU, 1e-4f));
+    float iD = rcp(max(dD, 1e-4f));
+
+    bool hasL = outCoord.x > 0;
+    bool hasR = outCoord.x < (OutputWidth - 1);
+    bool hasU = outCoord.y > 0;
+    bool hasD = outCoord.y < (OutputHeight - 1);
+
+    float diL = iC - iL;
+    float diR = iR - iC;
+    float tolX = max(abs(diL) + abs(diR), iC * 0.008f) * 0.45f + iC * 0.004f;
+    bool coplanarX = (hasL && hasR && dL < 64000.0f && dR < 64000.0f && abs(diR - diL) < tolX);
+
+    float3 dx;
+    if (coplanarX)
+        dx = 0.5f * (qR - qL);
+    else if (hasL && hasR)
+        dx = (abs(diR) < abs(diL)) ? (qR - qC) : (qC - qL);
+    else if (hasR)
+        dx = qR - qC;
+    else if (hasL)
+        dx = qC - qL;
+    else
+        dx = float3(2.0f * TanHalfFovAspect * invOut.x, 0.0f, 0.0f);
+
+    float diU = iC - iU;
+    float diD = iD - iC;
+    float tolY = max(abs(diU) + abs(diD), iC * 0.008f) * 0.45f + iC * 0.004f;
+    bool coplanarY = (hasU && hasD && dU < 64000.0f && dD < 64000.0f && abs(diD - diU) < tolY);
+
+    float3 dy;
+    if (coplanarY)
+        dy = 0.5f * (qU - qD);
+    else if (hasU && hasD)
+        dy = (abs(diD) < abs(diU)) ? (qC - qD) : (qU - qC);
+    else if (hasU)
+        dy = qU - qC;
+    else if (hasD)
+        dy = qC - qD;
+    else
+        dy = float3(0.0f, 2.0f * TanHalfFov * invOut.y, 0.0f);
+
+    float3 n = cross(dx, dy);
+
+    if (coplanarX && coplanarY && dUL < 64000.0f && dUR < 64000.0f && dDL < 64000.0f && dDR < 64000.0f)
+    {
+        float gX = 0.5f * (iR - iL);
+        float gY = 0.5f * (iD - iU);
+        float diagTol = max(tolX, tolY) * 1.5f;
+        float eUL = abs(rcp(max(dUL, 1e-4f)) - (iC - gX - gY));
+        float eUR = abs(rcp(max(dUR, 1e-4f)) - (iC + gX - gY));
+        float eDL = abs(rcp(max(dDL, 1e-4f)) - (iC - gX + gY));
+        float eDR = abs(rcp(max(dDR, 1e-4f)) - (iC + gX + gY));
+        if (max(max(eUL, eUR), max(eDL, eDR)) < diagTol)
+        {
+            float3 nDiag = cross(0.5f * (qUR - qDL), 0.5f * (qUL - qDR));
+            if (dot(nDiag, n) < 0.0f)
+                nDiag = -nDiag;
+            n += nDiag * 0.5f;
+        }
+    }
+
+    float lenSq = dot(n, n);
+    if (lenSq < 1e-12f)
+        return float3(0.0f, 0.0f, -1.0f);
+
+    n *= rsqrt(lenSq);
+    if (dot(n, qC) > 0.0f)
+        n = -n;
+    if (n.z > -0.005f)
+    {
+        n.z = -0.005f;
+        n = normalize(n);
+    }
+    return n;
+}
+
+// Strict 2x2 Bilinear Joint-Bilateral Upsample (full-res normal & depth-checked on all 4 taps)
+void BilateralUpsampleHalfRes(int2 ldsHalfBase, float2 fracHalf, float centerDepth, float3 fullResNorm,
+                              bool sampleSsr,
+                              out float4 outGi, out float outCs, out float4 outSsr,
+                              out float outFlicker, out float3 outHalfNorm, out float3 outBentNormal,
+                              out float3 outGiDir, out float outValid)
+{
+    float invSigmaLog2 = 1.442695f / max(centerDepth * 0.018f, 0.012f);
+    float maxDepthCliff = max(centerDepth * 0.055f, 0.030f);
+
+    static const int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+    float wBilin[4] = {
+        (1.0f - fracHalf.x) * (1.0f - fracHalf.y),
+        fracHalf.x * (1.0f - fracHalf.y),
+        (1.0f - fracHalf.x) * fracHalf.y,
+        fracHalf.x * fracHalf.y
+    };
 
     float4 giAccum = float4(0, 0, 0, 0);
+    float csAccum = 0.0f;
     float4 ssrAccum = float4(0, 0, 0, 0);
     float3 normAccum = float3(0, 0, 0);
     float3 bentAccum = float3(0, 0, 0);
     float3 dirAccum = float3(0, 0, 0);
+    float flickAccum = 0.0f;
     float wSum = 0.0f;
-    float maxNFlick = 0.0f;
-    float sumNFlick = 0.0f;
 
     [unroll]
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 4; ++i)
     {
-        int2 hp = ldsHalf + offsets[i];
-        float4 giTap = UnpackFloat4Half(s_halfGi[hp.y][hp.x]);
+        int2 hp = ldsHalfBase + offsets[i];
         float4 hNormTap = UnpackFloat4Half(s_halfNorm[hp.y][hp.x]);
-        float4 dirTap = UnpackFloat4Half(s_halfDir[hp.y][hp.x]);
+        float tapDepth = hNormTap.w;
+        float dDiff = abs(centerDepth - tapDepth);
+        if (tapDepth >= 64000.0f || dDiff > maxDepthCliff)
+            continue;
 
         float2 tn = clamp(hNormTap.xy, -1.0f, 1.0f);
         float3 tNorm = float3(tn, -sqrt(max(0.0f, 1.0f - dot(tn, tn))));
 
-        float w = weights[i];
-        if (i > 0)
-        {
-            float dDiff = abs(centerDepth - hNormTap.w);
-            if (dDiff > maxDepthCliff)
-                w = 0.0f;
-            else
-            {
-                float wZ = exp2(-dDiff * invSigmaLog2);
-                float wN = pow(max(0.0f, dot(centerNormRef, tNorm)), 12.0f);
-                w *= wZ * wN;
-            }
-            float tf = saturate(hNormTap.z);
-            maxNFlick = max(maxNFlick, tf);
-            sumNFlick += tf;
-        }
-        else
-        {
-            w += 1e-5f;
-        }
+        float wZ = exp2(-dDiff * invSigmaLog2);
+        float wN = pow(max(0.0f, dot(fullResNorm, tNorm)), 6.0f);
+        float w = (wBilin[i] + 1e-3f) * wZ * (0.05f + 0.95f * wN);
 
+        float4 giTap = UnpackFloat4Half(s_halfGi[hp.y][hp.x]);
+        float4 dirTap = UnpackFloat4Half(s_halfDir[hp.y][hp.x]);
         float2 bn = clamp(dirTap.xy, -1.0f, 1.0f);
         float3 bNorm = float3(bn, -sqrt(max(0.0f, 1.0f - dot(bn, bn))));
         float3 gDir = OctDecode(dirTap.zw);
 
         giAccum += giTap * w;
+        csAccum += s_halfCs[hp.y][hp.x] * w;
         normAccum += tNorm * w;
         bentAccum += bNorm * w;
         dirAccum += gDir * w;
+        flickAccum += saturate(hNormTap.z) * w;
         if (sampleSsr)
             ssrAccum += UnpackFloat4Half(s_halfSsr[hp.y][hp.x]) * w;
         wSum += w;
     }
 
-    float invW = rcp(max(wSum, 1e-5f));
-    outGi = giAccum * invW;
-    outSsr = sampleSsr ? (ssrAccum * invW) : float4(0, 0, 0, 0);
-    outFlicker = saturate(max(centerFlicker, maxNFlick * 0.65f + (sumNFlick * 0.25f) * 0.35f));
-    outViewNormal = (dot(normAccum, normAccum) > 1e-6f) ? normalize(normAccum) : centerNormRef;
-    outBentNormal = (dot(bentAccum, bentAccum) > 1e-6f) ? normalize(bentAccum) : outViewNormal;
-    outGiDir = (dot(dirAccum, dirAccum) > 1e-6f) ? normalize(dirAccum) : outBentNormal;
+    outValid = saturate(wSum * 8.0f);
+    if (wSum > 1e-4f)
+    {
+        float invW = rcp(wSum);
+        float4 giMean = giAccum * invW;
+        float csMean = csAccum * invW;
+        float4 ssrMean = sampleSsr ? (ssrAccum * invW) : float4(0, 0, 0, 0);
+        float3 hNormMean = (dot(normAccum, normAccum) > 1e-6f) ? normalize(normAccum) : fullResNorm;
+        float3 bentMean = (dot(bentAccum, bentAccum) > 1e-6f) ? normalize(bentAccum) : fullResNorm;
+        float3 dirMean = (dot(dirAccum, dirAccum) > 1e-6f) ? normalize(dirAccum) : fullResNorm;
+
+        outGi = float4(giMean.rgb * outValid, lerp(1.0f, saturate(giMean.a), outValid));
+        outCs = lerp(1.0f, saturate(csMean), outValid);
+        outSsr = float4(ssrMean.rgb, ssrMean.a * outValid);
+        outFlicker = saturate(flickAccum * invW * outValid);
+        outHalfNorm = hNormMean;
+        outBentNormal = normalize(lerp(fullResNorm, bentMean, outValid));
+        outGiDir = normalize(lerp(fullResNorm, dirMean, outValid));
+    }
+    else
+    {
+        outGi = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        outCs = 1.0f;
+        outSsr = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        outFlicker = 0.0f;
+        outHalfNorm = fullResNorm;
+        outBentNormal = fullResNorm;
+        outGiDir = fullResNorm;
+    }
 }
 
 // Fast-path bilinear on flat interior pixels; 4-tap Depth+Chroma joint-bilateral only near silhouettes
@@ -476,15 +591,20 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             float4 raw = SourceColor.Load(int3(colorBase + p, 0));
             s_color[sy][sx] = PackFloat4Half(float4(EncodeColor(raw.rgb, InColorEncodeMode) * invPreExp, raw.a));
 
-            float2 pUv = (float2(p) + 0.5f) * invOut;
-            float rawD = DepthTex.Load(int3(UvToDepthCoord(pUv), 0)).r;
+            int2 dCoord = (PreUpscale > 0)
+                              ? ClampDepthCoord(int2(DepthSubrectBaseX, DepthSubrectBaseY) + p)
+                              : UvToDepthCoord((float2(p) + 0.5f) * invOut);
+            float rawD = DepthTex.Load(int3(dCoord, 0)).r;
             s_depth[sy][sx] = LinearizeDepthValue(rawD, DepthIsLinear, DepthIsReversed,
                                                   DepthLinearA, DepthLinearB, DepthLinearC, SkyDepthThreshold);
         }
     }
 
-    // Populate 11x11 half-res GI/Normal/SSR/Dir LDS cache
-    int2 halfTileBase = int2((float2(gid.xy) * 16.0f + 0.5f) * outToGi) - 1;
+    // Populate 11x11 half-res GI/Normal/SSR/Dir/CS LDS cache
+    bool exact2x = (PreUpscale > 0 && abs(OutputWidth - GiWidth * 2) <= 1 && abs(OutputHeight - GiHeight * 2) <= 1);
+    int2 halfTileBase = exact2x
+                            ? (int2(gid.xy) * 8 - 1)
+                            : (int2(floor((float2(gid.xy) * 16.0f + 0.5f) * outToGi - 0.5f)) - 1);
     if (linearIdx < 121u)
     {
         uint hx = linearIdx % 11u;
@@ -494,6 +614,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         s_halfNorm[hy][hx] = PackFloat4Half(HalfNormalTex.Load(int3(hc, 0)));
         s_halfSsr[hy][hx] = PackFloat4Half(DenoisedSsrTex.Load(int3(hc, 0)));
         s_halfDir[hy][hx] = PackFloat4Half(DenoisedGiDirTex.Load(int3(hc, 0)));
+        s_halfCs[hy][hx] = saturate(DenoisedMetaTex.Load(int3(hc, 0)).r);
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -590,12 +711,15 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         return;
     }
 
-    int2 halfCoord = ClampGiCoord(int2((float2(outCoord) + 0.5f) * outToGi));
-    int2 ldsHalf = clamp(halfCoord - halfTileBase, int2(1, 1), int2(9, 9));
-    float4 hNormCenter = UnpackFloat4Half(s_halfNorm[ldsHalf.y][ldsHalf.x]);
-    float2 nxy = clamp(hNormCenter.xy, -1.0f, 1.0f);
-    float3 viewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
-    float centerFlicker = saturate(hNormCenter.z);
+    float3 fullResNormal = ReconstructFullResViewNormal(outCoord, uv, invOut,
+                                                        centerDepth, dL, dR, dU, dD, dUL, dUR, dDL, dDR);
+    float3 viewNormal = fullResNormal;
+
+    float2 fHalf = exact2x ? (float2(outCoord) * 0.5f) : ((float2(outCoord) + 0.5f) * outToGi - 0.5f);
+    int2 baseHalf = int2(floor(fHalf));
+    float2 fracHalf = frac(fHalf);
+    int2 ldsHalfBase = clamp(baseHalf - halfTileBase, int2(0, 0), int2(9, 9));
+    float centerFlicker = 0.0f;
 
     // Depth-aware neighborhood averages (zero cross-silhouette haloing in micro-gradients)
     float invDepthSig = 1.442695f / max(centerDepth * 0.025f, 0.015f);
@@ -642,12 +766,18 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float effRelight = clamp(RelightIntensity, 0.0f, 2.0f);
     float effCs = clamp(ContactShadowIntensity, 0.0f, 2.0f);
 
+    float upsampleValid = 1.0f;
     if (GiEnabled > 0)
     {
         float4 giSample;
+        float rawCs;
+        float3 halfNormUp;
         bool needSsr = (SsrEnabled > 0 && effSsr > 1e-4f) || (DebugView == 5);
-        BilateralUpsampleHalfRes(ldsHalf, centerDepth, viewNormal, centerFlicker, needSsr,
-                                 giSample, ssrSample, flickerSoft, viewNormal, bentNormal, giDir);
+        BilateralUpsampleHalfRes(ldsHalfBase, fracHalf, centerDepth, fullResNormal, needSsr,
+                                 giSample, rawCs, ssrSample, flickerSoft, halfNormUp, bentNormal, giDir, upsampleValid);
+        if (HasGBufferNormals > 0 && upsampleValid > 0.1f)
+            viewNormal = normalize(lerp(fullResNormal, halfNormUp, upsampleValid));
+
         giBounce = max(giSample.rgb, 0.0f);
         float giL = Luma(giBounce);
         if (giL > 2.8f)
@@ -656,34 +786,21 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float shapedAo = pow(max(saturate(giSample.a), 1e-4f), aoPower);
         contactAo = lerp(1.0f, shapedAo, saturate(effAo * 2.5f) * skyMask * (1.0f - flickerSoft));
 
-        float rawCs = saturate(DenoisedMetaTex.Load(int3(halfCoord, 0)).r);
         float csPower = 0.55f + effCs * 0.85f;
         float shapedCs = pow(max(rawCs, 1e-4f), csPower);
         contactShadow = lerp(1.0f, shapedCs, saturate(effCs * 2.5f) * skyMask * (1.0f - flickerSoft));
     }
     else
     {
-        static const int2 dOffsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
-        float invSigmaLog2 = 1.442695f / max(centerDepth * 0.028f, 0.015f);
-        float3 normAccum = viewNormal * 0.36f;
-        float maxNF = 0.0f, sumNF = 0.0f;
-        [unroll]
-        for (int i = 0; i < 4; ++i)
-        {
-            int2 hp = ldsHalf + dOffsets[i];
-            float4 hTap = UnpackFloat4Half(s_halfNorm[hp.y][hp.x]);
-            float tf = saturate(hTap.z);
-            maxNF = max(maxNF, tf);
-            sumNF += tf;
-            float dDiff = abs(centerDepth - hTap.w);
-            float wn = (dDiff > max(centerDepth * 0.08f, 0.04f)) ? 0.0f : (0.16f * exp2(-dDiff * invSigmaLog2));
-            float2 tn = clamp(hTap.xy, -1.0f, 1.0f);
-            normAccum += float3(tn, -sqrt(max(0.0f, 1.0f - dot(tn, tn)))) * wn;
-        }
-        viewNormal = (dot(normAccum, normAccum) > 1e-6f) ? normalize(normAccum) : viewNormal;
+        float4 dummyGi, dummySsr;
+        float dummyCs;
+        float3 halfNormUp, dummyBent, dummyDir;
+        BilateralUpsampleHalfRes(ldsHalfBase, fracHalf, centerDepth, fullResNormal, false,
+                                 dummyGi, dummyCs, dummySsr, flickerSoft, halfNormUp, dummyBent, dummyDir, upsampleValid);
+        if (HasGBufferNormals > 0 && upsampleValid > 0.1f)
+            viewNormal = normalize(lerp(fullResNormal, halfNormUp, upsampleValid));
         bentNormal = viewNormal;
         giDir = viewNormal;
-        flickerSoft = saturate(max(centerFlicker, maxNF * 0.65f + (sumNF * 0.25f) * 0.35f));
     }
 
     float NdotV = saturate(dot(toEye, viewNormal));
@@ -817,7 +934,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         // Texture-preserving scalar ambient de-lighting (no coarse 1/8-res albedo subtraction)
         float delightFrac = saturate(Luma(sh0) * 0.26f) * indirectWeight * (1.0f - silEdge * 0.50f) *
                             min(effGi * 0.26f + effAo * 0.18f, 0.34f);
-        litColor *= (1.0f - delightFrac * solidMask);
+        litColor *= (1.0f - delightFrac * solidMask * upsampleValid);
 
         float aoFloor = lerp(0.14f, 0.24f, sandW);
         float effectiveAo = lerp(1.0f, max(contactAo, aoFloor), indirectWeight);
@@ -869,22 +986,25 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     // Scene L1 SH 3D Sculptural Relighting + Material-Specific Micro-BRDFs (ZERO silhouette outline glow!)
     if (effRelight > 1e-4f)
     {
-        float3 shNormal = (HasCameraBasis > 0) ? ViewToWorldDir(bentNormal, CameraRight, CameraUp, CameraFwd) : bentNormal;
+        float3 relightNorm = normalize(lerp(shadedNormal, bentNormal, 0.30f * edgeSafeMask * upsampleValid));
+        float3 shNormal = (HasCameraBasis > 0) ? ViewToWorldDir(relightNorm, CameraRight, CameraUp, CameraFwd) : relightNorm;
         float3 shDirRad = max(sh0 + shX * shNormal.x + shY * shNormal.y + shZ * shNormal.z, 0.0f);
         float shMeanL = max(Luma(sh0), 0.04f);
-        float3 shRatio = clamp(shDirRad / shMeanL, 0.48f, 1.62f) - 1.0f;
+        float3 shRatio = clamp(shDirRad / shMeanL, 0.50f, 1.58f) - 1.0f;
 
         float rawKeyDot = dot(shadedNormal, keyDirView);
         float skinFabricWrap = 0.28f * skinW + 0.20f * fabricW;
         float wrapKeyDot = (rawKeyDot + skinFabricWrap) / (1.0f + skinFabricWrap);
-        float macroKey = (wrapKeyDot - 0.12f) * 0.19f * keyStrength;
-        float hemiTerm = dot(shadedNormal, worldUpInView) * 0.16f;
-        float bentContrast = (dot(bentNormal, worldUpInView) - dot(viewNormal, worldUpInView)) * 0.22f;
-        float3 sculptTint = (macroKey + hemiTerm >= 0.0f) ? keyTint : float3(0.87f, 0.93f, 1.08f);
-        float3 sculptVec = (shRatio * 0.26f + (macroKey + hemiTerm + bentContrast) * sculptTint) * effRelight * solidMask;
+        float macroKey = (wrapKeyDot - 0.12f) * 0.18f * keyStrength;
+        float hemiTerm = dot(shadedNormal, worldUpInView) * 0.15f;
+        float sculptScalar = macroKey + hemiTerm;
+        // Positive lifts slightly warm with keyTint; negative darkens slightly cooler (more red reduction than blue)
+        float3 sculptTint = (sculptScalar >= 0.0f) ? keyTint : float3(1.06f, 1.00f, 0.90f);
+        float relightMask = solidMask * (1.0f - silEdge * 0.72f) * (1.0f - fgSilEdge * 0.60f);
+        float3 sculptVec = (shRatio * 0.24f + sculptScalar * sculptTint) * effRelight * relightMask;
         float brightDamp = rcp(1.0f + max(centerLuma - 0.65f, 0.0f) * 0.85f);
         sculptVec = min(sculptVec, max(sculptVec * brightDamp, 0.0f));
-        litColor *= clamp(1.0f + sculptVec, 0.42f, 1.54f);
+        litColor *= clamp(1.0f + sculptVec, 0.45f, 1.50f);
 
         // 0) SKIN: Dual-lobe micro-sebum catchlight (neutral F0) + vellus peach-fuzz grazing rim
         if (skinW > 0.04f)
