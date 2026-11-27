@@ -352,22 +352,29 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
     ID3D12Resource* paramTransparencyMask = nullptr;
     ID3D12Resource* paramExposure = nullptr;
 
-    InParameters->Get(NVSDK_NGX_Parameter_Color, &paramColor);
-    InParameters->Get(NVSDK_NGX_Parameter_Output, &paramOutput);
-    InParameters->Get(NVSDK_NGX_Parameter_MotionVectors, &paramMotion);
-    InParameters->Get(NVSDK_NGX_Parameter_Depth, &paramDepth);
-    InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, &paramReactiveMask);
-    InParameters->Get(NVSDK_NGX_Parameter_TransparencyMask, &paramTransparencyMask);
-    InParameters->Get(NVSDK_NGX_Parameter_ExposureTexture, &paramExposure);
+    auto getRes = [&](const char* key, ID3D12Resource** out)
+    {
+        if (InParameters->Get(key, out) != NVSDK_NGX_Result_Success || *out == nullptr)
+            InParameters->Get(key, (void**) out);
+    };
+
+    getRes(NVSDK_NGX_Parameter_Color, &paramColor);
+    getRes(NVSDK_NGX_Parameter_Output, &paramOutput);
+    getRes(NVSDK_NGX_Parameter_MotionVectors, &paramMotion);
+    getRes(NVSDK_NGX_Parameter_Depth, &paramDepth);
+    getRes(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, &paramReactiveMask);
+    getRes(NVSDK_NGX_Parameter_TransparencyMask, &paramTransparencyMask);
+    getRes(NVSDK_NGX_Parameter_ExposureTexture, &paramExposure);
 
     if (Config::Instance()->NeuralLookUseGBuffers.value_or_default())
     {
-        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Normals, &paramGBufferNormals);
-        if (InParameters->Get(NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo, &paramGBufferAlbedo) != NVSDK_NGX_Result_Success)
-            InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Albedo, &paramGBufferAlbedo);
-        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Roughness, &paramGBufferRoughness);
-        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Metallic, &paramGBufferMetallic);
-        InParameters->Get(NVSDK_NGX_Parameter_GBuffer_Subsurface, &paramGBufferSubsurface);
+        getRes(NVSDK_NGX_Parameter_GBuffer_Normals, &paramGBufferNormals);
+        getRes(NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo, &paramGBufferAlbedo);
+        if (paramGBufferAlbedo == nullptr)
+            getRes(NVSDK_NGX_Parameter_GBuffer_Albedo, &paramGBufferAlbedo);
+        getRes(NVSDK_NGX_Parameter_GBuffer_Roughness, &paramGBufferRoughness);
+        getRes(NVSDK_NGX_Parameter_GBuffer_Metallic, &paramGBufferMetallic);
+        getRes(NVSDK_NGX_Parameter_GBuffer_Subsurface, &paramGBufferSubsurface);
     }
 
     const bool useNeuralLook = Config::Instance()->NeuralLookEnabled.value_or_default() && NeuralLook != nullptr &&
@@ -456,7 +463,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
 
     // Run 3D Neural Look PRE-UPSCALE on exact 1:1 jittered render-res Color + Depth + MV
     bool neuralLookSwappedColor = false;
-    if (useNeuralLook && NeuralLook->CanRender())
+    if (useNeuralLook)
     {
         const bool applyManualBarriers = (upscaler != Upscaler::DLSS && upscaler != Upscaler::DLSSD);
         std::optional<int32_t> colorBarrier = Config::Instance()->ColorResourceBarrier;
@@ -472,12 +479,20 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
             maskBarrier.reset();
             expBarrier.reset();
         }
+        else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
+                 (State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine))
+        {
+            if (!colorBarrier.has_value())
+                colorBarrier = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            if (!mvBarrier.has_value())
+                mvBarrier = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
 
         const D3D12_RESOURCE_STATES nlInitialState = colorBarrier.has_value()
                                                          ? static_cast<D3D12_RESOURCE_STATES>(colorBarrier.value())
                                                          : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-        if (NeuralLook->CreateBufferResource(Device, paramColor, nlInitialState))
+        if (NeuralLook->CreateBufferResource(Device, paramColor, nlInitialState) && NeuralLook->CanRender())
         {
             auto pushBarrier = [&](ID3D12Resource* res, const std::optional<int32_t>& entryState,
                                    std::vector<D3D12_RESOURCE_BARRIER>& list, bool toSrv)
@@ -519,6 +534,7 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
             }
             else
             {
+                LOG_WARN("NeuralLook Dispatch failed for pre-upscale color buffer!");
                 NeuralLook->SetBufferState(InCommandList, nlInitialState);
                 Config::Instance()->NeuralLookEnabled.set_volatile_value(false);
             }
@@ -531,6 +547,10 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
             pushBarrier(paramExposure, expBarrier, postBarriers, false);
             if (!postBarriers.empty())
                 InCommandList->ResourceBarrier(static_cast<UINT>(postBarriers.size()), postBarriers.data());
+        }
+        else
+        {
+            LOG_WARN("NeuralLook CreateBufferResource failed for pre-upscale color buffer!");
         }
     }
 
