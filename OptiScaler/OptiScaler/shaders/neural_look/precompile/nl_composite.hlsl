@@ -258,6 +258,64 @@ min16float3 MultiBounceAO(min16float visibility, min16float3 albedo)
     return max(v.xxx, ((v * a + b) * v + c) * v);
 }
 
+// Lagarde & de Rousiers Frostbite Specular Occlusion
+float ComputeSpecularOcclusion(float NdotV, float ao, float roughness)
+{
+    return saturate(pow(max(NdotV + ao, 1e-4f), exp2(-16.0f * roughness - 1.0f)) - 1.0f + ao);
+}
+
+// Full-resolution view normal reconstructed directly from LDS 18x18 depth tile
+float3 ReconstructFullResNormalLDS(float2 uv, float2 invOut, float dC, float dL, float dR, float dU, float dD,
+                                   float tanHalfFov, float tanHalfFovAspect)
+{
+    float3 pC = ReconstructViewPos(uv, dC, tanHalfFov, tanHalfFovAspect);
+    float3 pL = ReconstructViewPos(uv + float2(-invOut.x, 0.0f), dL, tanHalfFov, tanHalfFovAspect);
+    float3 pR = ReconstructViewPos(uv + float2(invOut.x, 0.0f), dR, tanHalfFov, tanHalfFovAspect);
+    float3 pU = ReconstructViewPos(uv + float2(0.0f, -invOut.y), dU, tanHalfFov, tanHalfFovAspect);
+    float3 pD = ReconstructViewPos(uv + float2(0.0f, invOut.y), dD, tanHalfFov, tanHalfFovAspect);
+
+    float3 dx = (abs(dR - dC) < abs(dC - dL)) ? (pR - pC) : (pC - pL);
+    float3 dy = (abs(dD - dC) < abs(dC - dU)) ? (pC - pD) : (pU - pC);
+
+    float3 n = cross(dx, dy);
+    float lenSq = dot(n, n);
+    if (lenSq < 1e-12f)
+        return float3(0.0f, 0.0f, -1.0f);
+
+    n *= rsqrt(lenSq);
+    if (n.z > 0.0f)
+        n = -n;
+    return n;
+}
+
+// Physically-based Trowbridge-Reitz GGX microfacet specular lobe
+float3 EvalGGXSpecular(float3 N, float3 V, float3 L, float roughness, float3 f0)
+{
+    float NdotL = saturate(dot(N, L));
+    float NdotV = max(saturate(dot(N, V)), 1e-3f);
+    if (NdotL <= 1e-4f)
+        return float3(0.0f, 0.0f, 0.0f);
+
+    float3 H = normalize(V + L);
+    float NdotH = saturate(dot(N, H));
+    float VdotH = saturate(dot(V, H));
+
+    float a = max(roughness * roughness, 0.045f);
+    float a2 = a * a;
+    float denom = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
+    float D = a2 / (kPi * max(denom * denom, 1e-5f));
+
+    float k = (a + 1.0f);
+    k = (k * k) * 0.125f;
+    float gV = NdotV / (NdotV * (1.0f - k) + k);
+    float gL = NdotL / (NdotL * (1.0f - k) + k);
+    float G = gV * gL;
+
+    float3 F = f0 + (1.0f - f0) * pow(1.0f - VdotH, 5.0f);
+    float3 spec = (D * G * F) / max(4.0f * NdotV * NdotL, 1e-3f);
+    return min(spec * NdotL, float3(3.5f, 3.5f, 3.5f));
+}
+
 // AgX-inspired highlight-desaturating filmic curve (preserves hue on bright lights instead of neon clipping)
 float3 ApplyAgxFilmicContrast(float3 linearCol, float contrastStr)
 {
@@ -412,23 +470,50 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float lumaU = Luma(cU);
     float lumaD = Luma(cD);
 
-    // Multi-scale Volumetric Light Wrap from ColorPyramid mips 2, 3, 4
-    float3 multiScaleGlow = float3(0, 0, 0);
+    float dL = s_depth[ldsCoord.y][ldsCoord.x - 1];
+    float dR = s_depth[ldsCoord.y][ldsCoord.x + 1];
+    float dU = s_depth[ldsCoord.y - 1][ldsCoord.x];
+    float dD = s_depth[ldsCoord.y + 1][ldsCoord.x];
+
+    float maxDepthGrad = max(abs(dR - dL), abs(dD - dU));
+    float haloRisk = smoothstep(0.015f, 0.08f, maxDepthGrad / max(centerDepth, 0.05f));
+
+    // 3D Depth-Occluded Volumetric Light Scattering (foreground characters & beams occlude background light glow)
+    float3 volumetricScatter = float3(0, 0, 0);
     if (VolumetricGlow > 1e-4f)
     {
-        float3 g2 = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, 2.0f).rgb;
-        float3 g3 = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, 3.0f).rgb;
-        float3 g4 = ColorPyramidTex.SampleLevel(LinearClampPyr, uv, 4.0f).rgb;
-        float3 wide = g2 * 0.35f + g3 * 0.40f + g4 * 0.25f;
-        float wL = Luma(wide);
-        float brightGate = max(wL - 1.15f, 0.0f) / max(wL, 1e-4f);
-        multiScaleGlow = wide * brightGate;
+        float2 aspectScale = float2(1.0f, float(OutputWidth) / max(float(OutputHeight), 1.0f));
+        static const float2 vOffsets[4] = {
+            float2(-0.014f, -0.010f), float2(0.014f, -0.010f),
+            float2(-0.014f,  0.010f), float2(0.014f,  0.010f)
+        };
+        static const float vMips[4] = { 1.0f, 2.0f, 2.0f, 3.0f };
+        static const float vRadiusScale[4] = { 0.65f, 1.0f, 1.35f, 2.2f };
+        static const float vWeights[4] = { 0.22f, 0.26f, 0.26f, 0.26f };
+
+        [unroll]
+        for (int vi = 0; vi < 4; ++vi)
+        {
+            float2 tapUv = saturate(uv + vOffsets[vi] * aspectScale * vRadiusScale[vi]);
+            float4 pyr = ColorPyramidTex.SampleLevel(LinearClampPyr, tapUv, vMips[vi]);
+            float3 tapCol = max(pyr.rgb, 0.0f);
+            float wL = Luma(tapCol);
+            float brightGate = max(wL - 0.65f, 0.0f) / max(wL, 1e-4f);
+            float3 tapBright = tapCol * brightGate;
+
+            float tapDepth = pyr.a;
+            float frontOcc = smoothstep(0.50f, 1.05f, centerDepth / max(tapDepth, 0.05f));
+            float edgeWrap = haloRisk * 0.22f;
+            float airWeight = max(frontOcc, edgeWrap);
+
+            volumetricScatter += tapBright * airWeight * vWeights[vi];
+        }
     }
 
     // Fast skybox early-out
     if (skyMask <= 1e-4f && DebugView == 0)
     {
-        float3 skyOut = centerColor + multiScaleGlow * (VolumetricGlow * 0.10f);
+        float3 skyOut = centerColor + volumetricScatter * (VolumetricGlow * 0.22f);
         if (FusedRcasSharpness > 1e-4f)
         {
             float minL = min(min(lumaU, lumaL), min(lumaR, lumaD));
@@ -450,23 +535,22 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float3 cDL = s_color[ldsCoord.y + 1][ldsCoord.x - 1].rgb;
     float3 cDR = s_color[ldsCoord.y + 1][ldsCoord.x + 1].rgb;
 
-    float dL = s_depth[ldsCoord.y][ldsCoord.x - 1];
-    float dR = s_depth[ldsCoord.y][ldsCoord.x + 1];
-    float dU = s_depth[ldsCoord.y - 1][ldsCoord.x];
-    float dD = s_depth[ldsCoord.y + 1][ldsCoord.x];
-
-    float maxDepthGrad = max(abs(dR - dL), abs(dD - dU));
-    float haloRisk = smoothstep(0.015f, 0.08f, maxDepthGrad / max(centerDepth, 0.05f));
-
     int2 halfCoord = ClampGiCoord(int2((float2(outCoord) + 0.5f) * outToGi));
     float4 hNorm = HalfNormalTex.Load(int3(halfCoord, 0));
     float2 nxy = clamp(hNorm.xy, -1.0f, 1.0f);
-    float3 viewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
+    float3 halfViewNormal = float3(nxy, -sqrt(max(0.0f, 1.0f - dot(nxy, nxy))));
     float centerFlicker = saturate(hNorm.z);
+
+    float3 fullViewNormal =
+        ReconstructFullResNormalLDS(uv, invOut, centerDepth, dL, dR, dU, dD, TanHalfFov, TanHalfFovAspect);
+    float3 viewNormal = (HasGBufferNormals > 0)
+                            ? normalize(lerp(fullViewNormal, halfViewNormal, 0.75f))
+                            : normalize(lerp(fullViewNormal, halfViewNormal, 0.30f * (1.0f - haloRisk)));
 
     float3 viewPos = ReconstructViewPos(uv, centerDepth, TanHalfFov, TanHalfFovAspect);
     float3 viewDir = normalize(viewPos);
-    float NdotV = saturate(-dot(viewDir, viewNormal));
+    float3 toEye = -viewDir;
+    float NdotV = saturate(dot(toEye, viewNormal));
 
     float lumaUL = Luma(cUL);
     float lumaUR = Luma(cUR);
@@ -526,7 +610,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float solidMask = skyMask * (1.0f - flickerSoft);
     float edgeMask = solidMask * (1.0f - haloRisk * 0.85f);
     float3 microNormal = normalize(
-        viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (0.28f * meshGuard * edgeMask));
+        viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * (0.34f * meshGuard * edgeMask));
 
     // Fetch Trained Neural Material & Intrinsic Priors (override with render-res DLSS-RR G-buffers when present!)
     float4 mat0 = Material0Tex.SampleLevel(LinearClampMat0, uv, 0.0f);
@@ -577,7 +661,7 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         litColor = lerp(litColor, blurredSkin, rgbFalloff);
     }
 
-    // Scene-Derived Key Light & World Up (zero camera headlamp!)
+    // Scene-Derived Key Light, World Up, and Local 3D Light-Field Vector from Nearby Bright Emitters
     float4 keyDirData = ResolvedSceneLightBuf[4];
     float3 keyDirView = normalize(keyDirData.xyz);
     float keyStrength = saturate(keyDirData.w);
@@ -586,51 +670,117 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
     float3 keyTint = clamp(keyColor / keyNormLuma, 0.70f, 1.35f);
     float3 worldUpInView = normalize(ResolvedSceneLightBuf[6].xyz);
 
-    // Energy-Conserving GI + Direct-Light-Protected Multi-Bounce AO + Contact Shadows
+    float3 localLightDir = keyDirView;
+    float3 localLightCol = float3(0.0f, 0.0f, 0.0f);
+    float localLightWeight = 0.0f;
+    {
+        static const float2 lfOff[4] = {
+            float2(-0.045f, 0.0f), float2(0.045f, 0.0f),
+            float2(0.0f, -0.045f), float2(0.0f, 0.045f)
+        };
+        float3 lfDirSum = float3(0.0f, 0.0f, 0.0f);
+        float3 lfColSum = float3(0.0f, 0.0f, 0.0f);
+        float lfWSum = 0.0f;
+
+        [unroll]
+        for (int li = 0; li < 4; ++li)
+        {
+            float2 tapUv = saturate(uv + lfOff[li]);
+            float4 tapPyr = ColorPyramidTex.SampleLevel(LinearClampPyr, tapUv, 2.0f);
+            float3 tapRgb = max(tapPyr.rgb, 0.0f);
+            float wEmit = max(Luma(tapRgb) - 0.25f, 0.0f);
+            wEmit *= wEmit;
+            if (wEmit > 1e-5f && tapPyr.a < 64000.0f)
+            {
+                float3 tapPos =
+                    ReconstructViewPos(tapUv, min(tapPyr.a, centerDepth * 2.0f), TanHalfFov, TanHalfFovAspect);
+                float3 toTap = tapPos - viewPos;
+                float toLenSq = dot(toTap, toTap);
+                if (toLenSq > 1e-5f)
+                {
+                    lfDirSum += (toTap * rsqrt(toLenSq)) * wEmit;
+                    lfColSum += tapRgb * wEmit;
+                    lfWSum += wEmit;
+                }
+            }
+        }
+        if (lfWSum > 1e-5f && dot(lfDirSum, lfDirSum) > 1e-6f)
+        {
+            localLightDir = normalize(lfDirSum);
+            localLightCol = lfColSum / lfWSum;
+            localLightWeight = saturate(lfWSum * 2.0f);
+        }
+    }
+    float localLuma = max(Luma(localLightCol), 1e-4f);
+    float3 localLightTint = clamp(localLightCol / localLuma, 0.50f, 1.80f);
+
+    // Energy-Conserving GI + Multi-Bounce AO + Frostbite Specular Occlusion + Radiant Colored Diffuse & Indirect Specular
+    float specOcc = 1.0f;
     if (GiEnabled > 0)
     {
-        float indirectWeight = saturate(1.0f - directMask * 0.78f) * (1.0f - skinMask * 0.50f);
-        float flooredAo = max(contactAo, 0.30f);
+        float indirectWeight = saturate(1.0f - directMask * 0.72f) * (1.0f - skinMask * 0.50f);
+        float flooredAo = max(contactAo, 0.22f);
         float effectiveAo = lerp(1.0f, flooredAo, indirectWeight);
         float3 coloredAo = float3(MultiBounceAO(min16float(effectiveAo), min16float3(albedo)));
-        float csFactor = lerp(1.0f, max(contactShadow, 0.55f), 0.65f * edgeMask);
+        specOcc = ComputeSpecularOcclusion(NdotV, effectiveAo, roughness);
+        float csFactor = lerp(1.0f, max(contactShadow, 0.40f), 0.78f * edgeMask);
         litColor = litColor * lerp(float3(1, 1, 1), coloredAo, edgeMask) * csFactor;
 
-        // Diffuse bounce weighted by (1 - metallic) so dark steel and chrome aren't washed out by diffuse GI
-        float shadowFocus = rcp(1.0f + centerLuma * 1.10f);
-        float3 bounceAlbedo = clamp(albedo, 0.01f, 0.85f);
-        litColor += giBounce * bounceAlbedo * (1.0f - metallic * 0.75f) *
-                    (GiIntensity * (0.45f + 0.45f * shadowFocus)) * edgeMask;
+        float shadowFocus = rcp(1.0f + centerLuma * 0.85f);
+        float3 bounceAlbedo = clamp(albedo, 0.03f, 0.90f);
+        // Diffuse colored bounce from glowing lights & walls
+        litColor += giBounce * bounceAlbedo * (1.0f - metallic * 0.60f) *
+                    (GiIntensity * (0.75f + 0.85f * shadowFocus)) * edgeMask;
+
+        // Indirect specular colored sheen so dark painted steel, armor, and pipes pick up colored environment light
+        float3 indSpecF0 = lerp(float3(0.04f, 0.04f, 0.04f), bounceAlbedo, metallic);
+        float indFresnel = 0.25f + 0.75f * pow(1.0f - NdotV, 4.0f);
+        litColor += giBounce * indSpecF0 * indFresnel * pow(smoothness, 1.25f) * specOcc *
+                    (1.0f - skinMask * 0.80f) * (GiIntensity * 0.55f) * edgeMask;
     }
 
-    // Physically-Based Roughness-Cone SSR with Schlick Fresnel (no plastic glaze on rough/skin!)
+    // Physically-Based Roughness-Cone SSR with Schlick Fresnel + Frostbite Specular Occlusion
     if (GiEnabled > 0 && SsrEnabled > 0 && SsrIntensity > 1e-4f && roughness < 0.85f)
     {
         float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
         f0 = lerp(f0, float3(0.028f, 0.028f, 0.028f), skinMask);
         float fresnel = pow(1.0f - NdotV, 5.0f);
         float3 specF = f0 + (1.0f - f0) * fresnel;
-        float glossGate = pow(smoothness, 1.35f) * (1.0f - skinMask * 0.65f);
-        float reflWeight = saturate(max(specF.r, max(specF.g, specF.b)) * glossGate * SsrIntensity * 1.15f) *
-                           edgeMask * saturate(ssrSample.a);
+        float glossGate = pow(smoothness, 1.15f) * (1.0f - skinMask * 0.78f);
+        float reflWeight = saturate((max(specF.r, max(specF.g, specF.b)) * 1.45f + metallic * 0.22f) * glossGate *
+                                    SsrIntensity * 1.35f) *
+                           edgeMask * specOcc * saturate(ssrSample.a);
         float3 reflTint = lerp(float3(1, 1, 1), albedo, metallic * 0.70f);
         litColor = lerp(litColor, ssrSample.rgb * reflTint, reflWeight);
     }
 
-    // Scene-Coherent Directional Relighting + Charlie Cloth Sheen + Foliage Backlit Transmission
+    // Physically-Based GGX Microfacet Specular + Local 3D Light Rim + Macro Volume Sculpting
+    if (RelightIntensity > 1e-4f || SpecularRelief > 1e-4f)
+    {
+        float3 f0Spec = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+        float specScale = (RelightIntensity * 0.35f + SpecularRelief * 0.45f) * specOcc * contactShadow *
+                          (1.0f - skinMask * 0.65f) * edgeMask;
+        float3 keySpec = EvalGGXSpecular(microNormal, toEye, keyDirView, roughness, f0Spec) * keyTint * keyStrength * 0.85f;
+        float3 localSpec = EvalGGXSpecular(microNormal, toEye, localLightDir, roughness, f0Spec) * localLightCol *
+                           localLightWeight * 1.15f;
+        litColor += (keySpec + localSpec) * specScale;
+    }
+
     if (RelightIntensity > 1e-4f)
     {
-        float deltaBump = (dot(microNormal, keyDirView) - dot(viewNormal, keyDirView)) * 0.18f;
-        float macroKey = (dot(viewNormal, keyDirView) - 0.15f) * 0.07f * keyStrength;
-        float hemiTerm = dot(viewNormal, worldUpInView) * 0.06f;
+        float macroKey = (dot(viewNormal, keyDirView) - 0.12f) * 0.13f * keyStrength;
+        float hemiTerm = dot(viewNormal, worldUpInView) * 0.09f;
 
-        float sculpt = (deltaBump + macroKey + hemiTerm) * RelightIntensity * edgeMask;
+        float sculpt = (macroKey + hemiTerm) * RelightIntensity * edgeMask;
         float3 sculptTint = (sculpt >= 0.0f) ? keyTint : float3(0.88f, 0.94f, 1.08f);
-        litColor *= max(1.0f + sculpt * sculptTint, 0.55f);
+        litColor *= max(1.0f + sculpt * sculptTint, 0.50f);
 
-        // Rim scatter aligned with scene key & bounce
-        float rim = pow(1.0f - NdotV, 3.5f) * RelightIntensity * edgeMask * 0.12f * (1.0f - roughness * 0.45f);
-        litColor += litColor * rim * keyTint * saturate(Luma(giBounce) * 1.2f + 0.30f);
+        // Local-light grazing rim scatter with subtle foreground character/geometry separation
+        float fgBoost = 1.0f + 0.45f * (1.0f - smoothstep(2.0f, 10.0f, centerDepth));
+        float rim = pow(1.0f - NdotV, 3.0f) * RelightIntensity * edgeMask * specOcc * 0.16f *
+                    (1.0f - roughness * 0.40f) * fgBoost;
+        float3 rimTint = lerp(keyTint, localLightTint, localLightWeight);
+        litColor += litColor * rim * rimTint * saturate(Luma(giBounce) * 1.3f + localLightWeight * 0.55f + 0.25f);
 
         // Charlie velvet/cloth sheen at grazing angles (zero black-floor lift)
         if (clothMask > 0.05f)
@@ -648,18 +798,16 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         }
     }
 
-    // Specular Micro-Relief
-    if (SpecularRelief > 1e-4f)
-    {
-        float microMag = length(microGrad) * meshGuard;
-        float grazing = pow(1.0f - NdotV, 3.0f) * smoothness;
-        float specSignal = 0.55f * grazing + 0.45f * saturate(microMag * 1.25f) * smoothness;
-        float specMod = SpecularRelief * edgeMask * specSignal * 0.18f * (1.0f - skinMask * 0.35f);
-        litColor *= (1.0f + specMod);
-    }
-
     if (VolumetricGlow > 1e-4f)
-        litColor += multiScaleGlow * (VolumetricGlow * 0.18f * (0.30f + 0.70f * (1.0f - flickerSoft)));
+    {
+        litColor += volumetricScatter * (VolumetricGlow * 0.42f * (0.35f + 0.65f * (1.0f - flickerSoft)));
+
+        // Subtle Beer-Lambert distant atmospheric depth separation (only past 12m, preserves foreground blacks)
+        float farDist = max(centerDepth - 12.0f, 0.0f);
+        float aerialFactor = saturate(1.0f - exp(-farDist * 0.0085f)) * min(VolumetricGlow * 0.14f, 0.16f) * skyMask;
+        float3 sceneAmbient = max(ResolvedSceneLightBuf[0].rgb * 0.45f + volumetricScatter * 0.35f, 0.0f);
+        litColor = lerp(litColor, max(litColor, sceneAmbient), aerialFactor);
+    }
 
     // 3D Bilateral Grid Trilinear Slicing (Real Trained Neural Look Transform!)
     float3 finalColor = litColor;

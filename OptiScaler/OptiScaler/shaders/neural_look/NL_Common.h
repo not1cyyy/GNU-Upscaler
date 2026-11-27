@@ -46,9 +46,9 @@ class NL_Common
   public:
     enum class BudgetTier : int
     {
-        Light = 0,  // Prep + Pyramid + Neural Prior + Composite (SSS + Bilateral Grid + AgX + RCAS; skip SSGI/SSR/Denoise)
-        Medium = 1, // All 6 passes: 2-slice Visibility-Bitmask SSGI + 6-step Contact Shadows + 8-step Hi-Z SSR + Denoise
-        Full = 2    // All 6 passes: 3-slice Visibility-Bitmask SSGI + 6-step Contact Shadows + 12-step Hi-Z SSR + Denoise
+        Light = 0,  // All passes except SSR: 1-slice SSGI + 3-step Contact Shadows + Denoise + Composite
+        Medium = 1, // All 6 passes: 2-slice Visibility-Bitmask SSGI + 4-step Contact Shadows + 8-step Hi-Z SSR + Denoise
+        Full = 2    // All 6 passes: 2-slice Visibility-Bitmask SSGI + 6-step Contact Shadows + 14-step Hi-Z SSR + Denoise
     };
 
     void UpdateBudget(double gpuMs)
@@ -403,11 +403,32 @@ class NL_Common
         outTanHalfFovAspect = outTanHalfFov * aspect;
     }
 
+    static float ComputeDepthUnitScale(const NeuralLookConstants& inConst)
+    {
+        // Engines like Unreal Engine pass CameraNear in centimeters (e.g. 10.0 cm).
+        // Normalize to canonical meters so world-space GI/AO/Contact Shadow/Volumetric ranges are engine-invariant.
+        return (inConst.CameraNear >= 2.0f) ? 0.01f : 1.0f;
+    }
+
+    static float ComputeScaledSkyThreshold(const NeuralLookConstants& inConst)
+    {
+        const float unitScale = ComputeDepthUnitScale(inConst);
+        const float nearP = std::max(inConst.CameraNear * unitScale, 0.001f);
+        const float farP = std::max(inConst.CameraFar * unitScale, nearP + 1.0f);
+        // Cap below FP16 max (65504) so HalfColorDepthTex / ColorPyramidTex never overflow to +INF.
+        return std::min(farP * 0.85f, 32000.0f);
+    }
+
     static void CopyCameraBasis(const NeuralLookConstants& inConst, float outPos[3], float outRight[3], float outUp[3],
                                 float outFwd[3])
     {
         if (outPos)
-            std::memcpy(outPos, inConst.CameraPos, 3 * sizeof(float));
+        {
+            const float unitScale = ComputeDepthUnitScale(inConst);
+            outPos[0] = inConst.CameraPos[0] * unitScale;
+            outPos[1] = inConst.CameraPos[1] * unitScale;
+            outPos[2] = inConst.CameraPos[2] * unitScale;
+        }
         std::memcpy(outRight, inConst.CameraRight, 3 * sizeof(float));
         std::memcpy(outUp, inConst.CameraUp, 3 * sizeof(float));
         std::memcpy(outFwd, inConst.CameraFwd, 3 * sizeof(float));
@@ -426,14 +447,15 @@ class NL_Common
                                       int32_t& outDepthReversed, float& outLinearA, float& outLinearB,
                                       float& outLinearC, float& outSkyThreshold)
     {
-        const float nearP = std::max(inConst.CameraNear, 0.001f);
-        const float farP = std::max(inConst.CameraFar, nearP + 1.0f);
+        const float unitScale = ComputeDepthUnitScale(inConst);
+        const float nearP = std::max(inConst.CameraNear * unitScale, 0.001f);
+        const float farP = std::max(inConst.CameraFar * unitScale, nearP + 1.0f);
         outDepthLinear = inConst.DepthIsLinear ? 1 : 0;
         outDepthReversed = inConst.DepthIsReversed ? 1 : 0;
         outLinearA = nearP * farP;
         outLinearB = farP;
         outLinearC = farP - nearP;
-        outSkyThreshold = farP * 0.85f;
+        outSkyThreshold = std::min(farP * 0.85f, 32000.0f);
     }
 
     void FillPrepConstants(NLPrepInternalConstants& c, const NeuralLookConstants& inConst, bool hasNormals,
@@ -478,17 +500,15 @@ class NL_Common
     void FillPyramidConstants(NLPyramidInternalConstants& c, const NeuralLookConstants& inConst, int32_t outW,
                               int32_t outH) const
     {
-        const float farP = std::max(inConst.CameraFar, std::max(inConst.CameraNear, 0.001f) + 1.0f);
         c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
         c.FrameIndex = static_cast<int32_t>(_frameIndex);
-        c.SkyDepthThreshold = farP * 0.85f;
+        c.SkyDepthThreshold = ComputeScaledSkyThreshold(inConst);
         ComputeTanFov(outW, outH, inConst, c.TanHalfFov, c.TanHalfFovAspect);
         CopyCameraBasis(inConst, nullptr, c.CameraRight, c.CameraUp, c.CameraFwd);
     }
 
     void FillNeuralPriorConstants(NLNeuralPriorInternalConstants& c, const NeuralLookConstants& inConst) const
     {
-        const float farP = std::max(inConst.CameraFar, std::max(inConst.CameraNear, 0.001f) + 1.0f);
         ResolveRenderDims(c.OutputWidth, c.OutputHeight, 0, 0, inConst, c.RenderWidth, c.RenderHeight);
         c.MvSubrectBaseX = inConst.MvSubrectBaseX;
         c.MvSubrectBaseY = inConst.MvSubrectBaseY;
@@ -500,14 +520,13 @@ class NL_Common
         c.TotalTiles = std::max(1, c.GridWidth * c.GridHeight);
         c.MvScaleX = inConst.MvScaleX;
         c.MvScaleY = inConst.MvScaleY;
-        c.SkyDepthThreshold = farP * 0.85f;
+        c.SkyDepthThreshold = ComputeScaledSkyThreshold(inConst);
         CopyCameraBasis(inConst, nullptr, c.CameraRight, c.CameraUp, c.CameraFwd);
     }
 
     void FillGiConstants(NLGiInternalConstants& c, const NeuralLookConstants& inConst, bool ssrEnabled,
                          bool worldHashEnabled) const
     {
-        const float farP = std::max(inConst.CameraFar, std::max(inConst.CameraNear, 0.001f) + 1.0f);
         ResolveRenderDims(c.OutputWidth, c.OutputHeight, 0, 0, inConst, c.RenderWidth, c.RenderHeight);
         c.MvSubrectBaseX = inConst.MvSubrectBaseX;
         c.MvSubrectBaseY = inConst.MvSubrectBaseY;
@@ -516,22 +535,22 @@ class NL_Common
         c.ResetHistory = inConst.ResetHistory ? 1 : 0;
         c.FrameIndex = static_cast<int32_t>(_frameIndex);
 
-        c.RayCount = 2;
-        c.StepCount = (_activeTier >= 2) ? 5 : 4;
+        c.RayCount = (_activeTier == 0) ? 1 : 2;
+        c.StepCount = (_activeTier >= 2) ? 6 : 4;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
-        c.SsrSteps = (_activeTier >= 2) ? 12 : 8;
+        c.SsrSteps = (_activeTier >= 2) ? 14 : 8;
         c.HasCameraBasis = inConst.HasCameraBasis ? 1 : 0;
         c.WorldHashEnabled = (worldHashEnabled && inConst.HasCameraBasis) ? 1 : 0;
 
-        c.SkyDepthThreshold = farP * 0.85f;
+        c.SkyDepthThreshold = ComputeScaledSkyThreshold(inConst);
         c.MvScaleX = inConst.MvScaleX;
         c.MvScaleY = inConst.MvScaleY;
         ComputeTanFov(c.OutputWidth, c.OutputHeight, inConst, c.TanHalfFov, c.TanHalfFovAspect);
 
         const float minDim = (float) std::min(c.OutputWidth, c.OutputHeight);
-        c.GiRadius = std::clamp(minDim * 0.11f, 40.0f, 144.0f);
+        c.GiRadius = std::clamp(minDim * 0.16f, 64.0f, 220.0f);
         c.GiBias = 0.04f;
-        c.ContactShadowSteps = (_activeTier >= 2) ? 6.0f : 4.0f;
+        c.ContactShadowSteps = (_activeTier >= 2) ? 6.0f : ((_activeTier == 1) ? 4.0f : 3.0f);
 
         CopyCameraBasis(inConst, c.CameraPos, c.CameraRight, c.CameraUp, c.CameraFwd);
     }
@@ -539,12 +558,11 @@ class NL_Common
     void FillDenoiseConstants(NLDenoiseInternalConstants& c, const NeuralLookConstants& inConst, int32_t giW,
                               int32_t giH, bool ssrEnabled) const
     {
-        const float farP = std::max(inConst.CameraFar, std::max(inConst.CameraNear, 0.001f) + 1.0f);
         c.GiWidth = giW;
         c.GiHeight = giH;
         c.StepSize = 1;
         c.SsrEnabled = ssrEnabled ? 1 : 0;
-        c.SkyDepthThreshold = farP * 0.85f;
+        c.SkyDepthThreshold = ComputeScaledSkyThreshold(inConst);
         c.PhiDepth = 0.045f;
         c.PhiNormal = 32.0f;
         c.PhiLuma = 1.25f;

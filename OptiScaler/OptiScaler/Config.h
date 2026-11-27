@@ -393,7 +393,7 @@ class Config
     CustomOptional<float> NeuralLookToneContrast { 0.32f };
     CustomOptional<float> NeuralLookSssIntensity { 0.75f };
     CustomOptional<float> NeuralLookContactShadowIntensity { 0.70f };
-    CustomOptional<float> NeuralLookMaxGpuMs { 1.80f };
+    CustomOptional<float> NeuralLookMaxGpuMs { 3.00f };
     CustomOptional<float> NeuralLookSplitScreen { 0.0f };
     CustomOptional<bool> NeuralLookUseGBuffers { true };
     CustomOptional<bool> NeuralLookWorldHashEnabled { true };

@@ -250,34 +250,33 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
     int slices = clamp(RayCount, 1, 4);
     int steps = clamp(StepCount, 3, 8);
-    float worldRange = clamp(centerDepth * 0.18f, 0.50f, 5.0f);
-    float invWorldRange = rcp(worldRange);
-    float thickness = clamp(centerDepth * 0.035f, 0.06f, 0.65f);
-    float maxForegroundGap = clamp(centerDepth * 0.06f, 0.15f, 1.4f);
+    float aoWorldRange = clamp(centerDepth * 0.16f, 0.45f, 3.8f);
+    float aoThickness = clamp(centerDepth * 0.032f, 0.06f, 0.48f);
+    float maxFgGap = clamp(centerDepth * 0.07f, 0.18f, 1.35f);
+    float giWorldRange = clamp(centerDepth * 0.48f, 2.5f, 14.0f);
 
     float3 accumGi = float3(0.0f, 0.0f, 0.0f);
     float accumAo = 0.0f;
 
-    // 1. Visibility-Bitmask SSGI (Therrien et al.) + Mip-Sampled Prefiltered Color Pyramid + World Hash Fallback
+    // 1. Dual-Band Visibility-Bitmask SSGI: Crisp Close AO + Wide Radiant Colored Light Bleed
     [loop]
     for (int r = 0; r < slices; ++r)
     {
         float angle = (kPi * (float(r) + noiseA)) / float(slices);
         float2 dirPx = float2(cos(angle), sin(angle));
 
-        // Project normal onto slice plane for proper cosine-weighted hemisphere bitmasking
+        // Project normal onto slice plane using exact atan2 signed angles
         float3 sliceDirView = normalize(float3(dirPx.x * TanHalfFovAspect, -dirPx.y * TanHalfFov, 0.0f));
         float3 planeNormal = normalize(cross(sliceDirView, toEye));
         float3 orthoTangent = cross(toEye, planeNormal);
         float3 projNormal = viewNormal - planeNormal * dot(viewNormal, planeNormal);
-        float projNLen = max(length(projNormal), 1e-4f);
-        float cosN = clamp(dot(projNormal / projNLen, toEye), -1.0f, 1.0f);
-        float sinN = dot(projNormal / projNLen, orthoTangent);
-        float nAngle = acos(cosN) * ((sinN >= 0.0f) ? 1.0f : -1.0f);
+        float projNLen = length(projNormal);
+        float cosN = (projNLen > 1e-4f) ? clamp(dot(projNormal / projNLen, toEye), -1.0f, 1.0f) : 1.0f;
+        float sinN = (projNLen > 1e-4f) ? dot(projNormal / projNLen, orthoTangent) : 0.0f;
+        float nAngle = (projNLen > 1e-4f) ? atan2(sinN, cosN) : 0.0f;
 
         uint bitmask = 0u;
         float3 sliceGi = float3(0.0f, 0.0f, 0.0f);
-        float hitCount = 0.0f;
 
         [loop]
         for (int dirSign = -1; dirSign <= 1; dirSign += 2)
@@ -293,63 +292,80 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
                 if (any(sampleUv < 0.002f) || any(sampleUv > 0.998f))
                 {
-                    // Screen-border exit: query World-Space Hash Cache / Scene SH gently
                     float3 exitDir = normalize(lerp(viewNormal, float3(marchDirPx.x, -marchDirPx.y, -0.3f), 0.55f));
-                    sliceGi += QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f) * 0.08f;
+                    sliceGi += QueryFallbackRadiance(centerPos, exitDir, centerDepth * 0.5f) * 0.12f;
                     break;
                 }
 
-                // Sample crisp half-res depth to avoid Hi-Z minDepth silhouette bloat into 8x8/16x16 shadow blocks;
-                // keep prefiltered ColorPyramid only for soft indirect bounce radiance.
+                // Crisp half-res depth prevents Hi-Z minDepth 16x16 block outlines
                 int2 sGiCoord = ClampGiCoord(int2(sampleUv * float2(GiWidth, GiHeight)));
                 float sampleDepth = HalfColorDepthTex.Load(int3(sGiCoord, 0)).a;
-                if (sampleDepth >= 64000.0f || sampleDepth >= SkyDepthThreshold ||
-                    (centerDepth - sampleDepth) > maxForegroundGap)
-                {
+                if (sampleDepth >= 64000.0f || sampleDepth >= SkyDepthThreshold)
                     continue;
-                }
-
-                float mipLvl = clamp(log2(max(radiusPx * 0.22f, 1.0f)), 0.0f, 4.0f);
-                float3 sampleColor = ColorPyramidTex.SampleLevel(LinearClampPyr, sampleUv, mipLvl).rgb;
 
                 float3 samplePos = ReconstructViewPos(sampleUv, sampleDepth, TanHalfFov, TanHalfFovAspect);
                 float3 deltaFront = samplePos - centerPos;
                 float distSq = dot(deltaFront, deltaFront);
-                if (distSq < 1e-5f || distSq > worldRange * worldRange)
+                if (distSq < 1e-5f || distSq > giWorldRange * giWorldRange)
                     continue;
 
                 float dist = sqrt(distSq);
                 float3 frontDir = deltaFront / dist;
-                float3 backDir = normalize(deltaFront - toEye * thickness);
 
-                // Map front/back horizon angles relative to projected normal into 32 sectors [0, 31]
-                float hFront = acos(clamp(dot(frontDir, toEye), -1.0f, 1.0f)) * float(dirSign);
-                float hBack = acos(clamp(dot(backDir, toEye), -1.0f, 1.0f)) * float(dirSign);
-
-                float a0 = clamp((min(hFront, hBack) - nAngle + kPi * 0.5f) / kPi, 0.0f, 1.0f);
-                float a1 = clamp((max(hFront, hBack) - nAngle + kPi * 0.5f) / kPi, 0.0f, 1.0f);
-
-                uint startBit = min(uint(floor(a0 * 32.0f)), 31u);
-                uint endBit = min(uint(ceil(a1 * 32.0f)), 32u);
-                uint bitCount = (endBit > startBit) ? (endBit - startBit) : 0u;
-
-                if (bitCount > 0u)
+                // Band 1: Geometric Visibility-Bitmask AO (foreground-gap guarded)
+                if ((centerDepth - sampleDepth) <= maxFgGap && dist < aoWorldRange)
                 {
-                    uint sectorMask = (bitCount >= 32u) ? (0xFFFFFFFFu << startBit)
-                                                        : (((1u << bitCount) - 1u) << startBit);
-                    uint newlyOccluded = sectorMask & ~bitmask;
-                    float visWeight = float(countbits(newlyOccluded)) / 32.0f;
-                    bitmask |= sectorMask;
+                    float3 backDir = normalize(deltaFront - toEye * aoThickness);
+                    float fhX = dot(frontDir, toEye);
+                    float fhY = dot(frontDir, orthoTangent);
+                    float hFront = (abs(fhX) + abs(fhY) > 1e-5f) ? atan2(fhY, fhX) : 0.0f;
+                    float bhX = dot(backDir, toEye);
+                    float bhY = dot(backDir, orthoTangent);
+                    float hBack = (abs(bhX) + abs(bhY) > 1e-5f) ? atan2(bhY, bhX) : hFront;
 
-                    if (visWeight > 0.0f)
+                    float hF = hFront - nAngle;
+                    if (hF > kPi) hF -= 2.0f * kPi;
+                    else if (hF < -kPi) hF += 2.0f * kPi;
+
+                    float hB = hBack - nAngle;
+                    if (hB > kPi) hB -= 2.0f * kPi;
+                    else if (hB < -kPi) hB += 2.0f * kPi;
+
+                    float a0 = clamp((min(hF, hB) + kPi * 0.5f) / kPi, 0.0f, 1.0f);
+                    float a1 = clamp((max(hF, hB) + kPi * 0.5f) / kPi, 0.0f, 1.0f);
+
+                    uint startBit = min(uint(floor(a0 * 32.0f)), 31u);
+                    uint endBit = min(uint(ceil(a1 * 32.0f)), 32u);
+                    uint bitCount = (endBit > startBit) ? (endBit - startBit) : 0u;
+                    if (bitCount > 0u)
                     {
-                        float rangeFade = pow(1.0f - saturate(dist * invWorldRange), 1.5f);
-                        float nDotL = saturate(dot(viewNormal, frontDir) - GiBias);
-                        float3 hitCol = max(sampleColor, 0.0f);
-                        float hitLuma = Luma(hitCol);
-                        hitCol = max(lerp(hitLuma.xxx, hitCol, 1.05f), 0.0f);
-                        sliceGi += hitCol * nDotL * visWeight * rangeFade * 1.10f;
-                        hitCount += visWeight;
+                        uint sectorMask = (bitCount >= 32u) ? (0xFFFFFFFFu << startBit)
+                                                            : (((1u << bitCount) - 1u) << startBit);
+                        bitmask |= sectorMask;
+                    }
+                }
+
+                // Band 2: Wide Radiant Colored Bounce (up to 14m, luminous emitter boost)
+                float fgAtten = 1.0f - smoothstep(giWorldRange * 0.35f, giWorldRange * 0.70f, max(centerDepth - sampleDepth, 0.0f));
+                if (fgAtten > 0.01f)
+                {
+                    float nDotL = saturate(dot(viewNormal, frontDir) - 0.02f);
+                    if (nDotL > 0.0f)
+                    {
+                        float mipLvl = clamp(log2(max(radiusPx * 0.22f, 1.0f)), 0.0f, 4.0f);
+                        float3 sampleColor = max(ColorPyramidTex.SampleLevel(LinearClampPyr, sampleUv, mipLvl).rgb, 0.0f);
+                        float hitLuma = Luma(sampleColor);
+
+                        float2 sNxy = clamp(HalfNormalTex.Load(int3(sGiCoord, 0)).xy, -1.0f, 1.0f);
+                        float3 sNorm = float3(sNxy, -sqrt(max(0.0f, 1.0f - dot(sNxy, sNxy))));
+                        float emitterFace = saturate(dot(sNorm, -frontDir) * 0.65f + 0.35f);
+                        float emitterBoost = 1.0f + smoothstep(0.40f, 1.60f, hitLuma) * 1.50f;
+                        float3 hitCol = max(lerp(hitLuma.xxx, sampleColor, 1.20f), 0.0f);
+
+                        float normD = dist / max(giWorldRange * 0.38f, 0.5f);
+                        float giAtten = rcp(1.0f + normD * normD) * pow(1.0f - saturate(dist / giWorldRange), 1.25f) * fgAtten;
+
+                        sliceGi += hitCol * nDotL * emitterFace * emitterBoost * giAtten * (1.75f / float(steps));
                     }
                 }
             }
@@ -361,10 +377,10 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     }
 
     float3 currentGi = max(accumGi / float(slices), 0.0f);
-    float distAoFade = rcp(1.0f + centerDepth * 0.03f);
+    float distAoFade = rcp(1.0f + centerDepth * 0.012f);
     float currentAo = lerp(1.0f, saturate(accumAo / float(slices)), distAoFade);
 
-    // 2. Tight Screen-Space Contact Shadows toward Dominant Key Light
+    // 2. Grounding Screen-Space Contact Shadows toward Dominant Key Light (in canonical meters)
     float contactShadow = 1.0f;
     float4 keyDirData = ResolvedSceneLightBuf[4];
     float3 keyDirView = normalize(keyDirData.xyz);
@@ -373,7 +389,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     if (nDotKey > 0.02f && keyStrength > 0.05f)
     {
         int cSteps = clamp(int(ContactShadowSteps), 2, 8);
-        float maxShadowDist = clamp(centerDepth * 0.022f, 0.03f, 0.38f);
+        float maxShadowDist = clamp(centerDepth * 0.045f, 0.08f, 1.10f);
         float occ = 0.0f;
         float invTanV = rcp(max(TanHalfFov, 1e-4f));
         float invTanH = rcp(max(TanHalfFovAspect, 1e-4f));
@@ -392,14 +408,14 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
 
             float sampleD = HalfColorDepthTex.Load(int3(ClampGiCoord(int2(rUv * float2(GiWidth, GiHeight))), 0)).a;
             float diff = rayPos.z - sampleD;
-            float maxThick = clamp(centerDepth * 0.012f, 0.015f, 0.16f);
+            float maxThick = clamp(centerDepth * 0.022f, 0.03f, 0.32f);
             if (diff > centerDepth * 0.002f && diff < maxThick)
             {
                 occ = max(occ, 1.0f - fracS * 0.55f);
             }
         }
-        float csDistFade = rcp(1.0f + centerDepth * 0.09f);
-        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * 0.65f);
+        float csDistFade = rcp(1.0f + centerDepth * 0.025f);
+        contactShadow = saturate(1.0f - occ * saturate(nDotKey * 3.0f) * saturate(keyStrength * 1.4f) * csDistFade * 0.85f);
     }
 
     // 3. Hi-Z Roughness-Cone SSR (skip diffuse surfaces roughness > 0.85) + Virtual Hit Distance
@@ -517,12 +533,18 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
             }
         }
 
-        // Off-screen reflection fallback from World-Space Hash Cache or Scene SH
+        // High-impact off-screen reflection fallback: directional pyramid + World Hash / Scene SH
         if (currentSsr.a < 0.95f)
         {
             float3 envRefl = QueryFallbackRadiance(centerPos, reflDir, clamp(centerDepth * 1.2f, 1.5f, 24.0f));
+            if (reflDir.z > -0.60f)
+            {
+                float2 dirSampleUv = saturate(uv + reflDir.xy * 0.25f);
+                float3 pyrRefl = max(ColorPyramidTex.SampleLevel(LinearClampPyr, dirSampleUv, 3.0f).rgb, 0.0f);
+                envRefl = lerp(envRefl, pyrRefl, 0.55f);
+            }
             currentSsr.rgb = lerp(envRefl, currentSsr.rgb, currentSsr.a);
-            currentSsr.a = max(currentSsr.a, 0.18f * (1.0f - roughness));
+            currentSsr.a = max(currentSsr.a, 0.24f * (1.0f - roughness));
         }
     }
 

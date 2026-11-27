@@ -795,8 +795,7 @@ bool NL_Vk::Dispatch(VkDevice InDevice, VkCommandBuffer InCmdList, NeuralLookCon
     const int debugView = cfg->NeuralLookDebugView.value_or_default();
 
     const bool ssrEnabled = (_activeTier > 0) && (ssrIntensity > 1e-4f || debugView == 5);
-    const bool runGiPass = (_activeTier > 0) &&
-                           (giIntensity > 1e-4f || aoIntensity > 1e-4f || contactIntensity > 1e-4f || ssrEnabled ||
+    const bool runGiPass = (giIntensity > 1e-4f || aoIntensity > 1e-4f || contactIntensity > 1e-4f || ssrEnabled ||
                             debugView == 1 || debugView == 2 || debugView == 7);
 
     _giWriteIdx = (_giWriteIdx + 1) & 1;

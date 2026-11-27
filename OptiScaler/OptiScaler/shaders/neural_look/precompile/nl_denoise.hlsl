@@ -93,15 +93,17 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     float invSigmaZ = rcp(max(centerDepth * PhiDepth, 0.02f));
     float invSigmaL = rcp(max(centerMeta.g * PhiLuma + 0.08f, 0.08f));
 
-    static const int2 kOffsets[9] = {
+    static const int2 kOffsets[13] = {
         int2(0, 0),
         int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1),
-        int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1)
+        int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1),
+        int2(-3, 0), int2(3, 0), int2(0, -3), int2(0, 3)
     };
-    static const float kKernel[9] = {
-        0.25f,
-        0.125f, 0.125f, 0.125f, 0.125f,
-        0.0625f, 0.0625f, 0.0625f, 0.0625f
+    static const float kKernel[13] = {
+        0.22f,
+        0.10f, 0.10f, 0.10f, 0.10f,
+        0.06f, 0.06f, 0.06f, 0.06f,
+        0.035f, 0.035f, 0.035f, 0.035f
     };
 
     float4 giSum = centerGi * kKernel[0];
@@ -112,7 +114,7 @@ void CSMain(uint3 dtid : SV_DispatchThreadID)
     int step = max(StepSize, 1);
 
     [unroll]
-    for (int i = 1; i < 9; ++i)
+    for (int i = 1; i < 13; ++i)
     {
         int2 q = ClampGi(p + kOffsets[i] * step);
         float tapDepth = HalfColorDepthTex.Load(int3(q, 0)).a;
