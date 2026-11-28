@@ -320,6 +320,62 @@ float3 ApplySubtleFilmicCurve(float3 linearCol, float contrastStr)
     return max(linearCol * (targetL / l), 0.0f);
 }
 
+float Hash31(float3 p)
+{
+    p = frac(p * 0.1031f);
+    p += dot(p, p.yzx + 33.33f);
+    return frac((p.x + p.y) * p.z);
+}
+
+// Smooth 3D value noise with exact analytical gradient: float4(value, d/dx, d/dy, d/dz)
+float4 ValueNoise3DGrad(float3 x)
+{
+    float3 i = floor(x);
+    float3 f = frac(x);
+    float3 u = f * f * (3.0f - 2.0f * f);
+    float3 du = 6.0f * f * (1.0f - f);
+
+    float a  = Hash31(i + float3(0, 0, 0));
+    float b  = Hash31(i + float3(1, 0, 0));
+    float c  = Hash31(i + float3(0, 1, 0));
+    float d  = Hash31(i + float3(1, 1, 0));
+    float e  = Hash31(i + float3(0, 0, 1));
+    float f1 = Hash31(i + float3(1, 0, 1));
+    float g  = Hash31(i + float3(0, 1, 1));
+    float h  = Hash31(i + float3(1, 1, 1));
+
+    float k0 = a;
+    float k1 = b - a;
+    float k2 = c - a;
+    float k3 = e - a;
+    float k4 = a - b - c + d;
+    float k5 = a - c - e + g;
+    float k6 = a - b - e + f1;
+    float k7 = -a + b + c - d + e - f1 - g + h;
+
+    float val = k0 + k1 * u.x + k2 * u.y + k3 * u.z + k4 * u.x * u.y + k5 * u.y * u.z + k6 * u.z * u.x + k7 * u.x * u.y * u.z;
+    float3 grad = du * float3(
+        k1 + k4 * u.y + k6 * u.z + k7 * u.y * u.z,
+        k2 + k5 * u.z + k4 * u.x + k7 * u.z * u.x,
+        k3 + k6 * u.x + k5 * u.y + k7 * u.x * u.y);
+    return float4(val, grad);
+}
+
+float EvalSkinMotionStillness(float2 uv)
+{
+    int activeW = (DisplaySizeMV > 0)
+                      ? ((PreUpscale == 0) ? OutputWidth : max(MotionWidth - MvSubrectBaseX, 1))
+                      : RenderWidth;
+    int activeH = (DisplaySizeMV > 0)
+                      ? ((PreUpscale == 0) ? OutputHeight : max(MotionHeight - MvSubrectBaseY, 1))
+                      : RenderHeight;
+    int2 mvCoord = ClampMotionCoord(int2(MvSubrectBaseX, MvSubrectBaseY) + int2(uv * float2(activeW, activeH)));
+    float2 mv = MotionTex.Load(int3(mvCoord, 0)).rg * float2(MvScaleX, MvScaleY);
+    float2 mvUv = mv / float2(max(activeW, 1), max(activeH, 1));
+    float mvPx = length(mvUv * float2(OutputWidth, OutputHeight));
+    return rcp(1.0f + mvPx * 0.45f);
+}
+
 // Full-res silhouette-safe normal reconstruction directly from LDS depth (zero 2x2 staircasing)
 float3 ReconstructFullResViewNormal(int2 outCoord, float2 uv, float2 invOut,
                                     float dC, float dL, float dR, float dU, float dD,
@@ -971,7 +1027,68 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
             shadedNormal = normalize(viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * microStrength);
     }
 
-    // 3-Layer Jimenez Skin SSS (Epidermis / Dermis / Subcutis) with crisp real-texture preservation
+    float3 skinDetailNormal = shadedNormal;
+    float poreDimple = 0.0f;
+    float poreRoughMod = 0.0f;
+    float skinDetailMask = exp(-pVar * 14.0f);
+    float closeUpSkin = 1.0f - smoothstep(1.5f, 3.6f, centerDepth);
+
+    if (skinW > 0.03f && solidMask > 0.05f)
+    {
+        // 1) UV-locked micro-normal on top of smoothed curved viewNormal (pores, freckles, zero facet lines!)
+        float texMicroStr = 0.20f * skinW * edgeSafeMask * meshGuard;
+        float3 texSkinNorm = normalize(viewNormal + float3(-microGrad.x, microGrad.y, 0.0f) * texMicroStr);
+        skinDetailNormal = texSkinNorm;
+
+        // 2) Nyquist-filtered, motion-guarded close-up 3D micro-pore & fine skin-grain synthesis
+        if (closeUpSkin > 0.01f && edgeSafeMask > 0.05f && skinDetailMask > 0.05f)
+        {
+            float pxWorldSize = (2.0f * TanHalfFov * centerDepth) / float(max(OutputHeight, 1));
+            float nyqGrain = 1.0f - smoothstep(0.00055f, 0.0017f, pxWorldSize); // ~2.1mm fine skin grain
+            float nyqPore  = 1.0f - smoothstep(0.00022f, 0.00080f, pxWorldSize); // ~0.8mm pores
+            float motionStill = EvalSkinMotionStillness(uv);
+            float procGate = closeUpSkin * motionStill * skinDetailMask * edgeSafeMask * skinW;
+
+            if (procGate * max(nyqGrain, nyqPore) > 0.01f)
+            {
+                float3 relWorldPos = (HasCameraBasis > 0)
+                                         ? ((CameraPos - floor(CameraPos)) + CameraRight * viewPos.x +
+                                            CameraUp * viewPos.y + CameraFwd * viewPos.z)
+                                         : viewPos;
+                float3 surfNorm3 = (HasCameraBasis > 0)
+                                       ? ViewToWorldDir(viewNormal, CameraRight, CameraUp, CameraFwd)
+                                       : viewNormal;
+
+                // Orthonormal 3D rotation for second octave so grain and pores never align to a grid
+                float3 rotPos = float3(
+                    0.80f * relWorldPos.x - 0.60f * relWorldPos.y,
+                    0.36f * relWorldPos.x + 0.48f * relWorldPos.y - 0.80f * relWorldPos.z,
+                    0.48f * relWorldPos.x + 0.64f * relWorldPos.y + 0.60f * relWorldPos.z);
+
+                float4 nGrain = ValueNoise3DGrad(relWorldPos * 480.0f);
+                float4 nPore  = ValueNoise3DGrad(rotPos * 1250.0f);
+
+                float3 poreGradWorld = float3(
+                    0.80f * nPore.y + 0.36f * nPore.z + 0.48f * nPore.w,
+                   -0.60f * nPore.y + 0.48f * nPore.z + 0.64f * nPore.w,
+                   -0.80f * nPore.z + 0.60f * nPore.w);
+
+                float rawDimple = smoothstep(0.56f, 0.92f, nPore.x);
+                poreDimple = rawDimple * nyqPore * procGate;
+                poreRoughMod = ((nGrain.x - 0.5f) * 0.14f * nyqGrain + rawDimple * 0.14f * nyqPore) * procGate;
+
+                float3 grad3 = nGrain.yzw * (0.14f * nyqGrain) + poreGradWorld * (0.24f * nyqPore * (0.35f + 0.65f * rawDimple));
+                grad3 -= surfNorm3 * dot(grad3, surfNorm3);
+                float3 gradView = (HasCameraBasis > 0)
+                                      ? float3(dot(grad3, CameraRight), dot(grad3, CameraUp), dot(grad3, CameraFwd))
+                                      : grad3;
+
+                skinDetailNormal = normalize(texSkinNorm - gradView * (0.42f * procGate));
+            }
+        }
+    }
+
+    // 3-Layer Jimenez Skin SSS (Epidermis / Dermis / Subcutis) + Tactile Epidermal Pore Micro-Relief
     float3 litColor = centerColor;
     float effSkinSss = saturate(skinProb * SssIntensity * 0.90f) * skinChromaGate;
     if (effSkinSss > 0.03f && SssIntensity > 1e-4f && solidMask > 0.05f)
@@ -1025,6 +1142,12 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         float3 blendedSkin = lerp(litColor, max(diffusedSkin, 0.0f),
                                   float3(0.72f, 0.36f, 0.14f) * effSkinSss * solidMask * (1.0f - silEdge * 0.85f)) +
                              termScatter + backScatter;
+
+        // Restore tactile epidermal micro-texture (pores/freckles/skin grain) & subtle close-up pore recess occlusion
+        float epiMicro = clamp((pC - pAvg) * 0.65f, -0.06f, 0.06f) * skinW * edgeSafeMask * skinDetailMask *
+                         (0.45f + 0.55f * closeUpSkin);
+        float poreOcc = 1.0f - poreDimple * 0.085f;
+        blendedSkin *= (1.0f + epiMicro) * poreOcc;
 
         float diffLuma = Luma(blendedSkin);
         if (diffLuma > centerLuma * 1.15f + 0.01f)
@@ -1119,24 +1242,26 @@ void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : 
         sculptVec = min(sculptVec, max(sculptVec * brightDamp, 0.0f));
         litColor *= clamp(1.0f + sculptVec, 0.45f, 1.50f);
 
-        // 0) SKIN: Silky Dual-Lobe Sebum + Epidermal Sheen (neutral F0=0.028) + Vellus Peach-Fuzz Rim
+        // 0) SKIN: Pore-modulated Dual-Lobe GGX Sebum + Epidermal Sheen (neutral F0=0.028) + Vellus Peach-Fuzz Rim
         if (skinW > 0.04f)
         {
             float3 halfVec = normalize(keyDirView + toEye);
-            float nDotH = saturate(dot(shadedNormal, halfVec));
-            float sebumTight = pow(nDotH, 28.0f) * 0.068f;
-            float sebumBroad = pow(nDotH, 8.0f) * 0.024f;
-            float skinFresnel = 0.028f + 0.972f * pow(1.0f - safeNdotV, 5.0f);
-            float fresnelGain = lerp(0.82f, 1.75f, saturate(skinFresnel * 6.0f));
-            float keyVis = saturate(dot(shadedNormal, keyDirView) + 0.25f) * contactShadow;
+            float nDotH = saturate(dot(skinDetailNormal, halfVec));
+            float poreSpecMask = 1.0f - poreDimple * 0.42f; // Highlights peak on micro-ridges between pores
+            float tightExp = lerp(42.0f, 18.0f, saturate(0.35f + poreRoughMod * 2.0f));
+            float sebumTight = pow(nDotH, tightExp) * 0.085f;
+            float sebumBroad = pow(nDotH, 8.5f) * 0.026f;
+            float skinFresnel = 0.028f + 0.972f * pow(1.0f - saturate(dot(toEye, skinDetailNormal)), 5.0f);
+            float fresnelGain = lerp(0.80f, 1.85f, saturate(skinFresnel * 6.0f));
+            float keyVis = saturate(dot(skinDetailNormal, keyDirView) + 0.20f) * contactShadow;
 
             float3 sebumSpec = lerp(float3(1.0f, 1.0f, 1.0f), keyTint, 0.40f) * (sebumTight + sebumBroad) *
-                               fresnelGain * keyVis * specOcc * edgeSafeMask * skinW *
+                               fresnelGain * poreSpecMask * keyVis * specOcc * edgeSafeMask * skinW *
                                (0.45f + 0.55f * saturate(SssIntensity)) * (centerLuma * 0.72f + 0.04f);
 
-            float vellus = pow(1.0f - safeNdotV, 3.6f) * 0.072f * edgeSafeMask * specOcc * skinW *
+            float vellus = pow(1.0f - safeNdotV, 3.6f) * 0.070f * edgeSafeMask * specOcc * skinW *
                            saturate(SssIntensity * 0.75f + 0.25f);
-            float3 vellusRim = lerp(sh0, keyTint, 0.45f) * vellus * (centerLuma * 0.62f + 0.03f);
+            float3 vellusRim = lerp(sh0, keyTint, 0.45f) * vellus * (centerLuma * 0.60f + 0.03f);
             litColor += (sebumSpec + vellusRim) * saturate(effRelight * 0.85f + 0.30f);
         }
 
